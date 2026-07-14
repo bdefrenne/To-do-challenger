@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+/*
+  To-do Challenger — design tokens.
+  Change the LOOK of the whole app here. Light, calm, ClickUp-adjacent.
+  Every component references these via Tailwind utilities (bg-surface, text-muted, etc.).
+*/
+@theme {
+  /* Surfaces — clean light greys */
+  --color-bg: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-surface-2: #f4f5f7;
+  --color-surface-3: #eceef1;
+  --color-border: #e7e9ee;
+  --color-border-strong: #d6d9e0;
+
+  /* Text */
+  --color-fg: #1f2430;
+  --color-muted: #6b7280;
+  --color-faint: #9aa1ac;
+
+  /* Brand accent — ClickUp purple */
+  --color-accent: #7b68ee;
+  --color-accent-soft: #efecfe;
+
+  /* Semantic states (also drive status pills) */
+  --color-buff: #22a06b; /* green — Complete */
+  --color-buff-soft: #e6f6ee;
+  --color-nerf: #e5484d; /* red */
+  --color-nerf-soft: #fdeaea;
+  --color-adjust: #e08a1e; /* amber */
+  --color-adjust-soft: #fdf1df;
+  --color-new: #4f8bff; /* blue — In Progress */
+  --color-new-soft: #e9f0ff;
+
+  /* Priority flags */
+  --color-prio-urgent: #e5484d;
+  --color-prio-high: #e08a1e;
+  --color-prio-normal: #4f8bff;
+  --color-prio-low: #9aa1ac;
+
+  /* Tag chip tones */
+  --color-tag-purple: #7b68ee;
+  --color-tag-purple-soft: #efecfe;
+  --color-tag-blue: #4f8bff;
+  --color-tag-blue-soft: #e9f0ff;
+  --color-tag-green: #22a06b;
+  --color-tag-green-soft: #e6f6ee;
+  --color-tag-amber: #e08a1e;
+  --color-tag-amber-soft: #fdf1df;
+  --color-tag-pink: #e93d82;
+  --color-tag-pink-soft: #fce8f0;
+  --color-tag-gray: #6b7280;
+  --color-tag-gray-soft: #eceef1;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular numbers for counters so digits don't jitter */
+.nums {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+
+/* Thin custom scrollbars to keep the layout calm */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}

@@ -1,0 +1,203 @@
+"use client";
+
+import { useState } from "react";
+import type { TaskStatus } from "@/lib/types";
+import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
+import { useWorkspace, type TaskNode } from "./WorkspaceContext";
+import { TaskTableRow, GRID } from "./TaskTableRow";
+
+/** ClickUp-style task table: grouped by status, collapsible, drag-and-drop. */
+export function TaskTable() {
+  const {
+    nodes,
+    taskMap,
+    childrenOf,
+    openTask,
+    start,
+    toggleDone,
+    setStatus,
+    moveNode,
+    dropToGroup,
+    addTask,
+  } = useWorkspace();
+
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+
+  function renderRow(node: TaskNode, depth: number): React.ReactNode {
+    const task = taskMap[node.id];
+    if (!task) return null;
+    const kids = childrenOf(node.id);
+    const hasChildren = kids.length > 0;
+    const expanded = !collapsedRows[node.id];
+    return (
+      <div key={node.id}>
+        <TaskTableRow
+          node={node}
+          task={task}
+          depth={depth}
+          hasChildren={hasChildren}
+          expanded={expanded}
+          draggingId={draggingId}
+          onToggleExpand={() =>
+            setCollapsedRows((p) => ({ ...p, [node.id]: !p[node.id] }))
+          }
+          onOpen={() => openTask(node.id)}
+          onStart={() => start(node.id)}
+          onToggleDone={() => toggleDone(node.id)}
+          onSetStatus={(s) => setStatus(node.id, s)}
+          onDragStartRow={setDraggingId}
+          onDropRow={(targetId, pos) => {
+            if (draggingId) moveNode(draggingId, targetId, pos);
+            setDraggingId(null); // dragend may not fire if the row remounts
+          }}
+        />
+        {hasChildren && expanded
+          ? kids.map((k) => renderRow(k, depth + 1))
+          : null}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="overflow-x-auto rounded-xl border border-border bg-surface shadow-sm"
+      onDragEnd={() => setDraggingId(null)}
+    >
+      <div className="min-w-[800px]">
+        {/* column header */}
+        <div
+          className={`${GRID} border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-faint`}
+        >
+          <div>Name</div>
+          <div className="text-center">Owner</div>
+          <div className="text-center">Prio</div>
+          <div>Status</div>
+          <div>Due</div>
+          <div>Updated</div>
+        </div>
+
+        {STATUS_ORDER.map((status) => {
+          const groupTop = nodes.filter(
+            (n) => n.parentId === null && n.status === status,
+          );
+          const collapsed = collapsedGroups[status];
+          return (
+            <div key={status}>
+              <GroupHeader
+                status={status}
+                count={groupTop.length}
+                collapsed={collapsed}
+                onToggle={() =>
+                  setCollapsedGroups((p) => ({ ...p, [status]: !p[status] }))
+                }
+                onDropInto={() => {
+                  if (draggingId) dropToGroup(draggingId, status);
+                  setDraggingId(null);
+                }}
+                draggingActive={!!draggingId}
+              />
+              {!collapsed ? (
+                <>
+                  {groupTop.length === 0 ? (
+                    <div
+                      className="border-b border-border px-3 py-2.5 pl-12 text-xs text-faint"
+                      onDragOver={(e) => draggingId && e.preventDefault()}
+                      onDrop={() => {
+                        if (draggingId) dropToGroup(draggingId, status);
+                        setDraggingId(null);
+                      }}
+                    >
+                      Drop a task here
+                    </div>
+                  ) : (
+                    groupTop.map((n) => renderRow(n, 0))
+                  )}
+                  <AddTaskRow onAdd={(title) => addTask(status, title)} />
+                </>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function GroupHeader({
+  status,
+  count,
+  collapsed,
+  onToggle,
+  onDropInto,
+  draggingActive,
+}: {
+  status: TaskStatus;
+  count: number;
+  collapsed: boolean;
+  onToggle: () => void;
+  onDropInto: () => void;
+  draggingActive: boolean;
+}) {
+  const tone = STATUS_TONE[status];
+  return (
+    <div
+      className="flex items-center gap-2 bg-surface-2 px-3 py-2"
+      onDragOver={(e) => draggingActive && e.preventDefault()}
+      onDrop={onDropInto}
+    >
+      <button onClick={onToggle} className="text-faint hover:text-fg" aria-label="Toggle group">
+        {collapsed ? "▸" : "▾"}
+      </button>
+      <span
+        className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide ${tone.bg} ${tone.text} ${tone.border}`}
+      >
+        <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} aria-hidden />
+        {STATUS_LABEL[status]}
+      </span>
+      <span className="nums text-xs text-faint">{count}</span>
+    </div>
+  );
+}
+
+function AddTaskRow({ onAdd }: { onAdd: (title: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState("");
+
+  if (!editing) {
+    return (
+      <button
+        onClick={() => setEditing(true)}
+        className="flex w-full items-center gap-2 border-b border-border px-3 py-2 pl-12 text-left text-xs text-faint hover:bg-surface-2 hover:text-muted"
+      >
+        <span className="text-sm leading-none">+</span> Add task
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 pl-12">
+      <span className="text-sm leading-none text-faint">+</span>
+      <input
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && text.trim()) {
+            onAdd(text.trim());
+            setText(""); // keep open for rapid entry
+          } else if (e.key === "Escape") {
+            setText("");
+            setEditing(false);
+          }
+        }}
+        onBlur={() => {
+          if (!text.trim()) setEditing(false);
+        }}
+        placeholder="Task name, then Enter…"
+        className="flex-1 bg-transparent py-1 text-sm text-fg outline-none placeholder:text-faint"
+      />
+    </div>
+  );
+}
