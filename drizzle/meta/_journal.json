@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1784058783019,
+      "tag": "0000_pink_hammerhead",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784059132748,
+      "tag": "0001_cool_eternity",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784101286090,
+      "tag": "0002_petite_imperial_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1784105079067,
+      "tag": "0003_add_task_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784105868609,
+      "tag": "0004_conscious_lake",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784108623120,
+      "tag": "0005_clear_nightshade",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784111437653,
+      "tag": "0006_rapid_lester",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1784111946977,
+      "tag": "0007_faithful_dreadnoughts",
+      "breakpoints": true
+    }
+  ]
+}

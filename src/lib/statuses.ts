@@ -1,4 +1,4 @@
-import type { Priority, TaskStatus } from "./types";
+import type { TaskStatus } from "./types";
 
 /** Display order of status groups in the List (top → bottom). */
 export const STATUS_ORDER: TaskStatus[] = [
@@ -50,19 +50,10 @@ export const STATUS_TONE: Record<
   },
 };
 
-/** Priority flags, ClickUp-style (a colored 🚩). */
-export const PRIORITY_ORDER: Priority[] = ["urgent", "high", "normal", "low"];
-
-export const PRIORITY_LABEL: Record<Priority, string> = {
-  urgent: "Urgent",
-  high: "High",
-  normal: "Normal",
-  low: "Low",
-};
-
-export const PRIORITY_COLOR: Record<Priority, string> = {
-  urgent: "text-prio-urgent",
-  high: "text-prio-high",
-  normal: "text-prio-normal",
-  low: "text-prio-low",
+/** How often a task repeats — label + a compact glyph for chips. */
+export const RECURRENCE_LABEL: Record<string, string> = {
+  none: "Doesn’t repeat",
+  daily: "Daily",
+  weekly: "Weekly",
+  monthly: "Monthly",
 };

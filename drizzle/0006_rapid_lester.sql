@@ -1,0 +1,2 @@
+CREATE TYPE "public"."google_calendar_type" AS ENUM('standard', 'holidays');--> statement-breakpoint
+ALTER TABLE "google_connections" ADD COLUMN "type" "google_calendar_type" DEFAULT 'standard' NOT NULL;

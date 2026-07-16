@@ -3,13 +3,13 @@
 import { useState, type DragEvent } from "react";
 import type { Task, TaskStatus } from "@/lib/types";
 import type { DropPos, TaskNode } from "./WorkspaceContext";
-import { Avatar, PriorityFlag, TagChip } from "@/components/ui/Badge";
+import { AvatarStack, PointsChip, TagChip } from "@/components/ui/Badge";
 import { StatusPill } from "./StatusPill";
 import { formatRelative, formatDue } from "@/lib/format";
 
 /** Shared grid template so header and rows line up. */
 export const GRID =
-  "grid grid-cols-[minmax(240px,1fr)_52px_44px_150px_104px_92px] items-center";
+  "grid grid-cols-[minmax(240px,1fr)_64px_96px_150px_104px_92px] items-center";
 
 /**
  * One draggable table row. Click the name to open the task; drag onto the
@@ -22,6 +22,7 @@ export function TaskTableRow({
   hasChildren,
   expanded,
   draggingId,
+  boardName,
   onToggleExpand,
   onOpen,
   onStart,
@@ -36,6 +37,8 @@ export function TaskTableRow({
   hasChildren: boolean;
   expanded: boolean;
   draggingId: string | null;
+  /** When set, a small chip with the task's board name (mixed-board views). */
+  boardName?: string;
   onToggleExpand: () => void;
   onOpen: () => void;
   onStart: () => void;
@@ -136,6 +139,14 @@ export function TaskTableRow({
           <span className={`truncate ${done ? "text-faint line-through" : "text-fg"}`}>
             {task.title}
           </span>
+          {boardName ? (
+            <span
+              className="shrink-0 rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+              title={`Board: ${boardName}`}
+            >
+              {boardName}
+            </span>
+          ) : null}
           {(task.tags ?? []).map((t) => (
             <TagChip key={t} id={t} />
           ))}
@@ -147,10 +158,10 @@ export function TaskTableRow({
         </button>
       </div>
 
-      {/* Assignee */}
+      {/* Assignees */}
       <div className="flex justify-center">
-        {task.assignee ? (
-          <Avatar name={task.assignee} />
+        {task.assignees?.length ? (
+          <AvatarStack names={task.assignees} />
         ) : (
           <span className="grid h-[22px] w-[22px] place-items-center rounded-full border border-dashed border-border-strong text-[10px] text-faint">
             +
@@ -158,9 +169,15 @@ export function TaskTableRow({
         )}
       </div>
 
-      {/* Priority */}
-      <div className="flex justify-center">
-        {task.priority ? <PriorityFlag priority={task.priority} /> : null}
+      {/* Points (value / difficulty) */}
+      <div className="flex justify-center gap-1">
+        {task.value != null ? <PointsChip kind="value" points={task.value} /> : null}
+        {task.difficulty != null ? (
+          <PointsChip kind="difficulty" points={task.difficulty} />
+        ) : null}
+        {task.value == null && task.difficulty == null ? (
+          <span className="text-faint">—</span>
+        ) : null}
       </div>
 
       {/* Status */}

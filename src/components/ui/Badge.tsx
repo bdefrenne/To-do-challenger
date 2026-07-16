@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
-import type { Priority, TagTone } from "@/lib/types";
+import type { TagTone } from "@/lib/types";
 import { tagById } from "@/lib/mock-data";
-import { PRIORITY_COLOR, PRIORITY_LABEL } from "@/lib/statuses";
 
 type Tone = "neutral" | "green" | "red" | "amber" | "blue" | "purple";
 
@@ -32,21 +31,33 @@ export function Badge({
   );
 }
 
-/** ClickUp-style priority flag: a colored ⚑ with an optional label. */
-export function PriorityFlag({
-  priority,
+/**
+ * A small points chip for the value (payoff) and difficulty (effort) axes.
+ * `kind` picks the glyph + tone so the two read differently at a glance.
+ */
+export function PointsChip({
+  kind,
+  points,
   withLabel = false,
 }: {
-  priority: Priority;
+  kind: "value" | "difficulty";
+  points: number;
   withLabel?: boolean;
 }) {
+  const value = kind === "value";
+  const label = value ? "Value" : "Difficulty";
   return (
     <span
-      className={`inline-flex items-center gap-1 text-xs ${PRIORITY_COLOR[priority]}`}
-      title={`${PRIORITY_LABEL[priority]} priority`}
+      className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium ${
+        value
+          ? "border-buff/25 bg-buff-soft text-buff"
+          : "border-adjust/25 bg-adjust-soft text-adjust"
+      }`}
+      title={`${label}: ${points}`}
     >
-      <span aria-hidden>⚑</span>
-      {withLabel ? <span className="font-medium">{PRIORITY_LABEL[priority]}</span> : null}
+      <span aria-hidden>{value ? "★" : "◆"}</span>
+      {withLabel ? <span>{label}</span> : null}
+      <span className="nums">{points}</span>
     </span>
   );
 }
@@ -87,6 +98,47 @@ export function Avatar({ name, size = 22 }: { name: string; size?: number }) {
       title={name}
     >
       {initials}
+    </span>
+  );
+}
+
+/** Overlapping avatars for multiple assignees; collapses the overflow to "+N". */
+export function AvatarStack({
+  names,
+  size = 22,
+  max = 3,
+}: {
+  names: string[];
+  size?: number;
+  max?: number;
+}) {
+  if (!names.length) return null;
+  const shown = names.slice(0, max);
+  const extra = names.length - shown.length;
+  return (
+    <span className="flex items-center" title={names.join(", ")}>
+      {shown.map((name, i) => (
+        <span
+          key={`${name}-${i}`}
+          className="rounded-full ring-2 ring-surface"
+          style={{ marginLeft: i === 0 ? 0 : -size * 0.3 }}
+        >
+          <Avatar name={name} size={size} />
+        </span>
+      ))}
+      {extra > 0 ? (
+        <span
+          className="grid shrink-0 place-items-center rounded-full bg-surface-3 font-semibold text-muted ring-2 ring-surface"
+          style={{
+            width: size,
+            height: size,
+            fontSize: size * 0.38,
+            marginLeft: -size * 0.3,
+          }}
+        >
+          +{extra}
+        </span>
+      ) : null}
     </span>
   );
 }

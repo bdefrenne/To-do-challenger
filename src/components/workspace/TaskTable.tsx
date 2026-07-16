@@ -1,16 +1,32 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskTableRow, GRID } from "./TaskTableRow";
 
-/** ClickUp-style task table: grouped by status, collapsible, drag-and-drop. */
-export function TaskTable() {
+/**
+ * ClickUp-style task table: grouped by status, collapsible, drag-and-drop.
+ *
+ * With no props it shows every top-level task (the global "All tasks" view).
+ * Scope it to a project or board with `boardIds`; `showBoardChip` labels each
+ * row with its board (useful when boards are mixed); `addBoardId` is the board
+ * that inline-added tasks land on (null = unassigned).
+ */
+export function TaskTable({
+  boardIds,
+  showBoardChip = false,
+  addBoardId = null,
+}: {
+  boardIds?: string[];
+  showBoardChip?: boolean;
+  addBoardId?: string | null;
+} = {}) {
   const {
     nodes,
     taskMap,
+    projects,
     childrenOf,
     openTask,
     start,
@@ -20,6 +36,15 @@ export function TaskTable() {
     dropToGroup,
     addTask,
   } = useWorkspace();
+
+  const boardNameById = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of projects) for (const b of p.boards ?? []) m[b.id] = b.name;
+    return m;
+  }, [projects]);
+
+  const inScope = (n: TaskNode) =>
+    !boardIds || (n.boardId != null && boardIds.includes(n.boardId));
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
@@ -40,6 +65,9 @@ export function TaskTable() {
           hasChildren={hasChildren}
           expanded={expanded}
           draggingId={draggingId}
+          boardName={
+            showBoardChip && node.boardId ? boardNameById[node.boardId] : undefined
+          }
           onToggleExpand={() =>
             setCollapsedRows((p) => ({ ...p, [node.id]: !p[node.id] }))
           }
@@ -71,8 +99,8 @@ export function TaskTable() {
           className={`${GRID} border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-faint`}
         >
           <div>Name</div>
-          <div className="text-center">Owner</div>
-          <div className="text-center">Prio</div>
+          <div className="text-center">Owners</div>
+          <div className="text-center">Points</div>
           <div>Status</div>
           <div>Due</div>
           <div>Updated</div>
@@ -80,7 +108,7 @@ export function TaskTable() {
 
         {STATUS_ORDER.map((status) => {
           const groupTop = nodes.filter(
-            (n) => n.parentId === null && n.status === status,
+            (n) => n.parentId === null && n.status === status && inScope(n),
           );
           const collapsed = collapsedGroups[status];
           return (
@@ -114,7 +142,9 @@ export function TaskTable() {
                   ) : (
                     groupTop.map((n) => renderRow(n, 0))
                   )}
-                  <AddTaskRow onAdd={(title) => addTask(status, title)} />
+                  <AddTaskRow
+                    onAdd={(title) => addTask(status, title, addBoardId)}
+                  />
                 </>
               ) : null}
             </div>

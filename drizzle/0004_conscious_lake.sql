@@ -1,0 +1,1 @@
+ALTER TYPE "public"."log_kind" ADD VALUE 'updated';

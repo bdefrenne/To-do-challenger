@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "google_conn_holidays_idx" ON "google_connections" USING btree ("type") WHERE "google_connections"."type" = 'holidays';

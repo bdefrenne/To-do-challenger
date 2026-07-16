@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { Badge, PriorityFlag, TagChip } from "@/components/ui/Badge";
+import { Badge, PointsChip, TagChip } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { daysAgo, formatDue } from "@/lib/format";
 import { STATUS_LABEL } from "@/lib/statuses";
@@ -68,7 +68,8 @@ export function DailyFocus() {
                   key={n.id}
                   node={n}
                   title={t?.title ?? ""}
-                  priority={t?.priority}
+                  value={t?.value}
+                  difficulty={t?.difficulty}
                   tags={t?.tags}
                   dueDate={t?.dueDate}
                   daysInStatus={daysAgo(n.statusSince)}
@@ -115,7 +116,8 @@ export function DailyFocus() {
 function FocusRow({
   node,
   title,
-  priority,
+  value,
+  difficulty,
   tags,
   dueDate,
   daysInStatus,
@@ -126,7 +128,8 @@ function FocusRow({
 }: {
   node: TaskNode;
   title: string;
-  priority?: import("@/lib/types").Priority;
+  value?: import("@/lib/types").FibPoints;
+  difficulty?: import("@/lib/types").FibPoints;
   tags?: string[];
   dueDate?: string;
   daysInStatus: number;
@@ -166,7 +169,8 @@ function FocusRow({
 
       <button onClick={onOpen} className="min-w-0 flex-1 text-left">
         <div className="flex items-center gap-2">
-          {priority ? <PriorityFlag priority={priority} /> : null}
+          {value != null ? <PointsChip kind="value" points={value} /> : null}
+          {difficulty != null ? <PointsChip kind="difficulty" points={difficulty} /> : null}
           <span className="truncate text-sm font-medium text-fg">{title}</span>
           {running ? <span className="shrink-0 text-xs text-new">● in progress</span> : null}
         </div>
