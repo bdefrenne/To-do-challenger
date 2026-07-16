@@ -39,10 +39,10 @@ import {
 } from "@/lib/telegram/api";
 
 export const runtime = "nodejs";
-// Requires Vercel Pro (Hobby hard-caps at 60s). Gives heavy turns room to
-// finish; prompt caching keeps normal turns fast so this is a ceiling, not a
-// wait the user usually feels.
-export const maxDuration = 300;
+// Hobby plan hard-caps at 60s. Prompt caching (see brain.ts) keeps normal turns
+// well under this; the guard below messages the user before the hard kill.
+// On Vercel Pro this can go up to 300.
+export const maxDuration = 60;
 
 const CONFIRM = "td:confirm";
 const CANCEL = "td:cancel";

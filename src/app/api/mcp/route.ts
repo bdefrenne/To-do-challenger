@@ -27,6 +27,8 @@ import {
   listToday,
   searchTasks,
   getTask,
+  startAnalysis,
+  startWork,
   createTask,
   updateTask,
   moveTask,
@@ -153,11 +155,49 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_task",
-      "Get one task by id, including its full activity log and comments.",
+      "Passive PEEK at a task: its headline fields + activity log/comments + counts of decisions/notes/commits — enough to check status or locate a task. It does NOT return the working context (recorded decisions, notes, linked commits, board gitFolder, phase playbook) and does NOT record that you've started. ⚠️ If you are about to ANALYZE or BUILD this task, do NOT use this — call `get_task_for_analysis` or `get_task_for_working`: they return the FULL context you need AND stamp the start. Only the phase tools give you the working context, so there's no way to \"just read everything\" without recording that you began.",
       { id: z.string() },
       async ({ id }) => {
         const result = await getTask(id, currentUser());
-        return result ? text(result) : text({ error: "Task not found" });
+        if (!result) return text({ error: "Task not found" });
+        return text({
+          task: result.task,
+          activity: result.logs, // includes comments (kind:"comment")
+          counts: {
+            decisions: result.decisions.length,
+            notes: result.notes.length,
+            commits: result.commits.length,
+          },
+          hint: "Lean peek. To analyze or build this task, call get_task_for_analysis or get_task_for_working — they return the full context and record the start.",
+        });
+      },
+    );
+
+    server.tool(
+      "get_task_for_analysis",
+      "START HERE to analyze a task — the required entry point before any analysis. Returns the FULL task context (description, activity, prior decisions, notes, commits) so you can understand it, locks the code so commits can cite it, and records that analysis has started (stamps `analysisStartedAt` the first time + an attributed activity entry). Then follow the Analyze step of the todo workflow. When you move from analysis to building, call `get_task_for_working`. Use plain `get_task` only for a passive status check you don't intend to act on.",
+      { id: z.string() },
+      async ({ id }) => {
+        const result = await startAnalysis(id, currentUser(), AI_AUTHOR);
+        if (!result) return text({ error: "Task not found" });
+        return text({
+          ...result,
+          next: "Analyze: record_decision for EACH choice (business/product/ux/technical/scope). Read the container's description + gitFolder via list_projects if it's on a project/board. When analysis is settled, set analysisSummary + analyzedAt. To start building, call get_task_for_working.",
+        });
+      },
+    );
+
+    server.tool(
+      "get_task_for_working",
+      "START HERE to build/implement a task, after analysis — the required entry point before any coding. Returns the FULL working context (the plan, all recorded decisions to implement, notes, linked commits, and the locked code to cite) and records that work has started (stamps `workStartedAt` the first time + an attributed activity entry). If you haven't analyzed yet, call `get_task_for_analysis` first. Use plain `get_task` only for a passive status check.",
+      { id: z.string() },
+      async ({ id }) => {
+        const result = await startWork(id, currentUser(), AI_AUTHOR);
+        if (!result) return text({ error: "Task not found" });
+        return text({
+          ...result,
+          next: "Work: reference the locked code in EVERY commit message and link_commit each sha; log anything added on the fly as a `scope` decision. Run the finish_task protocol (reconcile the git diff, write the summary, mark done) when finished.",
+        });
       },
     );
 
@@ -204,7 +244,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn/tags. WORKFLOW: write the revisable summaries here — `analysisSummary` when analysis is done (also set `analyzedAt`), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect). Set lifecycle timestamps (`analyzedAt` etc.) to the current time as an ISO string when the corresponding milestone is reached; analysisStartedAt/workStartedAt auto-fire from record_decision/link_commit, so you rarely set those by hand.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn/tags. WORKFLOW: write the revisable summaries here — `analysisSummary` when analysis is done (also set `analyzedAt`), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect). Set lifecycle timestamps (`analyzedAt` etc.) to the current time as an ISO string when the corresponding milestone is reached; you rarely set the START stamps by hand — `analysisStartedAt` fires when you call `get_task_for_analysis` (or the work_on_task prompt), `workStartedAt` when you call `get_task_for_working`, with record_decision/link_commit as set-if-null backstops.",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -936,10 +976,12 @@ const handler = createMcpHandler(
         argsSchema: { taskId: z.string() },
       },
       async ({ taskId }) => {
-        // Handoff = the mint point. Lock the code so every commit can cite it.
-        const locked = await mintRef(taskId, currentUser());
-        const result = await getTask(taskId, currentUser());
-        if (!locked || !result)
+        // Handoff = enter the analysis phase: locks the code, stamps
+        // analysisStartedAt (set-if-null), and logs a `started` activity entry.
+        // Same server op the get_task_for_analysis tool uses, so both surfaces
+        // record the start identically.
+        const result = await startAnalysis(taskId, currentUser(), "You");
+        if (!result)
           return userMsg(
             `Task ${taskId} was not found on my board. Please ask me to pick a valid task id or code.`,
           );
@@ -949,9 +991,11 @@ const handler = createMcpHandler(
             `Here it is:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
             `Follow the todo workflow contract (in your server instructions / the ` +
             `\`todo://workflow\` resource) using the todo MCP tools — read it if you ` +
-            `haven't. Its code is locked, so reference **${code}** in every commit ` +
-            `and \`link_commit\` each sha. Start by understanding the task and the ` +
-            `relevant code, and ask me anything unclear before deciding.`,
+            `haven't. Analysis has started and its code is locked, so reference ` +
+            `**${code}** in every commit and \`link_commit\` each sha. Start by ` +
+            `understanding the task and the relevant code, and ask me anything ` +
+            `unclear before deciding. When you move from analysis to building, call ` +
+            `\`get_task_for_working\` to load the build context and record it.`,
         );
       },
     );

@@ -302,12 +302,6 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
               </Link>
             );
           })}
-          <button
-            onClick={() => setAdding(true)}
-            className="block px-2 py-1 text-xs text-faint hover:text-muted"
-          >
-            + board
-          </button>
         </div>
       ) : null}
 

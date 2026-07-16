@@ -94,7 +94,8 @@ function TaskDetailLevel({
     setStatus,
     childrenOf,
     addComment,
-    lockTask,
+    startAnalysis,
+    startWork,
     recordDecision,
     addNote,
     addAttachment,
@@ -109,14 +110,16 @@ function TaskDetailLevel({
   // in the lightbox). One index drives both, so selecting persists across open/close.
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [locking, setLocking] = useState(false);
+  // Which phase-prompt button is mid-request / just-copied ("analysis" | "work").
+  const [busyPhase, setBusyPhase] = useState<null | "analysis" | "work">(null);
+  const [copiedPhase, setCopiedPhase] = useState<null | "analysis" | "work">(null);
   // Inline "add subtask" composer.
   const [subtaskTitle, setSubtaskTitle] = useState("");
   const [addingSub, setAddingSub] = useState(false);
   // Inline description editor: rendered Markdown by default, raw source on edit.
   const [editingDesc, setEditingDesc] = useState(false);
   const [descDraft, setDescDraft] = useState("");
+  const [descCopied, setDescCopied] = useState(false);
 
   // Each stack level is a fresh component instance (keyed by task id in the
   // wrapper), so the composer/gallery state above is naturally per-task — no
@@ -210,6 +213,16 @@ function TaskDetailLevel({
     editTask(taskId, { description: descDraft.trim() });
     setEditingDesc(false);
   };
+  const copyDesc = async () => {
+    if (!task.description) return;
+    try {
+      await navigator.clipboard?.writeText(task.description);
+      setDescCopied(true);
+      setTimeout(() => setDescCopied(false), 2000);
+    } catch (e) {
+      console.error("[modal] copy description failed", e);
+    }
+  };
 
   const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
@@ -223,19 +236,23 @@ function TaskDetailLevel({
 
   const lightboxItem = lightboxOpen ? featured : null;
 
-  // Lock the code (if still soft) and copy the ready-to-paste work prompt.
-  const copyPrompt = async () => {
-    if (locking) return;
-    setLocking(true);
+  // Enter a phase server-side (stamps its start timestamp + logs it) and copy
+  // the ready-to-paste prompt that tells the AI to call the matching
+  // get_task_for_* tool. startAnalysis also locks the code, so soft codes still
+  // freeze on handoff.
+  const copyPhasePrompt = async (phase: "analysis" | "work") => {
+    if (busyPhase) return;
+    setBusyPhase(phase);
     try {
-      const prompt = await lockTask(taskId);
+      const prompt =
+        phase === "analysis" ? await startAnalysis(taskId) : await startWork(taskId);
       await navigator.clipboard?.writeText(prompt);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setCopiedPhase(phase);
+      setTimeout(() => setCopiedPhase(null), 2000);
     } catch (e) {
-      console.error("[modal] copy prompt failed", e);
+      console.error(`[modal] copy ${phase} prompt failed`, e);
     } finally {
-      setLocking(false);
+      setBusyPhase(null);
     }
   };
 
@@ -271,18 +288,32 @@ function TaskDetailLevel({
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             <button
-              onClick={copyPrompt}
-              disabled={locking}
+              onClick={() => copyPhasePrompt("analysis")}
+              disabled={busyPhase !== null}
               className="flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
-              title="Lock the code and copy a ready-to-paste prompt for your AI"
+              title="Start analysis (records the start) and copy a ready-to-paste prompt for your AI"
             >
-              {locking ? (
+              {busyPhase === "analysis" ? (
                 <span
                   className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
                   aria-hidden
                 />
               ) : null}
-              {copied ? "✓ Copied" : "⧉ Copy prompt"}
+              {copiedPhase === "analysis" ? "✓ Copied" : "⧉ Copy analysis prompt"}
+            </button>
+            <button
+              onClick={() => copyPhasePrompt("work")}
+              disabled={busyPhase !== null}
+              className="flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
+              title="Start work (records the start) and copy a ready-to-paste prompt for your AI"
+            >
+              {busyPhase === "work" ? (
+                <span
+                  className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
+                  aria-hidden
+                />
+              ) : null}
+              {copiedPhase === "work" ? "✓ Copied" : "⧉ Copy work prompt"}
             </button>
             <button
               onClick={closeTask}
@@ -315,13 +346,22 @@ function TaskDetailLevel({
               <div className="flex items-center justify-between">
                 <SectionLabel>Description</SectionLabel>
                 {!editingDesc && task.description ? (
-                  <button
-                    type="button"
-                    onClick={startEditDesc}
-                    className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2"
-                  >
-                    ✎ Edit
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={copyDesc}
+                      className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2"
+                    >
+                      {descCopied ? "✓ Copied" : "⧉ Copy"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={startEditDesc}
+                      className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2"
+                    >
+                      ✎ Edit
+                    </button>
+                  </div>
                 ) : null}
               </div>
               {editingDesc ? (
@@ -348,7 +388,11 @@ function TaskDetailLevel({
                   </div>
                 </div>
               ) : task.description ? (
-                <div className="mt-1 rounded-lg border border-border bg-surface-2 px-3 py-2">
+                <div
+                  onDoubleClick={startEditDesc}
+                  title="Double-click to edit"
+                  className="mt-1 rounded-lg border border-border bg-surface-2 px-3 py-2"
+                >
                   <Markdown>{task.description}</Markdown>
                 </div>
               ) : (

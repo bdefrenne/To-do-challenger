@@ -83,6 +83,12 @@ interface WorkspaceContextValue {
   addComment: (id: string, message: string) => Promise<void>;
   /** Lock the task's code (freeze it) and return a ready-to-paste work prompt. */
   lockTask: (id: string) => Promise<string>;
+  /** Enter the analysis phase (stamps analysisStartedAt + logs it) and return a
+   *  ready-to-paste "analyze this" prompt. */
+  startAnalysis: (id: string) => Promise<string>;
+  /** Enter the work phase (stamps workStartedAt + logs it) and return a
+   *  ready-to-paste "build this" prompt. */
+  startWork: (id: string) => Promise<string>;
   /** Record a decision on a task, then reload its detail. */
   recordDecision: (
     id: string,
@@ -862,6 +868,22 @@ export function WorkspaceProvider({
     return res.prompt;
   }
 
+  // Enter a phase (analysis or work): the server stamps the start timestamp,
+  // logs an attributed `started` entry, and returns the phase prompt. Both are
+  // idempotent, so a second click just re-returns the prompt.
+  async function enterPhase(id: string, phase: "analysis" | "work") {
+    const res = await api<{ task: Task; prompt: string }>(
+      `/api/tasks/${id}/start-${phase === "analysis" ? "analysis" : "work"}`,
+      { method: "POST" },
+    );
+    setTaskMap((prev) =>
+      prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
+    );
+    return res.prompt;
+  }
+  const startAnalysis = (id: string) => enterPhase(id, "analysis");
+  const startWork = (id: string) => enterPhase(id, "work");
+
   // Optimistically append a temp row (rendered with a small "saving" spinner),
   // POST it, then reload so the temp entry is replaced by the server row.
   async function recordDecision(
@@ -999,6 +1021,8 @@ export function WorkspaceProvider({
         addTask,
         addComment,
         lockTask,
+        startAnalysis,
+        startWork,
         recordDecision,
         addNote,
         editWorkflow,

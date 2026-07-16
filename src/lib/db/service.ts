@@ -594,6 +594,60 @@ export async function getTask(
   };
 }
 
+type TaskContext = Awaited<ReturnType<typeof getTask>>;
+
+/**
+ * Enter the ANALYSIS phase — the required entry point before analysing a task.
+ * Locks the code (so commits can cite it), stamps `analysisStartedAt` the FIRST
+ * time only (set-if-null), leaves an attributed `started` activity row, and
+ * returns the full task context. Idempotent: a second call just returns the
+ * context without re-stamping or re-logging. This is what binds "started
+ * analysing" to the act of fetching what you need to analyse — you can't get
+ * the context without recording the start.
+ */
+export async function startAnalysis(
+  id: string,
+  userId: string,
+  author = "You",
+): Promise<TaskContext> {
+  const locked = await mintRef(id, userId);
+  if (!locked) return null;
+  const current = (
+    await db.select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+  )[0];
+  if (current && !current.analysisStartedAt) {
+    const now = new Date();
+    await db.update(tasks).set({ analysisStartedAt: now, updatedAt: now }).where(eq(tasks.id, id));
+    await log(id, "started", "Analysis started", author);
+  }
+  return getTask(id, userId);
+}
+
+/**
+ * Enter the WORK phase — the required entry point before building a task.
+ * Stamps `workStartedAt` the FIRST time only (set-if-null), leaves an attributed
+ * `started` activity row, and returns the full working context. Idempotent.
+ * Same principle as {@link startAnalysis}: fetching the build context is what
+ * records that work began — no separate "remember to mark it" step, and no
+ * reliance on the first commit (which lands late).
+ */
+export async function startWork(
+  id: string,
+  userId: string,
+  author = "You",
+): Promise<TaskContext> {
+  const current = (
+    await db.select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+  )[0];
+  if (!current) return null;
+  if (!current.workStartedAt) {
+    const now = new Date();
+    await db.update(tasks).set({ workStartedAt: now, updatedAt: now }).where(eq(tasks.id, id));
+    await log(id, "started", "Work started", author);
+  }
+  return getTask(id, userId);
+}
+
 /** Cheap change-cursor for a user's board: moves on any create/update/
  *  move/complete/delete/comment (every mutation bumps updatedAt; deletes
  *  drop the row count). Lets clients poll "did anything change?" without
