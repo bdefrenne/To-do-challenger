@@ -19,15 +19,6 @@ export type FibPoints = 1 | 2 | 3 | 5 | 8;
 /** An open-ended, user-defined field value (the custom-field bag). */
 export type CustomFieldValue = string | number | boolean;
 
-/** A colored label chip, ClickUp-style. */
-export type TagTone = "purple" | "blue" | "green" | "amber" | "pink" | "gray";
-
-export interface Tag {
-  id: string;
-  label: string;
-  tone: TagTone;
-}
-
 /** One Trello-style board — the sub level of the hierarchy. */
 export interface Board {
   id: string;
@@ -173,8 +164,6 @@ export interface Task {
   startDate?: string;
   /** ISO date the task is due — drives the Due column (overdue shows red). */
   dueDate?: string;
-  /** Tag ids (see TAGS in mock-data). */
-  tags?: string[];
   /** How often the task repeats. Defaults to "none". */
   recurrence?: Recurrence;
   /** Ids of tasks this one is blocked by (they must finish first). */

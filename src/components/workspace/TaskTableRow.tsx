@@ -3,7 +3,7 @@
 import { useState, type DragEvent } from "react";
 import type { Task, TaskStatus } from "@/lib/types";
 import type { DropPos, TaskNode } from "./WorkspaceContext";
-import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip } from "@/components/ui/Badge";
 import { AvatarStack } from "@/components/PersonAvatar";
 import { StatusPill } from "./StatusPill";
 import { BoardPill, type BoardGroup } from "./BoardPill";
@@ -137,9 +137,6 @@ export function TaskTableRow({
           <span className={`truncate ${done ? "text-faint line-through" : "text-fg"}`}>
             {task.title}
           </span>
-          {(task.tags ?? []).map((t) => (
-            <TagChip key={t} id={t} />
-          ))}
           {task.commentCount ? (
             <span className="shrink-0 text-xs text-faint" title={`${task.commentCount} comments`}>
               💬 {task.commentCount}

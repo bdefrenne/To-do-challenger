@@ -39,7 +39,6 @@ export const createTaskSchema = z.object({
   value: fibSchema.optional(),
   difficulty: fibSchema.optional(),
   description: z.string().max(10_000).optional(),
-  tags: z.array(z.string()).optional(),
   parentId: z.string().nullable().optional(),
   boardId: z.string().nullable().optional(),
 });
@@ -60,7 +59,6 @@ export const updateTaskSchema = z
     value: fibSchema.nullable(),
     difficulty: fibSchema.nullable(),
     description: z.string().max(10_000).nullable(),
-    tags: z.array(z.string()),
     /* ---- Workflow: revisable summaries (null clears) ---- */
     analysisSummary: z.string().max(20_000).nullable(),
     plan: z.string().max(20_000).nullable(),

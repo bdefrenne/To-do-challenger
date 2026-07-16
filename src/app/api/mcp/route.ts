@@ -145,7 +145,7 @@ const handler = createMcpHandler(
   (server) => {
     server.tool(
       "list_tasks",
-      "List every task on the board. Returns the full nested tree with stable ids, statuses, assignees, start/due dates, tags, value/difficulty points, recurrence, dependencies and subtasks. Use format:'markdown' for a compact, skimmable view.",
+      "List every task on the board. Returns the full nested tree with stable ids, statuses, assignees, start/due dates, value/difficulty points, recurrence, dependencies and subtasks. Use format:'markdown' for a compact, skimmable view.",
       { format: z.enum(["json", "markdown"]).optional().default("json") },
       async ({ format }) => {
         const tree = await listTasks(currentUser());
@@ -155,7 +155,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_task",
-      "Passive PEEK at a task: its headline fields + activity log/comments + counts of decisions/notes/commits — enough to check status or locate a task. It does NOT return the working context (recorded decisions, notes, linked commits, board gitFolder, phase playbook) and does NOT record that you've started. ⚠️ If you are about to ANALYZE or BUILD this task, do NOT use this — call `get_task_for_analysis` or `get_task_for_working`: they return the FULL context you need AND stamp the start. Only the phase tools give you the working context, so there's no way to \"just read everything\" without recording that you began.",
+      "Passive PEEK at a task: its headline fields + its direct subtasks (one level: id/code/title/status etc.) + activity log/comments + counts of decisions/notes/commits — enough to check status or locate a task. It does NOT return the working context (recorded decisions, notes, linked commits, board gitFolder, phase playbook) and does NOT record that you've started. ⚠️ If you are about to ANALYZE or BUILD this task, do NOT use this — call `get_task_for_analysis` or `get_task_for_working`: they return the FULL context you need AND stamp the start. Only the phase tools give you the working context, so there's no way to \"just read everything\" without recording that you began.",
       { id: z.string() },
       async ({ id }) => {
         const result = await getTask(id, currentUser());
@@ -234,7 +234,6 @@ const handler = createMcpHandler(
         value: fibEnum.optional(),
         difficulty: fibEnum.optional(),
         description: z.string().max(10_000).optional(),
-        tags: z.array(z.string()).optional(),
         parentId: z.string().optional(),
         boardId: z.string().nullable().optional(),
       },
@@ -244,7 +243,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn/tags. WORKFLOW: write the revisable summaries here — `analysisSummary` when analysis is done (also set `analyzedAt`), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect). Set lifecycle timestamps (`analyzedAt` etc.) to the current time as an ISO string when the corresponding milestone is reached; you rarely set the START stamps by hand — `analysisStartedAt` fires when you call `get_task_for_analysis` (or the work_on_task prompt), `workStartedAt` when you call `get_task_for_working`, with record_decision/link_commit as set-if-null backstops.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: write the revisable summaries here — `analysisSummary` when analysis is done (also set `analyzedAt`), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect). Set lifecycle timestamps (`analyzedAt` etc.) to the current time as an ISO string when the corresponding milestone is reached; you rarely set the START stamps by hand — `analysisStartedAt` fires when you call `get_task_for_analysis` (or the work_on_task prompt), `workStartedAt` when you call `get_task_for_working`, with record_decision/link_commit as set-if-null backstops.",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -258,7 +257,6 @@ const handler = createMcpHandler(
         value: fibEnum.nullable().optional(),
         difficulty: fibEnum.nullable().optional(),
         description: z.string().max(10_000).nullable().optional(),
-        tags: z.array(z.string()).optional(),
         analysisSummary: z.string().max(20_000).nullable().optional(),
         plan: z.string().max(20_000).nullable().optional(),
         summary: z.string().max(20_000).nullable().optional(),
@@ -339,7 +337,6 @@ const handler = createMcpHandler(
       {
         status: z.array(statusEnum).optional(),
         assignee: z.string().max(120).optional().describe("matches one of a task's assignees"),
-        tag: z.string().optional(),
         text: z.string().max(200).optional().describe("substring of title or description"),
         dueBefore: ymd.optional(),
         dueAfter: ymd.optional(),
@@ -688,7 +685,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "bulk_update",
-      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'tag these #work', or 'move these to Planned'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn/tags). Tasks you don't own are silently skipped and returned in `skipped`.",
+      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). Tasks you don't own are silently skipped and returned in `skipped`.",
       { ids: z.array(z.string()).min(1).max(500), patch: updateTaskSchema },
       async ({ ids, patch }) =>
         text(await bulkUpdate(currentUser(), ids, patch, AI_AUTHOR)),

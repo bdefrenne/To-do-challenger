@@ -369,11 +369,6 @@ export const tasks = pgTable(
     startDate: date("start_date"),
     dueDate: date("due_date"),
     description: text("description"),
-    /** Tag ids (see the TAGS catalog in mock-data.ts). */
-    tags: text("tags")
-      .array()
-      .notNull()
-      .default(sql`'{}'::text[]`),
     /** How often it repeats. */
     recurrence: recurrence("recurrence").notNull().default("none"),
     /** Task ids this task is blocked by (must finish first). */

@@ -52,7 +52,6 @@ async function insertTask(
     value: t.value,
     difficulty: t.difficulty,
     description: t.description,
-    tags: t.tags ?? [],
     parentId,
     position,
     statusSince: new Date(statusSince),

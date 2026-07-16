@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { Badge, PointsChip, TagChip } from "@/components/ui/Badge";
+import { Badge, PointsChip } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { daysAgo, formatDue } from "@/lib/format";
 import { STATUS_LABEL } from "@/lib/statuses";
@@ -70,7 +70,6 @@ export function DailyFocus() {
                   title={t?.title ?? ""}
                   value={t?.value}
                   difficulty={t?.difficulty}
-                  tags={t?.tags}
                   dueDate={t?.dueDate}
                   daysInStatus={daysAgo(n.statusSince)}
                   onOpen={() => openTask(n.id)}
@@ -118,7 +117,6 @@ function FocusRow({
   title,
   value,
   difficulty,
-  tags,
   dueDate,
   daysInStatus,
   onOpen,
@@ -130,7 +128,6 @@ function FocusRow({
   title: string;
   value?: import("@/lib/types").FibPoints;
   difficulty?: import("@/lib/types").FibPoints;
-  tags?: string[];
   dueDate?: string;
   daysInStatus: number;
   onOpen: () => void;
@@ -175,9 +172,6 @@ function FocusRow({
           {running ? <span className="shrink-0 text-xs text-new">● in progress</span> : null}
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
-          {(tags ?? []).map((t) => (
-            <TagChip key={t} id={t} />
-          ))}
           {due ? (
             <span className={due.overdue ? "text-nerf" : due.today ? "text-accent" : "text-faint"}>
               Due {due.label}

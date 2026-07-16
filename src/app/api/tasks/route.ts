@@ -35,7 +35,6 @@ export const GET = route(async (req: NextRequest, { userId }) => {
       ? (statusCsv.split(",").map((s) => s.trim()).filter(Boolean) as TaskStatus[])
       : undefined,
     assignee: sp.get("assignee") ?? undefined,
-    tag: sp.get("tag") ?? undefined,
     text: sp.get("text") ?? sp.get("q") ?? undefined,
     dueBefore: sp.get("dueBefore") ?? undefined,
     dueAfter: sp.get("dueAfter") ?? undefined,

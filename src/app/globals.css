@@ -39,20 +39,6 @@
   --color-prio-normal: #4f8bff;
   --color-prio-low: #9aa1ac;
 
-  /* Tag chip tones */
-  --color-tag-purple: #7b68ee;
-  --color-tag-purple-soft: #efecfe;
-  --color-tag-blue: #4f8bff;
-  --color-tag-blue-soft: #e9f0ff;
-  --color-tag-green: #22a06b;
-  --color-tag-green-soft: #e6f6ee;
-  --color-tag-amber: #e08a1e;
-  --color-tag-amber-soft: #fdf1df;
-  --color-tag-pink: #e93d82;
-  --color-tag-pink-soft: #fce8f0;
-  --color-tag-gray: #6b7280;
-  --color-tag-gray-soft: #eceef1;
-
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 }

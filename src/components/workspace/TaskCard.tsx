@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import type { Task } from "@/lib/types";
-import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip } from "@/components/ui/Badge";
 import { AvatarStack } from "@/components/PersonAvatar";
 import { formatDue } from "@/lib/format";
 
@@ -51,14 +51,6 @@ export function TaskCard({
           ) : null}
         </div>
       </div>
-
-      {task.tags?.length ? (
-        <div className="mt-1.5 flex flex-wrap gap-1">
-          {task.tags.map((t) => (
-            <TagChip key={t} id={t} />
-          ))}
-        </div>
-      ) : null}
 
       <div className="mt-2 flex items-center gap-2 text-xs text-faint">
         {task.assignees?.length ? (

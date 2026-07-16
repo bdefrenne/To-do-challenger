@@ -1,6 +1,4 @@
 import type { ReactNode } from "react";
-import type { TagTone } from "@/lib/types";
-import { tagById } from "@/lib/mock-data";
 
 type Tone = "neutral" | "green" | "red" | "amber" | "blue" | "purple";
 
@@ -58,28 +56,6 @@ export function PointsChip({
       <span aria-hidden>{value ? "★" : "◆"}</span>
       {withLabel ? <span>{label}</span> : null}
       <span className="nums">{points}</span>
-    </span>
-  );
-}
-
-const TAG_CLASS: Record<TagTone, string> = {
-  purple: "bg-tag-purple-soft text-tag-purple",
-  blue: "bg-tag-blue-soft text-tag-blue",
-  green: "bg-tag-green-soft text-tag-green",
-  amber: "bg-tag-amber-soft text-tag-amber",
-  pink: "bg-tag-pink-soft text-tag-pink",
-  gray: "bg-tag-gray-soft text-tag-gray",
-};
-
-/** A rounded, colored tag label resolved from a tag id. */
-export function TagChip({ id }: { id: string }) {
-  const tag = tagById(id);
-  if (!tag) return null;
-  return (
-    <span
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${TAG_CLASS[tag.tone]}`}
-    >
-      {tag.label}
     </span>
   );
 }

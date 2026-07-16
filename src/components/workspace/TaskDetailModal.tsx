@@ -13,7 +13,7 @@ import type {
 } from "@/lib/types";
 import { Button } from "@/components/ui/Button";
 import { Markdown } from "@/components/ui/Markdown";
-import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip } from "@/components/ui/Badge";
 import { AvatarStack, PersonAvatar } from "@/components/PersonAvatar";
 import { usePeople } from "@/components/PeopleContext";
 import { formatTime, formatShortDate, formatAge, formatDue } from "@/lib/format";
@@ -280,9 +280,6 @@ function TaskDetailLevel({
                 </span>
               ) : null}
               {task.phase ? <PhaseBadge phase={task.phase} /> : null}
-              {(task.tags ?? []).map((t) => (
-                <TagChip key={t} id={t} />
-              ))}
             </div>
             <h2 className="text-lg font-semibold tracking-tight">{task.title}</h2>
           </div>

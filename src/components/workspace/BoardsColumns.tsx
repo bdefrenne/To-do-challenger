@@ -40,9 +40,16 @@ export function BoardsColumns({ project }: { project: Project }) {
 
   function handleReorderDrop(targetId: string) {
     if (dragBoardId && dragBoardId !== targetId) {
+      const fromIdx = boards.findIndex((b) => b.id === dragBoardId);
+      const targetIdx = boards.findIndex((b) => b.id === targetId);
       const ids = boards.map((b) => b.id).filter((id) => id !== dragBoardId);
       const to = ids.indexOf(targetId);
-      ids.splice(to < 0 ? ids.length : to, 0, dragBoardId);
+      // Dropping onto a target lands the board on that target's side: when
+      // moving forward (dragged board started before the target) insert AFTER
+      // it, otherwise insert in its place. Without the +1, forward drags (e.g.
+      // 1st → 2nd) resolve to the unchanged order and appear to do nothing.
+      const insertAt = to < 0 ? ids.length : fromIdx < targetIdx ? to + 1 : to;
+      ids.splice(insertAt, 0, dragBoardId);
       reorderBoards(project.id, ids);
     }
     setDragBoardId(null);

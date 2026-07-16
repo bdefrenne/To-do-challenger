@@ -7,21 +7,7 @@
   ====================================================================
 */
 
-import type { Tag, Task } from "./types";
-
-/** Tag catalog — referenced by id from a task's `tags`. */
-export const TAGS: Tag[] = [
-  { id: "work", label: "Work", tone: "purple" },
-  { id: "personal", label: "Personal", tone: "blue" },
-  { id: "home", label: "Home", tone: "green" },
-  { id: "errand", label: "Errand", tone: "amber" },
-  { id: "health", label: "Health", tone: "pink" },
-  { id: "finance", label: "Finance", tone: "gray" },
-];
-
-export function tagById(id: string): Tag | undefined {
-  return TAGS.find((t) => t.id === id);
-}
+import type { Task } from "./types";
 
 /* ---- Tasks (List view, ClickUp-style grouped table). ----
    Statuses: backlog (To Do) → planned → in-progress → done. */
@@ -33,7 +19,6 @@ export const TASKS: Task[] = [
     status: "in-progress",
     startDate: "2026-07-12",
     dueDate: "2026-07-15",
-    tags: ["work"],
     value: 8,
     difficulty: 5,
     recurrence: "none",
@@ -68,7 +53,6 @@ export const TASKS: Task[] = [
     title: "Review Alex's pull request",
     status: "planned",
     dueDate: "2026-07-14",
-    tags: ["work"],
     value: 3,
     difficulty: 2,
     dependsOn: ["t-1"],
@@ -80,7 +64,6 @@ export const TASKS: Task[] = [
     title: "Book the dentist appointment",
     status: "planned",
     dueDate: "2026-07-14",
-    tags: ["health", "personal"],
     updatedAt: "2026-07-13T18:30:00+02:00",
   },
   {
@@ -88,7 +71,6 @@ export const TASKS: Task[] = [
     title: "Grocery run for the week",
     status: "planned",
     dueDate: "2026-07-15",
-    tags: ["errand", "home"],
     recurrence: "weekly",
     customFields: { Store: "Whole Foods", Budget: 120 },
     updatedAt: "2026-07-13T19:00:00+02:00",
@@ -105,7 +87,6 @@ export const TASKS: Task[] = [
     title: "Prep slides for the team demo",
     status: "planned",
     dueDate: "2026-07-16",
-    tags: ["work"],
     commentCount: 5,
     updatedAt: "2026-07-13T11:00:00+02:00",
   },
@@ -116,14 +97,12 @@ export const TASKS: Task[] = [
     title: "Renew the car insurance",
     status: "backlog",
     dueDate: "2026-07-20",
-    tags: ["finance", "errand"],
     updatedAt: "2026-07-10T10:00:00+02:00",
   },
   {
     id: "t-7",
     title: "Fix the leaking kitchen tap",
     status: "backlog",
-    tags: ["home"],
     updatedAt: "2026-07-09T14:00:00+02:00",
   },
   {
@@ -131,7 +110,6 @@ export const TASKS: Task[] = [
     title: "Plan the September team offsite",
     status: "backlog",
     dueDate: "2026-08-01",
-    tags: ["work"],
     commentCount: 2,
     updatedAt: "2026-07-08T13:00:00+02:00",
     subtasks: [
@@ -151,21 +129,18 @@ export const TASKS: Task[] = [
     id: "t-9",
     title: "Read 'Shape Up' chapters 3–5",
     status: "backlog",
-    tags: ["personal"],
     updatedAt: "2026-07-06T21:00:00+02:00",
   },
   {
     id: "t-10",
     title: "Set up automatic savings transfer",
     status: "backlog",
-    tags: ["finance"],
     updatedAt: "2026-07-05T10:00:00+02:00",
   },
   {
     id: "t-11",
     title: "Water the plants",
     status: "backlog",
-    tags: ["home"],
     updatedAt: "2026-07-11T08:00:00+02:00",
   },
   {
@@ -173,7 +148,6 @@ export const TASKS: Task[] = [
     title: "Draft blog post on the new release",
     status: "backlog",
     dueDate: "2026-07-22",
-    tags: ["work"],
     updatedAt: "2026-07-07T15:30:00+02:00",
   },
 
@@ -182,21 +156,18 @@ export const TASKS: Task[] = [
     id: "t-13",
     title: "Send the invoice to the client",
     status: "done",
-    tags: ["finance", "work"],
     updatedAt: "2026-07-13T17:00:00+02:00",
   },
   {
     id: "t-14",
     title: "Reply to the landlord about the lease",
     status: "done",
-    tags: ["home"],
     updatedAt: "2026-07-12T12:00:00+02:00",
   },
   {
     id: "t-15",
     title: "Cancel the unused streaming subscription",
     status: "done",
-    tags: ["finance"],
     updatedAt: "2026-07-11T20:00:00+02:00",
   },
 ];

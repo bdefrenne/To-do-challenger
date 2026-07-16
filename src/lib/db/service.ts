@@ -157,7 +157,6 @@ function rowToTask(
     value: (row.value as FibPoints | null) ?? undefined,
     difficulty: (row.difficulty as FibPoints | null) ?? undefined,
     description: row.description ?? undefined,
-    tags: row.tags ?? [],
     commentCount: commentCount || undefined,
     boardId: row.boardId,
     projectId: row.projectId,
@@ -425,8 +424,6 @@ export interface TaskFilter {
   status?: TaskStatus[];
   /** Only tasks with this assignee (matches one of a task's assignees). */
   assignee?: string;
-  /** Only tasks carrying this tag. */
-  tag?: string;
   /** Case-insensitive substring match on title or description. */
   text?: string;
   /** Only tasks due on/before this date (YYYY-MM-DD). */
@@ -455,10 +452,9 @@ function taskWhere(userId: string, filter?: TaskFilter): SQL | undefined {
     );
   }
   if (filter?.status?.length) conds.push(inArray(tasks.status, filter.status));
-  // Array-membership: assignees/tags are text[] columns.
+  // Array-membership: assignees is a text[] column.
   if (filter?.assignee)
     conds.push(sql`${filter.assignee} = ANY(${tasks.assignees})`);
-  if (filter?.tag) conds.push(sql`${filter.tag} = ANY(${tasks.tags})`);
   if (filter?.text) {
     const pat = `%${filter.text}%`;
     conds.push(
@@ -569,18 +565,32 @@ export async function getTask(
       .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
   )[0];
   if (!row) return null;
-  const [logRows, attachmentRows, decisionRows, noteRows, commitRows, ctx] =
+  const [logRows, attachmentRows, decisionRows, noteRows, commitRows, childRows, ctx] =
     await Promise.all([
       db.select().from(taskLogs).where(eq(taskLogs.taskId, id)).orderBy(asc(taskLogs.at)),
       db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(asc(taskAttachments.createdAt)),
       db.select().from(taskDecisions).where(eq(taskDecisions.taskId, id)).orderBy(asc(taskDecisions.createdAt)),
       db.select().from(taskNotes).where(eq(taskNotes.taskId, id)).orderBy(asc(taskNotes.createdAt)),
       db.select().from(taskCommits).where(eq(taskCommits.taskId, id)).orderBy(asc(taskCommits.createdAt)),
+      db.select().from(tasks).where(and(eq(tasks.parentId, id), eq(tasks.userId, userId))).orderBy(asc(tasks.position)),
       codeCtx(userId),
     ]);
   const cCount = logRows.filter((l) => l.kind === "comment").length;
+  // Direct subtasks (one level). Comment counts come from one grouped query so
+  // each child's commentCount is truthful, mirroring buildTree's counts map.
+  let subtasks: TaskDTO[] | undefined;
+  if (childRows.length) {
+    const childIds = childRows.map((c) => c.id);
+    const countRows = await db
+      .select({ taskId: taskLogs.taskId, n: sql<number>`count(*)::int` })
+      .from(taskLogs)
+      .where(and(inArray(taskLogs.taskId, childIds), eq(taskLogs.kind, "comment")))
+      .groupBy(taskLogs.taskId);
+    const counts = new Map(countRows.map((r) => [r.taskId, r.n]));
+    subtasks = childRows.map((c) => rowToTask(c, counts.get(c.id) ?? 0, undefined, ctx));
+  }
   return {
-    task: rowToTask(row, cCount, attachmentRows.map(rowToAttachment), ctx),
+    task: { ...rowToTask(row, cCount, attachmentRows.map(rowToAttachment), ctx), subtasks },
     logs: logRows.map((l) => ({
       id: l.id,
       at: iso(l.at)!,
@@ -698,7 +708,6 @@ export interface CreateTaskInput {
   value?: FibPoints;
   difficulty?: FibPoints;
   description?: string;
-  tags?: string[];
   parentId?: string | null;
   boardId?: string | null;
 }
@@ -770,7 +779,6 @@ export async function createTask(
       value: input.value,
       difficulty: input.difficulty,
       description: input.description,
-      tags: input.tags ?? [],
       parentId,
       boardId,
       projectId,
@@ -795,7 +803,6 @@ export interface UpdateTaskInput {
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
   description?: string | null;
-  tags?: string[];
   /* ---- Workflow: revisable summaries (null clears) ---- */
   analysisSummary?: string | null;
   plan?: string | null;
@@ -844,7 +851,6 @@ export async function updateTask(
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
   if (patch.description !== undefined) values.description = patch.description;
-  if (patch.tags !== undefined) values.tags = patch.tags;
   if (patch.analysisSummary !== undefined) values.analysisSummary = patch.analysisSummary;
   if (patch.plan !== undefined) values.plan = patch.plan;
   if (patch.summary !== undefined) values.summary = patch.summary;
@@ -1130,12 +1136,6 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
         ? `Assignees → ${patch.assignees.join(", ")}`
         : "Assignees cleared",
     );
-  if (patch.tags !== undefined)
-    parts.push(
-      patch.tags.length
-        ? `Tags → ${patch.tags.map((t) => `#${t}`).join(" ")}`
-        : "Tags cleared",
-    );
   if (patch.value !== undefined)
     parts.push(patch.value == null ? "Value cleared" : `Value → ${patch.value}`);
   if (patch.difficulty !== undefined)
@@ -1199,7 +1199,6 @@ export async function bulkUpdate(
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
   if (patch.description !== undefined) values.description = patch.description;
-  if (patch.tags !== undefined) values.tags = patch.tags;
   if (patch.status !== undefined) {
     values.status = patch.status;
     values.statusSince = now;
@@ -2021,7 +2020,6 @@ function taskLines(t: TaskDTO, depth: number): string[] {
   if (t.dueDate) meta.push(`due:${t.dueDate}`);
   if (t.recurrence && t.recurrence !== "none") meta.push(`↻${t.recurrence}`);
   if (t.dependsOn?.length) meta.push(`⛔${t.dependsOn.length}`);
-  if (t.tags?.length) meta.push(...t.tags.map((x) => `#${x}`));
   if (t.attachments?.length) meta.push(`📎${t.attachments.length}`);
   const tail = meta.length ? `  _(${meta.join(" · ")})_` : "";
   // Show the human code up front; keep the raw id (in backticks) for tools.

@@ -183,7 +183,6 @@ export type TaskEdit = Partial<
     | "customFields"
     | "value"
     | "difficulty"
-    | "tags"
     | "description"
   >
 >;
@@ -194,7 +193,6 @@ export type TaskEdit = Partial<
 const CONTENT_FIELDS: (keyof TaskEdit)[] = [
   "title",
   "description",
-  "tags",
   "assignees",
   "startDate",
   "dueDate",
