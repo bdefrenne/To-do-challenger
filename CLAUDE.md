@@ -20,6 +20,19 @@ the REST API (`src/app/api/*`), and the MCP server (`src/app/api/mcp`). When you
 add or change a field, thread it through **schema → types → service → API
 schemas (`src/lib/api.ts`) → routes → MCP → UI** so all three surfaces agree.
 
+## Live data (todo MCP)
+
+This session has the **`todo` MCP server** connected — a live link to a running
+To-do Challenger instance (the same app this repo builds). So the user may ask
+questions about *actual* tasks, projects, and boards, not just the code, e.g.
+"what's on my plate today?", "what did I decide on task X?", "add a task for …".
+
+Answer those against the MCP, not the source. Useful tools: `list_projects`,
+`list_tasks` / `search_tasks` / `get_task`, `standup`, `list_decisions` /
+`list_notes`, and the write tools (`create_task`, `update_task`,
+`complete_task`, `record_decision`, …). Follow the todo MCP's own usage
+instructions when creating or modifying anything.
+
 ## Commands
 
 - `npm run dev` — dev server

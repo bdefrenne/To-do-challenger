@@ -1,0 +1,90 @@
+"use client";
+
+/**
+ * Shared Markdown renderer. The app authors task descriptions and project/board
+ * readmes as Markdown; this renders them with the app's design tokens (there is
+ * no Tailwind `prose`/typography plugin, so each element is styled explicitly).
+ *
+ * - `remark-gfm`   — GitHub-flavored markdown (inline code, lists, tables, links).
+ * - `remark-breaks` — soft single newlines become <br>, so line breaks authored
+ *   in the raw text are preserved on screen.
+ *
+ * `react-markdown` escapes raw HTML by default (no `dangerouslySetInnerHTML`), so
+ * this is safe to point at user-authored content.
+ */
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+
+export function Markdown({
+  children,
+  className = "",
+}: {
+  children: string;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`text-sm leading-relaxed text-fg [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${className}`}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={{
+          h1: (p) => <h2 className="mb-1 mt-3 text-base font-semibold" {...p} />,
+          h2: (p) => <h3 className="mb-1 mt-3 text-sm font-semibold" {...p} />,
+          h3: (p) => (
+            <h4 className="mb-1 mt-2 text-sm font-semibold text-muted" {...p} />
+          ),
+          p: (p) => <p className="mb-2" {...p} />,
+          ul: (p) => <ul className="mb-2 list-disc space-y-0.5 pl-5" {...p} />,
+          ol: (p) => <ol className="mb-2 list-decimal space-y-0.5 pl-5" {...p} />,
+          li: (p) => <li className="pl-0.5" {...p} />,
+          a: (p) => (
+            <a
+              className="text-accent underline underline-offset-2 hover:opacity-80"
+              target="_blank"
+              rel="noopener noreferrer"
+              {...p}
+            />
+          ),
+          code: ({ className: cn, children: c, ...rest }) =>
+            cn?.includes("language-") ? (
+              // fenced code block — <pre> handles the box; keep the language class
+              <code className={cn} {...rest}>
+                {c}
+              </code>
+            ) : (
+              <code
+                className="rounded bg-surface-3 px-1 py-0.5 font-mono text-[0.85em]"
+                {...rest}
+              >
+                {c}
+              </code>
+            ),
+          pre: (p) => (
+            <pre
+              className="mb-2 overflow-x-auto rounded-lg bg-surface-3 p-3 font-mono text-[13px]"
+              {...p}
+            />
+          ),
+          blockquote: (p) => (
+            <blockquote className="mb-2 border-l-2 border-border pl-3 text-muted" {...p} />
+          ),
+          strong: (p) => <strong className="font-semibold" {...p} />,
+          hr: () => <hr className="my-3 border-border" />,
+          table: (p) => (
+            <div className="mb-2 overflow-x-auto">
+              <table className="w-full border-collapse text-left" {...p} />
+            </div>
+          ),
+          th: (p) => (
+            <th className="border border-border px-2 py-1 font-semibold" {...p} />
+          ),
+          td: (p) => <td className="border border-border px-2 py-1" {...p} />,
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}

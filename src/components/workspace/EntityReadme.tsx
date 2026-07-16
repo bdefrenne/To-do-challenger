@@ -1,11 +1,12 @@
 "use client";
 
 import { SUMMARY_FILENAME, summaryPath } from "@/lib/repo-sync";
+import { Markdown } from "@/components/ui/Markdown";
 
 /**
  * Shows a project's / board's git folder and Markdown readme above its task
- * list. The readme is rendered as pre-wrapped text (the app has no Markdown
- * renderer) — enough for humans to read; AIs consume the raw source over MCP.
+ * list. The readme is rendered as formatted Markdown for humans; AIs consume
+ * the raw source over MCP.
  * Also surfaces the repo-sync convention: the description mirrors a file in the
  * git folder that must be kept in sync both ways. Renders nothing when both
  * git folder and description are empty.
@@ -29,11 +30,7 @@ export function EntityReadme({
           </code>
         </div>
       ) : null}
-      {description ? (
-        <p className="whitespace-pre-wrap break-words font-mono text-[13px] leading-relaxed text-fg">
-          {description}
-        </p>
-      ) : null}
+      {description ? <Markdown>{description}</Markdown> : null}
       <p className="mt-3 border-t border-border pt-2 text-[11px] leading-relaxed text-faint">
         🔗 Kept in sync with{" "}
         <code className="rounded bg-surface px-1 py-0.5 font-mono text-fg">

@@ -12,6 +12,7 @@ import type {
   TaskCommit,
 } from "@/lib/types";
 import { Button } from "@/components/ui/Button";
+import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip, TagChip } from "@/components/ui/Badge";
 import { AvatarStack, PersonAvatar } from "@/components/PersonAvatar";
 import { usePeople } from "@/components/PeopleContext";
@@ -113,6 +114,9 @@ function TaskDetailLevel({
   // Inline "add subtask" composer.
   const [subtaskTitle, setSubtaskTitle] = useState("");
   const [addingSub, setAddingSub] = useState(false);
+  // Inline description editor: rendered Markdown by default, raw source on edit.
+  const [editingDesc, setEditingDesc] = useState(false);
+  const [descDraft, setDescDraft] = useState("");
 
   // Each stack level is a fresh component instance (keyed by task id in the
   // wrapper), so the composer/gallery state above is naturally per-task — no
@@ -194,6 +198,17 @@ function TaskDetailLevel({
     if (!text) return;
     setDraft("");
     addComment(taskId, text);
+  };
+
+  const startEditDesc = () => {
+    setDescDraft(task.description ?? "");
+    setEditingDesc(true);
+  };
+  const saveDesc = () => {
+    // Empty string clears it — the task PATCH schema takes a string, not null,
+    // and `""` reads as falsy so the section falls back to "+ Add description".
+    editTask(taskId, { description: descDraft.trim() });
+    setEditingDesc(false);
   };
 
   const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -295,15 +310,57 @@ function TaskDetailLevel({
               </Button>
             </div>
 
-            {/* description */}
-            {task.description ? (
-              <div>
+            {/* description — rendered Markdown; click Edit for the raw source */}
+            <div>
+              <div className="flex items-center justify-between">
                 <SectionLabel>Description</SectionLabel>
-                <p className="mt-1 rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
-                  {task.description}
-                </p>
+                {!editingDesc && task.description ? (
+                  <button
+                    type="button"
+                    onClick={startEditDesc}
+                    className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2"
+                  >
+                    ✎ Edit
+                  </button>
+                ) : null}
               </div>
-            ) : null}
+              {editingDesc ? (
+                <div className="mt-1">
+                  <textarea
+                    value={descDraft}
+                    onChange={(e) => setDescDraft(e.target.value)}
+                    autoFocus
+                    rows={8}
+                    placeholder="Describe this task…  (Markdown supported)"
+                    className="w-full resize-y rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] leading-relaxed text-fg outline-none focus:border-accent"
+                  />
+                  <div className="mt-2 flex items-center gap-2">
+                    <Button variant="primary" size="sm" onClick={saveDesc}>
+                      Save
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setEditingDesc(false)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : task.description ? (
+                <div className="mt-1 rounded-lg border border-border bg-surface-2 px-3 py-2">
+                  <Markdown>{task.description}</Markdown>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={startEditDesc}
+                  className="mt-1 text-xs font-medium text-accent hover:underline"
+                >
+                  + Add description
+                </button>
+              )}
+            </div>
 
             {/* workflow — summaries, decisions, notes, commits */}
             <WorkflowSection

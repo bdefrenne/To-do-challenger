@@ -39,10 +39,18 @@ import {
 } from "@/lib/telegram/api";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+// Requires Vercel Pro (Hobby hard-caps at 60s). Gives heavy turns room to
+// finish; prompt caching keeps normal turns fast so this is a ceiling, not a
+// wait the user usually feels.
+export const maxDuration = 300;
 
 const CONFIRM = "td:confirm";
 const CANCEL = "td:cancel";
+
+// Message the user just before Vercel's hard kill, so a slow turn shows a clear
+// note instead of a frozen "⏳ On it…". Kept under maxDuration so it always wins.
+const TURN_BUDGET_MS = (maxDuration - 5) * 1000;
+const TIMED_OUT = Symbol("timed_out");
 
 /* Minimal shapes of the Telegram update payloads we consume. */
 interface TgChat {
@@ -140,15 +148,38 @@ async function handleMessage(message: TgMessage): Promise<void> {
   const thread: ThreadTurn[] = [...link.thread, { role: "user", content: text }];
 
   try {
-    const result = await runBrain({
-      mcpToken: link.mcpToken,
-      thread: link.thread,
-      userMessage: text,
-      onStatus,
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([
+      runBrain({
+        mcpToken: link.mcpToken,
+        thread: link.thread,
+        userMessage: text,
+        onStatus,
+      }),
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), TURN_BUDGET_MS);
+      }),
+    ]);
+    clearTimeout(timer);
 
-    // Total tokens spent on this question, appended to the reply the user sees.
-    const tokenLine = `\n\n🪙 ${result.usage.total.toLocaleString()} tokens`;
+    // Ran out of time before Vercel kills the function — say so, don't freeze.
+    if (result === TIMED_OUT) {
+      if (statusId != null)
+        await editMessageText(
+          chatId,
+          statusId,
+          "⚠️ That took too long — try a narrower request.",
+        );
+      return;
+    }
+
+    // Token spend for this question, appended to the reply the user sees:
+    // total plus the input / output / cache-read / cache-write breakdown.
+    const u = result.usage;
+    const n = (x: number) => x.toLocaleString();
+    const tokenLine =
+      `\n\n🪙 ${n(u.total)} tokens ` +
+      `(${n(u.input)} in · ${n(u.output)} out · ${n(u.cacheRead)} cache read · ${n(u.cacheWrite)} cache write)`;
 
     if (result.proposal) {
       await setPendingConfirm(chatId, result.proposal);

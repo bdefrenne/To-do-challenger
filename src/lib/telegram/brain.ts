@@ -43,6 +43,10 @@ You CANNOT delete tasks or make bulk changes directly — those tools are disabl
 const PROPOSE_TOOL: Anthropic.Beta.BetaToolUnion = {
   type: "custom",
   name: "propose_destructive",
+  // Cache breakpoint on the LAST tool caches the whole tools block — including
+  // the big MCP toolset expansion — so it's read from cache on repeat turns
+  // instead of re-billed/reprocessed as fresh input each message.
+  cache_control: { type: "ephemeral" },
   description:
     "Propose a delete or bulk change for the user to confirm. You cannot delete or bulk-edit directly — describe the plan here and the user taps Confirm.",
   input_schema: {
@@ -152,7 +156,8 @@ export async function runBrain(opts: {
       model: MODEL,
       max_tokens: 4096,
       betas: [MCP_BETA],
-      system: SYSTEM,
+      // Cache the (static) system prompt too — cheap win on top of the tools.
+      system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
       mcp_servers: [
         { type: "url", name: "todo", url: MCP_URL, authorization_token: opts.mcpToken },
       ],
