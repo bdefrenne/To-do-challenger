@@ -1,7 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { Avatar } from "@/components/ui/Badge";
+import { AvatarCropper } from "@/components/ui/AvatarCropper";
+import { usePeople } from "@/components/PeopleContext";
 
 interface TokenInfo {
   id: string;
@@ -76,7 +80,11 @@ export default function SettingsPage() {
       />
 
       <div className="max-w-3xl space-y-8 px-8 py-6">
+        <ProfileSection />
+
         <CalendarsSection />
+
+        <TelegramSection />
 
         {/* Create */}
         <section className="rounded-xl border border-border bg-surface p-5">
@@ -146,6 +154,274 @@ export default function SettingsPage() {
         </section>
       </div>
     </div>
+  );
+}
+
+/* -------------------------------------------------------------------- */
+/* Telegram — link a chat so you can manage tasks on the go              */
+/* -------------------------------------------------------------------- */
+
+function TelegramSection() {
+  const [busy, setBusy] = useState(false);
+  const [link, setLink] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function connect() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await fetch("/api/telegram/link", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) setLink(data.url);
+      else setErr(data.error ?? "Couldn't create a link right now.");
+    } catch {
+      setErr("Couldn't create a link right now.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="rounded-xl border border-border bg-surface p-5">
+      <h2 className="mb-1 text-sm font-semibold">Connect Telegram</h2>
+      <p className="mb-4 text-xs text-muted">
+        Link a Telegram chat to ask about your to-dos and make changes on the go.
+        The link is one-time and expires in 15 minutes; only this account is bound.
+      </p>
+      {!link ? (
+        <button
+          onClick={connect}
+          disabled={busy}
+          className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Creating link…" : "Connect Telegram"}
+        </button>
+      ) : (
+        <div className="rounded-lg border border-accent/40 bg-accent-soft/40 p-4">
+          <div className="mb-2 text-xs font-medium text-accent">
+            Open this on the device with Telegram, then tap Start:
+          </div>
+          <a
+            href={link}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+          >
+            Open Telegram →
+          </a>
+          <div className="mt-3">
+            <CopyBox value={link} mono />
+          </div>
+        </div>
+      )}
+      {err && <p className="mt-3 text-xs text-red-600">{err}</p>}
+    </section>
+  );
+}
+
+/* -------------------------------------------------------------------- */
+/* Profile — display name, avatar color, and profile picture             */
+/* -------------------------------------------------------------------- */
+
+function ProfileSection() {
+  const { me, refresh } = usePeople();
+  const router = useRouter();
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const [name, setName] = useState(me?.name ?? "");
+  const [color, setColor] = useState(me?.color ?? "#7b68ee");
+  const [urlDraft, setUrlDraft] = useState("");
+  const [cropFile, setCropFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  // Keep the form in sync if the roster resolves after first paint.
+  const [seededFor, setSeededFor] = useState(me?.id);
+  if (me && me.id !== seededFor) {
+    setSeededFor(me.id);
+    setName(me.name);
+    setColor(me.color);
+  }
+
+  const flash = useCallback(() => {
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  }, []);
+
+  const after = useCallback(async () => {
+    await refresh();
+    router.refresh(); // re-render the server layout so the sidebar updates too
+  }, [refresh, router]);
+
+  async function patchProfile(patch: Record<string, unknown>) {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await fetch("/api/profile", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        setErr(b.error ?? `Failed (${res.status})`);
+        return false;
+      }
+      await after();
+      flash();
+      return true;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadCropped(blob: Blob) {
+    setCropFile(null);
+    setBusy(true);
+    setErr(null);
+    try {
+      const form = new FormData();
+      form.append("file", blob, "avatar.jpg");
+      const res = await fetch("/api/profile/avatar", { method: "POST", body: form });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        setErr(b.error ?? `Failed (${res.status})`);
+        return;
+      }
+      await after();
+      flash();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!me) return null;
+
+  return (
+    <section className="rounded-xl border border-border bg-surface p-5">
+      <h2 className="mb-1 text-sm font-semibold">Profile</h2>
+      <p className="mb-4 text-xs text-muted">
+        Your display name, avatar color, and picture — used everywhere you’re
+        shown as an assignee.
+      </p>
+
+      <div className="flex flex-wrap items-start gap-5">
+        {/* Live preview */}
+        <div className="flex flex-col items-center gap-2">
+          <Avatar name={name || me.email} size={72} imageUrl={me.avatarUrl} color={color} />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={busy}
+              className="rounded-md px-2 py-1 text-xs font-medium text-accent hover:bg-surface-2 disabled:opacity-50"
+            >
+              {me.avatarUrl ? "Change photo" : "Upload photo"}
+            </button>
+            {me.avatarUrl ? (
+              <button
+                type="button"
+                onClick={() => patchProfile({ avatarUrl: null })}
+                disabled={busy}
+                className="rounded-md px-2 py-1 text-xs text-red-600 hover:bg-red-50 disabled:opacity-50"
+              >
+                Remove
+              </button>
+            ) : null}
+          </div>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              e.target.value = "";
+              if (f) setCropFile(f);
+            }}
+          />
+        </div>
+
+        {/* Fields */}
+        <div className="min-w-[220px] flex-1 space-y-4">
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-muted">Display name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Your name"
+              className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+            />
+          </label>
+
+          <div>
+            <span className="mb-1 block text-xs font-medium text-muted">Avatar color</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="color"
+                value={color}
+                onChange={(e) => setColor(e.target.value)}
+                aria-label="Pick avatar color"
+                className="h-9 w-10 shrink-0 cursor-pointer rounded-md border border-border bg-bg p-1"
+              />
+              <input
+                value={color}
+                onChange={(e) => setColor(e.target.value)}
+                spellCheck={false}
+                aria-label="Hex color"
+                className="w-28 rounded-lg border border-border bg-bg px-3 py-2 font-mono text-sm text-fg outline-none focus:border-accent"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => patchProfile({ name: name.trim(), color })}
+              disabled={busy || !name.trim() || !/^#[0-9a-fA-F]{6}$/.test(color)}
+              className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+            {saved ? <span className="text-xs text-buff">Saved ✓</span> : null}
+          </div>
+
+          {/* Paste-URL alternative */}
+          <div className="border-t border-border pt-3">
+            <span className="mb-1 block text-xs font-medium text-muted">
+              …or use an image URL
+            </span>
+            <div className="flex gap-2">
+              <input
+                value={urlDraft}
+                onChange={(e) => setUrlDraft(e.target.value)}
+                placeholder="https://…/photo.jpg"
+                className="flex-1 rounded-lg border border-border bg-bg px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+              />
+              <button
+                onClick={async () => {
+                  if (await patchProfile({ avatarUrl: urlDraft.trim() })) setUrlDraft("");
+                }}
+                disabled={busy || !urlDraft.trim()}
+                className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg disabled:opacity-50"
+              >
+                Use
+              </button>
+            </div>
+          </div>
+
+          {err ? <p className="text-xs text-nerf">{err}</p> : null}
+        </div>
+      </div>
+
+      {cropFile ? (
+        <AvatarCropper
+          file={cropFile}
+          onCancel={() => setCropFile(null)}
+          onDone={uploadCropped}
+        />
+      ) : null}
+    </section>
   );
 }
 

@@ -33,13 +33,99 @@ export interface Board {
   id: string;
   projectId: string;
   name: string;
+  /** ≤4-char ref prefix (e.g. "GH") — the primary source of a task's code.
+   *  Doubles as the board's shortname in the tasks list. */
+  code?: string | null;
+  /** Accent color (hex). Always present (column default). */
+  color?: string;
+  /** Board picture — a public blob URL, or null for none. */
+  image?: string | null;
+  /** Path to this board's git working directory. */
+  gitFolder?: string | null;
+  /** Markdown readme: what this board is and its constraints. */
+  description?: string | null;
 }
 
 /** Top level of the hierarchy (e.g. a whole game); holds Boards. */
 export interface Project {
   id: string;
   name: string;
+  /** ≤4-char ref prefix used when a task is project-scoped but board-less.
+   *  Doubles as the project's shortname. */
+  code?: string | null;
+  /** Accent color (hex). Always present (column default). */
+  color?: string;
+  /** Project picture — a public blob URL, or null for none. */
+  image?: string | null;
+  /** Path to this project's git working directory. */
+  gitFolder?: string | null;
+  /** Markdown readme: what this project is and its constraints. */
+  description?: string | null;
   boards?: Board[];
+}
+
+/**
+ * A task's workflow phase, DERIVED from its lifecycle timestamps + lock state
+ * (never stored). Kanban `status` is orthogonal to this.
+ */
+export type TaskPhase =
+  | "draft" // code still soft (unlocked)
+  | "ready" // locked, analysis not started
+  | "analyzing" // analysisStartedAt set, analyzedAt not
+  | "analyzed" // analyzedAt set, workStartedAt not
+  | "working" // workStartedAt set, not done
+  | "done"; // completedAt set
+
+/** A decision's category — drives the Decisions-page filter. */
+export type DecisionCategory =
+  | "business"
+  | "product"
+  | "ux"
+  | "technical"
+  | "scope";
+
+/** Which lifecycle phase a decision was made in. */
+export type DecisionPhase = "analysis" | "execution";
+
+/** Retro verdict on a decision (null until reviewed). */
+export type DecisionOutcome = "good" | "mixed" | "bad";
+
+/** A recorded decision — first-class, cross-task, retro-reviewable. */
+export interface Decision {
+  id: string;
+  taskId: string;
+  category: DecisionCategory;
+  decision: string;
+  rationale?: string | null;
+  phase: DecisionPhase;
+  author?: string | null;
+  createdAt: string; // ISO
+  outcome?: DecisionOutcome | null;
+  reviewedAt?: string | null;
+  reviewNote?: string | null;
+  supersededById?: string | null;
+}
+
+/** A note's type — lets the standup digest group them. */
+export type NoteType = "progress" | "blocker" | "question" | "fyi";
+
+/** A team-facing note surfaced at standup. */
+export interface Note {
+  id: string;
+  taskId: string;
+  type?: NoteType | null;
+  note: string;
+  author?: string | null;
+  createdAt: string; // ISO
+}
+
+/** A git commit linked back to a task. */
+export interface TaskCommit {
+  id: string;
+  taskId: string;
+  sha: string;
+  subject?: string | null;
+  createdAt: string; // ISO
 }
 
 /** An image attached to a task (bytes stored in Vercel Blob). */
@@ -61,8 +147,26 @@ export interface Task {
   id: string;
   title: string;
   status: TaskStatus;
+  /** Human-friendly code (e.g. "GH-20", or "GH-20*" while unlocked/soft). */
+  code?: string;
+  /** The frozen code string once locked (null while soft). */
+  ref?: string | null;
+  /** True once the code is locked (frozen) — handoff or first mutation. */
+  refLocked?: boolean;
+  /** Derived workflow phase (see TaskPhase) — not the kanban status. */
+  phase?: TaskPhase;
+  /** Lifecycle timestamps (ISO) — informational, non-gating. */
+  analysisStartedAt?: string | null;
+  analyzedAt?: string | null;
+  workStartedAt?: string | null;
+  /** Revisable summaries written across the workflow. */
+  analysisSummary?: string | null;
+  plan?: string | null;
+  summary?: string | null;
   /** Which board the task lives on (null/undefined = unassigned). */
   boardId?: string | null;
+  /** Which project the task is scoped to (for board-less tasks). */
+  projectId?: string | null;
   /** Display names of the people assigned (empty/undefined = unassigned). */
   assignees?: string[];
   /** ISO date work should start — pairs with dueDate (the end). */

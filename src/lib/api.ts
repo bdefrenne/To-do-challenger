@@ -44,6 +44,9 @@ export const createTaskSchema = z.object({
   boardId: z.string().nullable().optional(),
 });
 
+/** An ISO datetime (or null to clear). Lenient — the service normalizes it. */
+const isoDateTime = z.string().min(1).max(40);
+
 export const updateTaskSchema = z
   .object({
     title: z.string().min(1).max(500),
@@ -58,8 +61,48 @@ export const updateTaskSchema = z
     difficulty: fibSchema.nullable(),
     description: z.string().max(10_000).nullable(),
     tags: z.array(z.string()),
+    /* ---- Workflow: revisable summaries (null clears) ---- */
+    analysisSummary: z.string().max(20_000).nullable(),
+    plan: z.string().max(20_000).nullable(),
+    summary: z.string().max(20_000).nullable(),
+    /* ---- Workflow: lifecycle timestamps (ISO, or null to clear) ---- */
+    analysisStartedAt: isoDateTime.nullable(),
+    analyzedAt: isoDateTime.nullable(),
+    workStartedAt: isoDateTime.nullable(),
   })
   .partial();
+
+/* ---- Workflow: decisions, notes, commits ---- */
+export const decisionCategorySchema = z.enum([
+  "business",
+  "product",
+  "ux",
+  "technical",
+  "scope",
+]);
+export const decisionOutcomeSchema = z.enum(["good", "mixed", "bad"]);
+export const noteTypeSchema = z.enum(["progress", "blocker", "question", "fyi"]);
+
+export const recordDecisionSchema = z.object({
+  category: decisionCategorySchema,
+  decision: z.string().min(1).max(2_000),
+  rationale: z.string().max(10_000).nullable().optional(),
+});
+
+export const reviewDecisionSchema = z.object({
+  outcome: decisionOutcomeSchema,
+  reviewNote: z.string().max(10_000).nullable().optional(),
+});
+
+export const addNoteSchema = z.object({
+  note: z.string().min(1).max(10_000),
+  type: noteTypeSchema.nullable().optional(),
+});
+
+export const linkCommitSchema = z.object({
+  sha: z.string().min(4).max(64),
+  subject: z.string().max(500).nullable().optional(),
+});
 
 export const moveTaskSchema = z.object({
   parentId: z.string().nullable().optional(),
@@ -148,22 +191,65 @@ export const updateConnectionSchema = z
     { message: "provide calendarId, type and/or label" },
   );
 
+/* ---- Profile ---- */
+
+/** Edit your own profile. Partial — send just the field(s) you're changing.
+ *  `avatarUrl: null` clears the picture (back to initials). */
+export const profileSchema = z
+  .object({
+    name: z.string().min(1, "name can't be empty").max(120),
+    color: z.string().regex(/^#[0-9a-fA-F]{6}$/, "use a #rrggbb hex color"),
+    avatarUrl: z.string().url().max(2048).nullable(),
+  })
+  .partial()
+  .refine((v) => Object.keys(v).length > 0, { message: "provide a field to update" });
+
 /* ---- Projects & Boards ---- */
+const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/, "use a #rrggbb hex color");
+const pictureUrl = z.string().url().max(2048);
+const gitFolder = z.string().max(512);
+/** Markdown readme explaining what a project/board is and its constraints. */
+const description = z.string().max(20000);
+
 export const createProjectSchema = z.object({
   name: z.string().min(1, "name is required").max(120),
+  code: z.string().min(1).max(8).optional(),
+  color: hexColor.optional(),
+  image: pictureUrl.optional(),
+  gitFolder: gitFolder.optional(),
+  description: description.optional(),
 });
 
 export const updateProjectSchema = z
-  .object({ name: z.string().min(1).max(120) })
+  .object({
+    name: z.string().min(1).max(120),
+    code: z.string().min(1).max(8),
+    color: hexColor,
+    image: pictureUrl.nullable(),
+    gitFolder: gitFolder.nullable(),
+    description: description.nullable(),
+  })
   .partial();
 
 export const createBoardSchema = z.object({
   projectId: z.string().min(1, "projectId is required"),
   name: z.string().min(1, "name is required").max(120),
+  code: z.string().min(1).max(8).optional(),
+  color: hexColor.optional(),
+  image: pictureUrl.optional(),
+  gitFolder: gitFolder.optional(),
+  description: description.optional(),
 });
 
 export const updateBoardSchema = z
-  .object({ name: z.string().min(1).max(120) })
+  .object({
+    name: z.string().min(1).max(120),
+    code: z.string().min(1).max(8),
+    color: hexColor,
+    image: pictureUrl.nullable(),
+    gitFolder: gitFolder.nullable(),
+    description: description.nullable(),
+  })
   .partial();
 
 /** Reorder all boards within a project — `orderedIds` is the new top-to-bottom

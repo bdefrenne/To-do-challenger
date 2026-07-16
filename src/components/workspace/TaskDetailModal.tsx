@@ -1,9 +1,20 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { TaskLogEntry } from "@/lib/types";
+import type {
+  Task,
+  TaskLogEntry,
+  TaskPhase,
+  Decision,
+  DecisionCategory,
+  Note,
+  NoteType,
+  TaskCommit,
+} from "@/lib/types";
 import { Button } from "@/components/ui/Button";
-import { Avatar, AvatarStack, PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { AvatarStack, PersonAvatar } from "@/components/PersonAvatar";
+import { usePeople } from "@/components/PeopleContext";
 import { formatTime, formatShortDate, formatAge, formatDue } from "@/lib/format";
 import { STATUS_LABEL, RECURRENCE_LABEL } from "@/lib/statuses";
 import { StatusPill } from "./StatusPill";
@@ -37,22 +48,57 @@ const LOG_COLOR: Record<TaskLogEntry["kind"], string> = {
   updated: "text-accent",
 };
 
-/** Full task detail modal — opens on row click. Rendered once globally (in AppShell). */
+/** Wrapper: renders one detail modal per entry in the open-task stack, so
+ *  subtasks (and any task click) stack on top and nest indefinitely. Rendered
+ *  once globally (in AppShell); the stack + its URL sync live in WorkspaceContext. */
 export function TaskDetailModal() {
+  const { openTaskIds } = useWorkspace();
+  if (!openTaskIds.length) return null;
+  return (
+    <>
+      {openTaskIds.map((id, i) => (
+        <TaskDetailLevel
+          key={id}
+          taskId={id}
+          depth={i}
+          isTop={i === openTaskIds.length - 1}
+        />
+      ))}
+    </>
+  );
+}
+
+/** A single level of the task-detail modal stack. */
+function TaskDetailLevel({
+  taskId,
+  depth,
+  isTop,
+}: {
+  taskId: string;
+  depth: number;
+  isTop: boolean;
+}) {
   const {
-    openTaskId,
     openTask,
     closeTask,
+    addSubtask,
     taskMap,
     logs,
+    decisions,
+    notes,
+    commits,
     nodeById,
     start,
     toggleDone,
     setStatus,
     childrenOf,
     addComment,
+    lockTask,
+    recordDecision,
+    addNote,
     addAttachment,
     removeAttachment,
+    editTask,
   } = useWorkspace();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -62,22 +108,22 @@ export function TaskDetailModal() {
   // in the lightbox). One index drives both, so selecting persists across open/close.
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [locking, setLocking] = useState(false);
+  // Inline "add subtask" composer.
+  const [subtaskTitle, setSubtaskTitle] = useState("");
+  const [addingSub, setAddingSub] = useState(false);
 
-  // Clear the composer + reset the gallery when switching tasks (render-phase
-  // state adjust — the recommended alternative to an effect).
-  const [draftFor, setDraftFor] = useState(openTaskId);
-  if (openTaskId !== draftFor) {
-    setDraftFor(openTaskId);
-    setDraft("");
-    setSelectedIndex(0);
-    setLightboxOpen(false);
-  }
+  // Each stack level is a fresh component instance (keyed by task id in the
+  // wrapper), so the composer/gallery state above is naturally per-task — no
+  // reset-on-switch effect needed.
 
-  // Keyboard: Escape closes the lightbox (if open) else the modal; when the
-  // lightbox is open, ←/→ step the featured image (staying full screen).
+  // Keyboard: Escape closes the lightbox (if open) else this modal; when the
+  // lightbox is open, ←/→ step the featured image. Only the topmost level
+  // listens, so Escape pops one level at a time instead of collapsing the stack.
   useEffect(() => {
-    if (!openTaskId) return;
-    const count = (taskMap[openTaskId]?.attachments ?? []).length;
+    if (!isTop) return;
+    const count = (taskMap[taskId]?.attachments ?? []).length;
     const onKey = (e: KeyboardEvent) => {
       if (lightboxOpen) {
         if (e.key === "Escape") {
@@ -96,11 +142,11 @@ export function TaskDetailModal() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [openTaskId, closeTask, lightboxOpen, taskMap]);
+  }, [isTop, taskId, closeTask, lightboxOpen, taskMap]);
 
-  // Paste an image anywhere while the modal is open (Ctrl/⌘+V).
+  // Paste an image anywhere while the topmost modal is open (Ctrl/⌘+V).
   useEffect(() => {
-    if (!openTaskId) return;
+    if (!isTop) return;
     const onPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
@@ -110,7 +156,7 @@ export function TaskDetailModal() {
           if (file) {
             e.preventDefault();
             setUploading(true);
-            addAttachment(openTaskId, file).finally(() => setUploading(false));
+            addAttachment(taskId, file).finally(() => setUploading(false));
           }
           break;
         }
@@ -118,14 +164,15 @@ export function TaskDetailModal() {
     };
     document.addEventListener("paste", onPaste);
     return () => document.removeEventListener("paste", onPaste);
-  }, [openTaskId, addAttachment]);
+  }, [isTop, taskId, addAttachment]);
 
-  if (!openTaskId) return null;
-  const task = taskMap[openTaskId];
-  const node = nodeById(openTaskId);
+  const task = taskMap[taskId];
+  const node = nodeById(taskId);
+  // Task may not be loaded yet (e.g. hydrating the stack from the URL on
+  // refresh); render nothing for this level until it arrives.
   if (!task || !node) return null;
 
-  const allEntries = logs[openTaskId] ?? [];
+  const allEntries = logs[taskId] ?? [];
   // Comments are their own conversation thread (oldest → newest, chat order);
   // everything else stays in the Activity timeline (newest first).
   const comments = allEntries
@@ -134,7 +181,7 @@ export function TaskDetailModal() {
   const activity = allEntries
     .filter((e) => e.kind !== "comment")
     .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
-  const kids = childrenOf(openTaskId);
+  const kids = childrenOf(taskId);
   const done = node.status === "done";
   const due = task.dueDate ? formatDue(task.dueDate) : null;
   const attachments = task.attachments ?? [];
@@ -146,7 +193,7 @@ export function TaskDetailModal() {
     const text = draft.trim();
     if (!text) return;
     setDraft("");
-    addComment(openTaskId, text);
+    addComment(taskId, text);
   };
 
   const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -155,39 +202,81 @@ export function TaskDetailModal() {
     if (!files.length) return;
     setUploading(true);
     (async () => {
-      for (const f of files) await addAttachment(openTaskId, f);
+      for (const f of files) await addAttachment(taskId, f);
     })().finally(() => setUploading(false));
   };
 
   const lightboxItem = lightboxOpen ? featured : null;
 
+  // Lock the code (if still soft) and copy the ready-to-paste work prompt.
+  const copyPrompt = async () => {
+    if (locking) return;
+    setLocking(true);
+    try {
+      const prompt = await lockTask(taskId);
+      await navigator.clipboard?.writeText(prompt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      console.error("[modal] copy prompt failed", e);
+    } finally {
+      setLocking(false);
+    }
+  };
+
   return (
     <>
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/30 p-6 backdrop-blur-sm"
+      className="fixed inset-0 flex items-start justify-center overflow-y-auto bg-slate-900/30 p-6 backdrop-blur-sm"
+      style={{ zIndex: 50 + depth * 10 }}
       onClick={closeTask}
     >
       <div
-        className="mt-12 w-full max-w-2xl rounded-xl border border-border bg-surface shadow-2xl"
+        className="mt-12 w-full max-w-[940px] rounded-xl border border-border bg-surface shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
           <div className="min-w-0">
             <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+              {task.code ? (
+                <span
+                  className="rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] font-medium text-muted"
+                  title={task.refLocked ? "Locked code" : "Soft code — not locked yet"}
+                >
+                  {task.code}
+                </span>
+              ) : null}
+              {task.phase ? <PhaseBadge phase={task.phase} /> : null}
               {(task.tags ?? []).map((t) => (
                 <TagChip key={t} id={t} />
               ))}
             </div>
             <h2 className="text-lg font-semibold tracking-tight">{task.title}</h2>
           </div>
-          <button
-            onClick={closeTask}
-            className="shrink-0 rounded-md px-2 py-1 text-muted hover:bg-surface-2 hover:text-fg"
-            aria-label="Close"
-          >
-            ✕
-          </button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              onClick={copyPrompt}
+              disabled={locking}
+              className="flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
+              title="Lock the code and copy a ready-to-paste prompt for your AI"
+            >
+              {locking ? (
+                <span
+                  className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
+                  aria-hidden
+                />
+              ) : null}
+              {copied ? "✓ Copied" : "⧉ Copy prompt"}
+            </button>
+            <button
+              onClick={closeTask}
+              className="rounded-md px-2 py-1 text-muted hover:bg-surface-2 hover:text-fg"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 gap-5 p-5 md:grid-cols-[1fr_240px]">
@@ -195,13 +284,13 @@ export function TaskDetailModal() {
           <div className="space-y-5">
             {/* actions */}
             <div className="flex flex-wrap items-center gap-2">
-              <StatusPill status={node.status} onChange={(s) => setStatus(openTaskId, s)} />
+              <StatusPill status={node.status} onChange={(s) => setStatus(taskId, s)} />
               {node.status !== "in-progress" && !done ? (
-                <Button variant="primary" size="sm" onClick={() => start(openTaskId)}>
+                <Button variant="primary" size="sm" onClick={() => start(taskId)}>
                   ▶ Start
                 </Button>
               ) : null}
-              <Button variant="success" size="sm" onClick={() => toggleDone(openTaskId)}>
+              <Button variant="success" size="sm" onClick={() => toggleDone(taskId)}>
                 {done ? "↺ Reopen" : "✓ Mark done"}
               </Button>
             </div>
@@ -215,6 +304,16 @@ export function TaskDetailModal() {
                 </p>
               </div>
             ) : null}
+
+            {/* workflow — summaries, decisions, notes, commits */}
+            <WorkflowSection
+              task={task}
+              decisions={decisions[taskId] ?? []}
+              notes={notes[taskId] ?? []}
+              commits={commits[taskId] ?? []}
+              onDecision={(input) => recordDecision(taskId, input)}
+              onNote={(input) => addNote(taskId, input)}
+            />
 
             {/* attachments */}
             <div>
@@ -260,7 +359,7 @@ export function TaskDetailModal() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => removeAttachment(openTaskId, featured.id)}
+                      onClick={() => removeAttachment(taskId, featured.id)}
                       className="absolute right-1.5 top-1.5 hidden rounded-full bg-slate-900/70 px-1.5 py-0.5 text-[11px] leading-none text-white group-hover:block"
                       aria-label={`Remove ${featured.filename}`}
                     >
@@ -299,9 +398,9 @@ export function TaskDetailModal() {
             </div>
 
             {/* subtasks */}
-            {kids.length > 0 ? (
-              <div>
-                <SectionLabel>Sub-tasks · {kids.length}</SectionLabel>
+            <div>
+              <SectionLabel>Sub-tasks · {kids.length}</SectionLabel>
+              {kids.length > 0 ? (
                 <ul className="mt-1 space-y-1">
                   {kids.map((k) => (
                     <li
@@ -318,8 +417,32 @@ export function TaskDetailModal() {
                     </li>
                   ))}
                 </ul>
+              ) : null}
+              {/* add subtask — creates the child and opens its modal on top */}
+              <div className="mt-2 flex items-center gap-1.5">
+                <input
+                  value={subtaskTitle}
+                  onChange={(e) => setSubtaskTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && subtaskTitle.trim() && !addingSub) {
+                      const title = subtaskTitle.trim();
+                      setSubtaskTitle("");
+                      setAddingSub(true);
+                      addSubtask(taskId, title).finally(() => setAddingSub(false));
+                    }
+                  }}
+                  disabled={addingSub}
+                  placeholder="Add a subtask…"
+                  className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-50"
+                />
+                {addingSub ? (
+                  <span
+                    className="h-3.5 w-3.5 animate-spin rounded-full border border-faint border-t-transparent"
+                    aria-label="Adding subtask"
+                  />
+                ) : null}
               </div>
-            ) : null}
+            </div>
 
             {/* comments — the conversation thread (you ⇄ Claude) */}
             <div>
@@ -338,7 +461,7 @@ export function TaskDetailModal() {
                         key={c.id}
                         className={`flex gap-2 ${mine ? "flex-row-reverse" : "flex-row"}`}
                       >
-                        <Avatar name={author} size={24} />
+                        <PersonAvatar name={author} size={24} />
                         <div
                           className={`flex min-w-0 max-w-[80%] flex-col ${mine ? "items-end" : "items-start"}`}
                         >
@@ -415,7 +538,7 @@ export function TaskDetailModal() {
           {/* Right: meta */}
           <div className="space-y-3">
             <Meta label="Status">
-              <StatusPill status={node.status} onChange={(s) => setStatus(openTaskId, s)} />
+              <StatusPill status={node.status} onChange={(s) => setStatus(taskId, s)} />
             </Meta>
             {task.value != null || task.difficulty != null ? (
               <Meta label="Points">
@@ -434,14 +557,9 @@ export function TaskDetailModal() {
                 </span>
               </Meta>
             ) : null}
-            {task.assignees?.length ? (
-              <Meta label={task.assignees.length > 1 ? "Assignees" : "Assignee"}>
-                <span className="flex items-center gap-2">
-                  <AvatarStack names={task.assignees} size={20} />
-                  <span className="truncate">{task.assignees.join(", ")}</span>
-                </span>
-              </Meta>
-            ) : null}
+            <Meta label={(task.assignees?.length ?? 0) > 1 ? "Assignees" : "Assignee"}>
+              <AssigneeEditor taskId={taskId} assignees={task.assignees ?? []} onChange={editTask} />
+            </Meta>
             {task.startDate ? (
               <Meta label="Start">
                 <span>{formatShortDate(task.startDate)}</span>
@@ -510,7 +628,8 @@ export function TaskDetailModal() {
     {/* Lightbox — full-size viewer with ←/→ navigation across the images. */}
     {lightboxItem ? (
       <div
-        className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/85 p-6 backdrop-blur-sm"
+        className="fixed inset-0 flex items-center justify-center bg-slate-950/85 p-6 backdrop-blur-sm"
+        style={{ zIndex: 50 + depth * 10 + 5 }}
         onClick={() => setLightboxOpen(false)}
       >
         <button
@@ -598,6 +717,291 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="text-[11px] font-medium uppercase tracking-wide text-muted">
       {children}
+    </div>
+  );
+}
+
+const PHASE_LABEL: Record<TaskPhase, string> = {
+  draft: "Draft",
+  ready: "Ready",
+  analyzing: "Analyzing",
+  analyzed: "Analyzed",
+  working: "Working",
+  done: "Done",
+};
+
+/** Small badge for the derived workflow phase. */
+export function PhaseBadge({ phase }: { phase: TaskPhase }) {
+  return (
+    <span className="rounded-full border border-border bg-surface-2 px-2 py-0.5 text-[11px] font-medium text-muted">
+      {PHASE_LABEL[phase]}
+    </span>
+  );
+}
+
+const DECISION_CATEGORIES: DecisionCategory[] = [
+  "business",
+  "product",
+  "ux",
+  "technical",
+  "scope",
+];
+const NOTE_TYPES: NoteType[] = ["progress", "blocker", "question", "fyi"];
+
+/** Workflow block: revisable summaries + decisions + notes + commits. */
+function WorkflowSection({
+  task,
+  decisions,
+  notes,
+  commits,
+  onDecision,
+  onNote,
+}: {
+  task: Task;
+  decisions: Decision[];
+  notes: Note[];
+  commits: TaskCommit[];
+  onDecision: (input: {
+    category: DecisionCategory;
+    decision: string;
+    rationale?: string;
+  }) => void;
+  onNote: (input: { note: string; type?: NoteType }) => void;
+}) {
+  const [dCat, setDCat] = useState<DecisionCategory>("technical");
+  const [dText, setDText] = useState("");
+  const [nType, setNType] = useState<NoteType>("progress");
+  const [nText, setNText] = useState("");
+
+  const summaries: [string, string | null | undefined][] = [
+    ["Analysis", task.analysisSummary],
+    ["Plan", task.plan],
+    ["Summary", task.summary],
+  ];
+  const hasSummary = summaries.some(([, v]) => v);
+
+  return (
+    <div className="space-y-4">
+      {hasSummary ? (
+        <div className="space-y-2">
+          {summaries.map(([label, val]) =>
+            val ? (
+              <div key={label}>
+                <SectionLabel>{label}</SectionLabel>
+                <p className="mt-1 whitespace-pre-wrap rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
+                  {val}
+                </p>
+              </div>
+            ) : null,
+          )}
+        </div>
+      ) : null}
+
+      {/* Decisions */}
+      <div>
+        <SectionLabel>Decisions · {decisions.length}</SectionLabel>
+        <ul className="mt-1 space-y-1">
+          {decisions.map((d) => {
+            const saving = d.id.startsWith("temp-");
+            return (
+              <li
+                key={d.id}
+                className={`rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""}`}
+              >
+                <span className="mr-1.5 rounded bg-accent-soft px-1 py-0.5 font-mono text-[10px] uppercase text-accent">
+                  {d.category}
+                </span>
+                <span className="text-fg">{d.decision}</span>
+                {d.rationale ? (
+                  <span className="text-faint"> — {d.rationale}</span>
+                ) : null}
+                {d.outcome ? (
+                  <span className="ml-1.5 text-[11px] text-muted">({d.outcome})</span>
+                ) : null}
+                {saving ? (
+                  <span
+                    className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
+                    aria-label="Saving"
+                  />
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+        <div className="mt-2 flex items-center gap-1.5">
+          <select
+            value={dCat}
+            onChange={(e) => setDCat(e.target.value as DecisionCategory)}
+            className="rounded-md border border-border bg-surface-2 px-1.5 py-1 text-xs text-fg"
+          >
+            {DECISION_CATEGORIES.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+          <input
+            value={dText}
+            onChange={(e) => setDText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && dText.trim()) {
+                onDecision({ category: dCat, decision: dText.trim() });
+                setDText("");
+              }
+            }}
+            placeholder="Record a decision…"
+            className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none"
+          />
+        </div>
+      </div>
+
+      {/* Notes */}
+      <div>
+        <SectionLabel>Notes · {notes.length}</SectionLabel>
+        <ul className="mt-1 space-y-1">
+          {notes.map((n) => {
+            const saving = n.id.startsWith("temp-");
+            return (
+              <li
+                key={n.id}
+                className={`rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""}`}
+              >
+                {n.type ? (
+                  <span className="mr-1.5 rounded bg-buff-soft px-1 py-0.5 font-mono text-[10px] uppercase text-buff">
+                    {n.type}
+                  </span>
+                ) : null}
+                <span className="text-fg">{n.note}</span>
+                {saving ? (
+                  <span
+                    className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
+                    aria-label="Saving"
+                  />
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+        <div className="mt-2 flex items-center gap-1.5">
+          <select
+            value={nType}
+            onChange={(e) => setNType(e.target.value as NoteType)}
+            className="rounded-md border border-border bg-surface-2 px-1.5 py-1 text-xs text-fg"
+          >
+            {NOTE_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+          <input
+            value={nText}
+            onChange={(e) => setNText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && nText.trim()) {
+                onNote({ note: nText.trim(), type: nType });
+                setNText("");
+              }
+            }}
+            placeholder="Add a standup note…"
+            className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none"
+          />
+        </div>
+      </div>
+
+      {/* Commits */}
+      {commits.length ? (
+        <div>
+          <SectionLabel>Commits · {commits.length}</SectionLabel>
+          <ul className="mt-1 space-y-1">
+            {commits.map((c) => (
+              <li key={c.id} className="text-sm text-fg">
+                <span className="font-mono text-xs text-accent">
+                  {c.sha.slice(0, 8)}
+                </span>{" "}
+                {c.subject ?? ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Assign/unassign real users. Opens a dropdown of the roster; toggling a
+ *  person persists the new assignee-name list via `editTask`. */
+function AssigneeEditor({
+  taskId,
+  assignees,
+  onChange,
+}: {
+  taskId: string;
+  assignees: string[];
+  onChange: (id: string, patch: { assignees: string[] }) => void;
+}) {
+  const { people } = usePeople();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const has = (name: string) => assignees.some((a) => a.toLowerCase() === name.toLowerCase());
+  const toggle = (name: string) => {
+    const next = has(name)
+      ? assignees.filter((a) => a.toLowerCase() !== name.toLowerCase())
+      : [...assignees, name];
+    onChange(taskId, { assignees: next });
+  };
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left hover:bg-surface"
+      >
+        {assignees.length ? (
+          <>
+            <AvatarStack names={assignees} size={20} />
+            <span className="truncate text-fg">{assignees.join(", ")}</span>
+          </>
+        ) : (
+          <span className="text-faint">Unassigned — click to assign</span>
+        )}
+        <span className="ml-auto text-faint">▾</span>
+      </button>
+
+      {open ? (
+        <div className="absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-y-auto rounded-lg border border-border bg-surface py-1 shadow-lg">
+          {people.length === 0 ? (
+            <p className="px-3 py-2 text-xs text-faint">No users yet.</p>
+          ) : (
+            people.map((p) => {
+              const on = has(p.name);
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => toggle(p.name)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-surface-2"
+                >
+                  <PersonAvatar name={p.name} size={20} />
+                  <span className="flex-1 truncate text-fg">{p.name}</span>
+                  {on ? <span className="text-accent">✓</span> : null}
+                </button>
+              );
+            })
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

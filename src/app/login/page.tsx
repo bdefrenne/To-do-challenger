@@ -87,10 +87,6 @@ export default function LoginPage() {
             {busy ? "Signing in…" : "Sign in"}
           </button>
         </form>
-
-        <p className="mt-4 text-center text-xs text-faint">
-          Accounts are created by the workspace owner.
-        </p>
       </div>
     </div>
   );

@@ -1,26 +1,26 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { TaskStatus } from "@/lib/types";
+import type { Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskTableRow, GRID } from "./TaskTableRow";
+import type { BoardGroup } from "./BoardPill";
 
 /**
  * ClickUp-style task table: grouped by status, collapsible, drag-and-drop.
  *
  * With no props it shows every top-level task (the global "All tasks" view).
- * Scope it to a project or board with `boardIds`; `showBoardChip` labels each
- * row with its board (useful when boards are mixed); `addBoardId` is the board
- * that inline-added tasks land on (null = unassigned).
+ * Scope it to a project or board with `boardIds`; `addBoardId` is the board
+ * that inline-added tasks land on (null = unassigned). Every row shows its
+ * board as a clickable pill (change within the same project; assign to any
+ * project when the task has no board).
  */
 export function TaskTable({
   boardIds,
-  showBoardChip = false,
   addBoardId = null,
 }: {
   boardIds?: string[];
-  showBoardChip?: boolean;
   addBoardId?: string | null;
 } = {}) {
   const {
@@ -29,11 +29,11 @@ export function TaskTable({
     projects,
     childrenOf,
     openTask,
-    start,
     toggleDone,
     setStatus,
     moveNode,
     dropToGroup,
+    moveToBoard,
     addTask,
   } = useWorkspace();
 
@@ -42,6 +42,26 @@ export function TaskTable({
     for (const p of projects) for (const b of p.boards ?? []) m[b.id] = b.name;
     return m;
   }, [projects]);
+
+  // boardId → its project, so a row can offer sibling boards (same project).
+  const projectByBoardId = useMemo(() => {
+    const m: Record<string, Project> = {};
+    for (const p of projects) for (const b of p.boards ?? []) m[b.id] = p;
+    return m;
+  }, [projects]);
+
+  const toGroup = (p: Project): BoardGroup => ({
+    projectId: p.id,
+    projectName: p.name,
+    boards: (p.boards ?? []).map((b) => ({ id: b.id, name: b.name })),
+  });
+
+  // Boards a task may move to: its own project when it has a board, else every
+  // project (two-step assign for unassigned tasks).
+  const boardGroupsFor = (boardId: string | null): BoardGroup[] => {
+    const proj = boardId ? projectByBoardId[boardId] : undefined;
+    return proj ? [toGroup(proj)] : projects.map(toGroup);
+  };
 
   const inScope = (n: TaskNode) =>
     !boardIds || (n.boardId != null && boardIds.includes(n.boardId));
@@ -65,14 +85,14 @@ export function TaskTable({
           hasChildren={hasChildren}
           expanded={expanded}
           draggingId={draggingId}
-          boardName={
-            showBoardChip && node.boardId ? boardNameById[node.boardId] : undefined
-          }
+          currentBoardId={node.boardId}
+          currentBoardName={node.boardId ? boardNameById[node.boardId] ?? null : null}
+          boardGroups={boardGroupsFor(node.boardId)}
+          onChangeBoard={(bid) => moveToBoard(node.id, bid)}
           onToggleExpand={() =>
             setCollapsedRows((p) => ({ ...p, [node.id]: !p[node.id] }))
           }
           onOpen={() => openTask(node.id)}
-          onStart={() => start(node.id)}
           onToggleDone={() => toggleDone(node.id)}
           onSetStatus={(s) => setStatus(node.id, s)}
           onDragStartRow={setDraggingId}

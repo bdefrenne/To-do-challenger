@@ -18,8 +18,15 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export const POST = route(async (req: NextRequest, { userId }: AuthedCtx) => {
-  const { projectId, name } = await body(req, createBoardSchema);
-  const board = await createBoard(userId, projectId, name);
+  const { projectId, name, code, color, image, gitFolder, description } =
+    await body(req, createBoardSchema);
+  const board = await createBoard(userId, projectId, name, {
+    code,
+    color,
+    image,
+    gitFolder,
+    description,
+  });
   if (!board) return error("Project not found", 404);
   return json({ board }, 201);
 });

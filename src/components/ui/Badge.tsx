@@ -84,61 +84,49 @@ export function TagChip({ id }: { id: string }) {
   );
 }
 
-/** Small circular avatar showing a person's initials. */
-export function Avatar({ name, size = 22 }: { name: string; size?: number }) {
+/**
+ * Small circular avatar. Presentational only — pass `imageUrl` for a profile
+ * picture (else it shows initials) and `color` for the ring/stroke around it.
+ * `ring` draws a thin surface-colored separator (used when avatars overlap).
+ * Name→picture/color resolution lives in `AvatarStack` / `PersonAvatar`.
+ */
+export function Avatar({
+  name,
+  size = 22,
+  imageUrl,
+  color,
+  ring = false,
+}: {
+  name: string;
+  size?: number;
+  imageUrl?: string | null;
+  color?: string | null;
+  ring?: boolean;
+}) {
   const initials = name
     .split(/\s+/)
     .slice(0, 2)
     .map((w) => w[0]?.toUpperCase() ?? "")
     .join("");
+  // Color ring = a surface gap then the person's color; box-shadow keeps it out
+  // of the layout box so overlap math stays based on `size`.
+  const boxShadow = color
+    ? `0 0 0 2px var(--color-surface), 0 0 0 4px ${color}`
+    : ring
+      ? "0 0 0 2px var(--color-surface)"
+      : undefined;
   return (
     <span
-      className="grid shrink-0 place-items-center rounded-full bg-accent-soft font-semibold text-accent"
-      style={{ width: size, height: size, fontSize: size * 0.42 }}
+      className="grid shrink-0 place-items-center overflow-hidden rounded-full bg-accent-soft font-semibold text-accent"
+      style={{ width: size, height: size, fontSize: size * 0.42, boxShadow }}
       title={name}
     >
-      {initials}
-    </span>
-  );
-}
-
-/** Overlapping avatars for multiple assignees; collapses the overflow to "+N". */
-export function AvatarStack({
-  names,
-  size = 22,
-  max = 3,
-}: {
-  names: string[];
-  size?: number;
-  max?: number;
-}) {
-  if (!names.length) return null;
-  const shown = names.slice(0, max);
-  const extra = names.length - shown.length;
-  return (
-    <span className="flex items-center" title={names.join(", ")}>
-      {shown.map((name, i) => (
-        <span
-          key={`${name}-${i}`}
-          className="rounded-full ring-2 ring-surface"
-          style={{ marginLeft: i === 0 ? 0 : -size * 0.3 }}
-        >
-          <Avatar name={name} size={size} />
-        </span>
-      ))}
-      {extra > 0 ? (
-        <span
-          className="grid shrink-0 place-items-center rounded-full bg-surface-3 font-semibold text-muted ring-2 ring-surface"
-          style={{
-            width: size,
-            height: size,
-            fontSize: size * 0.38,
-            marginLeft: -size * 0.3,
-          }}
-        >
-          +{extra}
-        </span>
-      ) : null}
+      {imageUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={imageUrl} alt={name} className="h-full w-full object-cover" />
+      ) : (
+        initials
+      )}
     </span>
   );
 }

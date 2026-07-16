@@ -5,17 +5,27 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { WorkspaceProvider, useWorkspace } from "./workspace/WorkspaceContext";
 import { TaskDetailModal } from "./workspace/TaskDetailModal";
+import { BoardModal } from "./workspace/BoardModal";
+import { ProjectModal } from "./workspace/ProjectModal";
+import { PeopleProvider, usePeople } from "./PeopleContext";
+import { Avatar } from "./ui/Badge";
 import type { Project } from "@/lib/types";
 
 export interface SessionUser {
   id: string;
   email: string;
   name: string;
+  /** Avatar ring/stroke color (hex). */
+  color: string;
+  /** Profile picture URL, or null (initials fallback). */
+  avatarUrl: string | null;
 }
 
 const NAV = [
   { href: "/", label: "All tasks", icon: "☰" },
   { href: "/today", label: "Today", icon: "◎" },
+  { href: "/decisions", label: "Decisions", icon: "◇" },
+  { href: "/notes", label: "Notes", icon: "✎" },
   { href: "/calendar", label: "Calendar", icon: "▦" },
 ];
 
@@ -27,14 +37,16 @@ export function AppShell({
   user: SessionUser;
 }) {
   return (
-    <WorkspaceProvider>
-      <div className="flex min-h-screen">
-        <Sidebar user={user} />
-        <main className="flex-1 overflow-x-hidden">{children}</main>
-      </div>
-      <TaskDetailModal />
-      <Notice />
-    </WorkspaceProvider>
+    <PeopleProvider me={user}>
+      <WorkspaceProvider meName={user.name}>
+        <div className="flex min-h-screen">
+          <Sidebar user={user} />
+          <main className="flex-1 overflow-x-hidden">{children}</main>
+        </div>
+        <TaskDetailModal />
+        <Notice />
+      </WorkspaceProvider>
+    </PeopleProvider>
   );
 }
 
@@ -84,7 +96,10 @@ function Sidebar({ user }: { user: SessionUser }) {
     router.refresh();
   }
 
-  const initial = (user.name || user.email).trim().charAt(0).toUpperCase();
+  // Prefer the live roster entry so a just-saved picture/color shows without a
+  // full reload; fall back to the server-rendered session user.
+  const { me } = usePeople();
+  const identity = me ?? user;
   return (
     <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex items-center gap-2.5 px-5 py-5">
@@ -133,12 +148,15 @@ function Sidebar({ user }: { user: SessionUser }) {
           aria-expanded={menuOpen}
           className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left transition-colors hover:bg-surface-2"
         >
-          <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-accent-soft text-xs font-semibold text-accent">
-            {initial}
-          </div>
+          <Avatar
+            name={identity.name || identity.email}
+            size={32}
+            imageUrl={identity.avatarUrl}
+            color={identity.color}
+          />
           <div className="min-w-0 flex-1 leading-tight">
-            <div className="truncate text-sm font-medium text-fg">{user.name}</div>
-            <div className="truncate text-[11px] text-faint">{user.email}</div>
+            <div className="truncate text-sm font-medium text-fg">{identity.name}</div>
+            <div className="truncate text-[11px] text-faint">{identity.email}</div>
           </div>
           <span className="text-faint">▾</span>
         </button>
@@ -178,15 +196,25 @@ function Sidebar({ user }: { user: SessionUser }) {
 /** Projects → Boards tree with inline create controls. */
 function ProjectsNav() {
   const pathname = usePathname();
-  const { projects, createProject } = useWorkspace();
+  const { projects } = useWorkspace();
+  const [creating, setCreating] = useState(false);
   return (
     <div className="mt-4 px-3">
       <div className="mb-1 flex items-center justify-between px-2">
         <span className="text-[11px] font-medium uppercase tracking-wide text-faint">
           Projects
         </span>
-        <NewProject onCreate={createProject} />
+        <button
+          onClick={() => setCreating(true)}
+          title="New project"
+          className="text-faint transition-colors hover:text-accent"
+        >
+          +
+        </button>
       </div>
+      {creating ? (
+        <ProjectModal mode="create" onClose={() => setCreating(false)} />
+      ) : null}
       <div className="max-h-[42vh] space-y-0.5 overflow-y-auto">
         {projects.length === 0 ? (
           <p className="px-2 py-1 text-xs text-faint">No projects yet.</p>
@@ -201,31 +229,23 @@ function ProjectsNav() {
 }
 
 function ProjectRow({ project, pathname }: { project: Project; pathname: string }) {
-  const { createBoard } = useWorkspace();
   const [open, setOpen] = useState(true);
   const [adding, setAdding] = useState(false);
-  const [text, setText] = useState("");
+  const [editing, setEditing] = useState(false);
   const boards = project.boards ?? [];
   const projectActive = pathname === `/projects/${project.id}`;
-
-  function submit() {
-    if (text.trim()) {
-      createBoard(project.id, text.trim());
-      setText("");
-      setAdding(false);
-    }
-  }
 
   return (
     <div>
       <div className="group flex items-center gap-1 rounded-lg pr-1 hover:bg-surface-2">
         <button
           onClick={() => setOpen((v) => !v)}
-          className="py-1.5 pl-2 pr-1 text-faint hover:text-fg"
+          className="py-1.5 pl-1 pr-0.5 text-faint hover:text-fg"
           aria-label={open ? "Collapse project" : "Expand project"}
         >
           {open ? "▾" : "▸"}
         </button>
+        <Avatar name={project.name} size={16} imageUrl={project.image} color={project.color} />
         <Link
           href={`/projects/${project.id}`}
           className={[
@@ -235,6 +255,13 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
         >
           {project.name}
         </Link>
+        <button
+          onClick={() => setEditing(true)}
+          title="Project settings"
+          className="px-1 text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
+        >
+          ⚙
+        </button>
         <button
           onClick={() => {
             setOpen(true);
@@ -247,6 +274,14 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
         </button>
       </div>
 
+      {editing ? (
+        <ProjectModal
+          mode="edit"
+          project={project}
+          onClose={() => setEditing(false)}
+        />
+      ) : null}
+
       {open ? (
         <div className="ml-4 border-l border-border pl-2">
           {boards.map((b) => {
@@ -256,84 +291,34 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
                 key={b.id}
                 href={`/boards/${b.id}`}
                 className={[
-                  "block truncate rounded-md px-2 py-1 text-[13px]",
+                  "flex items-center gap-2 truncate rounded-md px-2 py-1 text-[13px]",
                   active
                     ? "bg-accent-soft font-medium text-accent"
                     : "text-muted hover:bg-surface-2 hover:text-fg",
                 ].join(" ")}
               >
-                {b.name}
+                <Avatar name={b.name} size={16} imageUrl={b.image} color={b.color} />
+                <span className="truncate">{b.name}</span>
               </Link>
             );
           })}
-          {adding ? (
-            <input
-              autoFocus
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submit();
-                else if (e.key === "Escape") {
-                  setText("");
-                  setAdding(false);
-                }
-              }}
-              onBlur={() => {
-                if (!text.trim()) setAdding(false);
-              }}
-              placeholder="Board name…"
-              className="mt-0.5 w-full rounded-md border border-border bg-surface px-2 py-1 text-[13px] text-fg outline-none placeholder:text-faint focus:border-accent"
-            />
-          ) : (
-            <button
-              onClick={() => setAdding(true)}
-              className="block px-2 py-1 text-xs text-faint hover:text-muted"
-            >
-              + board
-            </button>
-          )}
+          <button
+            onClick={() => setAdding(true)}
+            className="block px-2 py-1 text-xs text-faint hover:text-muted"
+          >
+            + board
+          </button>
         </div>
+      ) : null}
+
+      {adding ? (
+        <BoardModal
+          mode="create"
+          projectId={project.id}
+          onClose={() => setAdding(false)}
+        />
       ) : null}
     </div>
   );
 }
 
-function NewProject({ onCreate }: { onCreate: (name: string) => void }) {
-  const [editing, setEditing] = useState(false);
-  const [text, setText] = useState("");
-
-  if (!editing) {
-    return (
-      <button
-        onClick={() => setEditing(true)}
-        title="New project"
-        className="text-faint transition-colors hover:text-accent"
-      >
-        +
-      </button>
-    );
-  }
-
-  return (
-    <input
-      autoFocus
-      value={text}
-      onChange={(e) => setText(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" && text.trim()) {
-          onCreate(text.trim());
-          setText("");
-          setEditing(false);
-        } else if (e.key === "Escape") {
-          setText("");
-          setEditing(false);
-        }
-      }}
-      onBlur={() => {
-        if (!text.trim()) setEditing(false);
-      }}
-      placeholder="Project name…"
-      className="w-32 rounded-md border border-border bg-surface px-2 py-0.5 text-xs text-fg outline-none placeholder:text-faint focus:border-accent"
-    />
-  );
-}

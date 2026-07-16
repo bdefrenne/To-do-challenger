@@ -9,7 +9,18 @@ import {
   useCallback,
   type ReactNode,
 } from "react";
-import type { Task, TaskStatus, TaskLogEntry, Project, Board } from "@/lib/types";
+import type {
+  Task,
+  TaskStatus,
+  TaskLogEntry,
+  Project,
+  Board,
+  Decision,
+  DecisionCategory,
+  Note,
+  NoteType,
+  TaskCommit,
+} from "@/lib/types";
 
 /*
   ====================================================================
@@ -40,10 +51,21 @@ interface WorkspaceContextValue {
   nodes: TaskNode[];
   taskMap: Record<string, Task>;
   logs: Record<string, TaskLogEntry[]>;
+  /** Per-task workflow detail, loaded alongside the activity log. */
+  decisions: Record<string, Decision[]>;
+  notes: Record<string, Note[]>;
+  commits: Record<string, TaskCommit[]>;
   projects: Project[];
-  openTaskId: string | null;
+  /** Stack of open task-detail modals (bottom → top). Each click pushes a new
+   *  level; the whole stack is mirrored to the URL so a refresh restores it. */
+  openTaskIds: string[];
   openTask: (id: string) => void;
+  /** Close the topmost modal (pops one level). */
   closeTask: () => void;
+  /** Close every open modal (clears the stack). */
+  closeAllTasks: () => void;
+  /** Create a subtask under `parentId` and open its modal stacked on top. */
+  addSubtask: (parentId: string, title: string) => Promise<void>;
   childrenOf: (id: string | null) => TaskNode[];
   nodeById: (id: string) => TaskNode | undefined;
   start: (id: string) => void;
@@ -59,15 +81,76 @@ interface WorkspaceContextValue {
   addTask: (status: TaskStatus, title: string, boardId?: string | null) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
+  /** Lock the task's code (freeze it) and return a ready-to-paste work prompt. */
+  lockTask: (id: string) => Promise<string>;
+  /** Record a decision on a task, then reload its detail. */
+  recordDecision: (
+    id: string,
+    input: { category: DecisionCategory; decision: string; rationale?: string },
+  ) => Promise<void>;
+  /** Add a standup note to a task, then reload its detail. */
+  addNote: (id: string, input: { note: string; type?: NoteType }) => Promise<void>;
+  /** Edit workflow summary fields (analysisSummary / plan / summary). */
+  editWorkflow: (
+    id: string,
+    patch: Partial<Pick<Task, "analysisSummary" | "plan" | "summary">>,
+  ) => Promise<void>;
   /** Upload an image onto a task (from a file picker or clipboard paste). */
   addAttachment: (id: string, file: File) => Promise<void>;
   /** Remove an image attachment from a task. */
   removeAttachment: (taskId: string, attachmentId: string) => Promise<void>;
-  createProject: (name: string) => void;
-  renameProject: (id: string, name: string) => void;
+  /** Create a project; returns the created project (or null on failure) so the
+   *  caller can upload a picture onto its fresh id. */
+  createProject: (input: {
+    name: string;
+    code?: string;
+    color?: string;
+    gitFolder?: string;
+    description?: string;
+  }) => Promise<Project | null>;
+  /** Edit a project's name / shortname / color / picture / git folder / readme.
+   *  `image`/`gitFolder`/`description` accept null to clear. */
+  renameProject: (
+    id: string,
+    patch: {
+      name?: string;
+      code?: string;
+      color?: string;
+      image?: string | null;
+      gitFolder?: string | null;
+      description?: string | null;
+    },
+  ) => Promise<void>;
+  /** Upload a project picture (client crops to a square first). */
+  uploadProjectAvatar: (projectId: string, blob: Blob) => Promise<void>;
   deleteProject: (id: string) => void;
-  createBoard: (projectId: string, name: string) => void;
-  renameBoard: (id: string, name: string) => void;
+  /** Create a board; returns the created board (or null on failure) so the
+   *  caller can, e.g., upload a picture onto its fresh id. */
+  createBoard: (
+    projectId: string,
+    input: {
+      name: string;
+      code?: string;
+      color?: string;
+      gitFolder?: string;
+      description?: string;
+    },
+  ) => Promise<Board | null>;
+  /** Edit a board's name / shortname (code) / color / picture / git folder /
+   *  readme. `image`/`gitFolder`/`description` accept null to clear. */
+  renameBoard: (
+    id: string,
+    patch: {
+      name?: string;
+      code?: string;
+      color?: string;
+      image?: string | null;
+      gitFolder?: string | null;
+      description?: string | null;
+    },
+  ) => Promise<void>;
+  /** Upload a board picture (client crops to a square first). */
+  uploadBoardAvatar: (boardId: string, blob: Blob) => Promise<void>;
   deleteBoard: (id: string) => void;
   /** Reorder the boards within a project (drives Boards view + sidebar). */
   reorderBoards: (projectId: string, orderedIds: string[]) => void;
@@ -174,12 +257,23 @@ function isDescendant(nodes: TaskNode[], ancestorId: string, nodeId: string): bo
   return false;
 }
 
-export function WorkspaceProvider({ children }: { children: ReactNode }) {
+export function WorkspaceProvider({
+  children,
+  /** Display name of the signed-in user — new tasks are assigned to them. */
+  meName = "You",
+}: {
+  children: ReactNode;
+  meName?: string;
+}) {
   const [nodes, setNodes] = useState<TaskNode[]>([]);
   const [taskMap, setTaskMap] = useState<Record<string, Task>>({});
   const [logs, setLogs] = useState<Record<string, TaskLogEntry[]>>({});
+  const [decisions, setDecisions] = useState<Record<string, Decision[]>>({});
+  const [notes, setNotes] = useState<Record<string, Note[]>>({});
+  const [commits, setCommits] = useState<Record<string, TaskCommit[]>>({});
   const [projects, setProjects] = useState<Project[]>([]);
-  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  // Stack of open task-detail modals (bottom → top). Empty = nothing open.
+  const [openTaskIds, setOpenTaskIds] = useState<string[]>([]);
   // Transient, user-facing message (e.g. a write was rejected as a conflict).
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -191,12 +285,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   // cursor against this and only re-fetches the whole list when it moves.
   const lastVersion = useRef<string | null>(null);
 
-  // Mirror of openTaskId so the (never re-armed) poll closure can refresh the
-  // open task's thread when the cursor moves — no need to re-arm the interval.
-  const openTaskIdRef = useRef<string | null>(null);
+  // Mirror of the open-modal stack so the (never re-armed) poll closure can
+  // refresh every open task's thread when the cursor moves — no interval re-arm.
+  const openTaskIdsRef = useRef<string[]>([]);
   useEffect(() => {
-    openTaskIdRef.current = openTaskId;
-  }, [openTaskId]);
+    openTaskIdsRef.current = openTaskIds;
+  }, [openTaskIds]);
+
+  // Mirror the modal stack to the URL (?tasks=id1,id2,…) without touching the
+  // route path, so a refresh restores the exact stack. replaceState keeps this
+  // out of history (no back-button spam); hydration happens in the load effect.
+  const hydratedFromUrl = useRef(false);
+  useEffect(() => {
+    if (typeof window === "undefined" || !hydratedFromUrl.current) return;
+    const url = new URL(window.location.href);
+    if (openTaskIds.length) url.searchParams.set("tasks", openTaskIds.join(","));
+    else url.searchParams.delete("tasks");
+    window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }, [openTaskIds]);
 
   const refreshVersion = useCallback(async () => {
     try {
@@ -207,7 +313,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const fetchAll = useCallback(async () => {
+  const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
     try {
       const { tasks } = await api<{ tasks: TaskDTO[] }>("/api/tasks?flat=1");
       setNodes(
@@ -220,9 +326,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           position: t.position,
         })),
       );
-      setTaskMap(Object.fromEntries(tasks.map((t) => [t.id, t as Task])));
+      const map = Object.fromEntries(tasks.map((t) => [t.id, t as Task]));
+      setTaskMap(map);
+      return map;
     } catch (e) {
       console.error("[workspace] failed to load tasks", e);
+      return undefined;
     }
   }, []);
 
@@ -239,8 +348,22 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   // opened, after posting/attaching, and by the poll so a comment Claude
   // leaves shows up in the open thread live.
   const loadLogs = useCallback((id: string) => {
-    api<{ logs: TaskLogEntry[] }>(`/api/tasks/${id}`)
-      .then((r) => setLogs((prev) => ({ ...prev, [id]: r.logs })))
+    api<{
+      task: Task;
+      logs: TaskLogEntry[];
+      decisions?: Decision[];
+      notes?: Note[];
+      commits?: TaskCommit[];
+    }>(`/api/tasks/${id}`)
+      .then((r) => {
+        setLogs((prev) => ({ ...prev, [id]: r.logs }));
+        setDecisions((prev) => ({ ...prev, [id]: r.decisions ?? [] }));
+        setNotes((prev) => ({ ...prev, [id]: r.notes ?? [] }));
+        setCommits((prev) => ({ ...prev, [id]: r.commits ?? [] }));
+        // Keep the task map fresh (code/phase/summaries may have changed).
+        if (r.task)
+          setTaskMap((prev) => ({ ...prev, [id]: { ...prev[id], ...r.task } }));
+      })
       .catch((e) => console.error("[workspace] failed to load task detail", e));
   }, []);
 
@@ -251,10 +374,32 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     // the cursor so our own reload doesn't look like a change next tick.
     const reload = () =>
       Promise.all([fetchAll(), fetchProjects()]).then(() => {
-        if (openTaskIdRef.current) loadLogs(openTaskIdRef.current);
+        openTaskIdsRef.current.forEach((id) => loadLogs(id));
         return refreshVersion();
       });
-    reload();
+    // Hydrate the modal stack from the URL on first load, then reconcile.
+    const hydrate = async () => {
+      const initial = new URLSearchParams(window.location.search).get("tasks");
+      const initialIds = initial ? initial.split(",").filter(Boolean) : [];
+      try {
+        const [loaded] = await Promise.all([fetchAll(), fetchProjects()]);
+        // Drop ids for tasks that no longer exist so we don't render blank levels.
+        const alive = initialIds.filter((id) => loaded?.[id]);
+        if (alive.length) {
+          setOpenTaskIds(alive);
+          alive.forEach((id) => loadLogs(id));
+        } else if (initialIds.length) {
+          // The URL pointed only at gone/invalid tasks — strip the stale param.
+          const url = new URL(window.location.href);
+          url.searchParams.delete("tasks");
+          window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+        }
+      } finally {
+        hydratedFromUrl.current = true;
+        await refreshVersion();
+      }
+    };
+    hydrate();
     const iv = setInterval(async () => {
       if (inflight.current !== 0 || document.hidden) return;
       try {
@@ -262,8 +407,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         if (v !== lastVersion.current) {
           lastVersion.current = v;
           await Promise.all([fetchAll(), fetchProjects()]);
-          // Keep the open task's thread current (e.g. a new Claude comment).
-          if (openTaskIdRef.current) loadLogs(openTaskIdRef.current);
+          // Keep every open task's thread current (e.g. a new Claude comment).
+          openTaskIdsRef.current.forEach((id) => loadLogs(id));
         }
       } catch (e) {
         console.error("[workspace] version poll failed", e);
@@ -488,24 +633,94 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }
 
   /* ---- Projects & boards ---- */
-  const createProject = (name: string) =>
+  const createProject = async (input: {
+    name: string;
+    code?: string;
+    color?: string;
+    gitFolder?: string;
+    description?: string;
+  }): Promise<Project | null> => {
+    let created: Project | null = null;
+    await mutateProjects(async () => {
+      const res = await api<{ project: Project }>("/api/projects", {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      created = res.project;
+    });
+    return created;
+  };
+  const renameProject = (
+    id: string,
+    patch: {
+      name?: string;
+      code?: string;
+      color?: string;
+      image?: string | null;
+      gitFolder?: string | null;
+      description?: string | null;
+    },
+  ) =>
     mutateProjects(() =>
-      api("/api/projects", { method: "POST", body: JSON.stringify({ name }) }),
+      api(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
     );
-  const renameProject = (id: string, name: string) =>
-    mutateProjects(() =>
-      api(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
-    );
+  const uploadProjectAvatar = (projectId: string, blob: Blob) =>
+    mutateProjects(async () => {
+      const form = new FormData();
+      form.append("file", blob, "project.jpg");
+      const res = await fetch(`/api/projects/${projectId}/avatar`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) throw new Error(`project avatar upload failed (${res.status})`);
+    });
   const deleteProject = (id: string) =>
     mutateProjects(() => api(`/api/projects/${id}`, { method: "DELETE" }));
-  const createBoard = (projectId: string, name: string) =>
+  const createBoard = async (
+    projectId: string,
+    input: {
+      name: string;
+      code?: string;
+      color?: string;
+      gitFolder?: string;
+      description?: string;
+    },
+  ): Promise<Board | null> => {
+    let created: Board | null = null;
+    await mutateProjects(async () => {
+      const res = await api<{ board: Board }>("/api/boards", {
+        method: "POST",
+        body: JSON.stringify({ projectId, ...input }),
+      });
+      created = res.board;
+    });
+    return created;
+  };
+  const renameBoard = (
+    id: string,
+    patch: {
+      name?: string;
+      code?: string;
+      color?: string;
+      image?: string | null;
+      gitFolder?: string | null;
+      description?: string | null;
+    },
+  ) =>
     mutateProjects(() =>
-      api("/api/boards", { method: "POST", body: JSON.stringify({ projectId, name }) }),
+      api(`/api/boards/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
     );
-  const renameBoard = (id: string, name: string) =>
-    mutateProjects(() =>
-      api(`/api/boards/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
-    );
+  const uploadBoardAvatar = (boardId: string, blob: Blob) =>
+    mutateProjects(async () => {
+      // Multipart upload — don't route through `api` (it forces a JSON header).
+      const form = new FormData();
+      form.append("file", blob, "board.jpg");
+      const res = await fetch(`/api/boards/${boardId}/avatar`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) throw new Error(`board avatar upload failed (${res.status})`);
+    });
   const deleteBoard = (id: string) =>
     mutateProjects(() => api(`/api/boards/${id}`, { method: "DELETE" }));
   const reorderBoards = (projectId: string, orderedIds: string[]) => {
@@ -544,7 +759,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       () => {
         setTaskMap((prev) => ({
           ...prev,
-          [tempId]: { id: tempId, title, status, assignees: ["You"], boardId, updatedAt: now },
+          [tempId]: { id: tempId, title, status, assignees: [meName], boardId, updatedAt: now },
         }));
         setNodes((prev) => [
           ...prev,
@@ -554,19 +769,44 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       () =>
         api("/api/tasks", {
           method: "POST",
-          body: JSON.stringify({ title, status, assignees: ["You"], boardId }),
+          body: JSON.stringify({ title, status, assignees: [meName], boardId }),
         }),
     );
   }
 
   /* ---- Open detail (lazily loads the activity log) ---- */
+  // Push a new modal onto the stack. If the task is already open somewhere in
+  // the stack, pop back to it (prevents duplicate levels and navigation cycles).
   const openTask = useCallback(
     (id: string) => {
-      setOpenTaskId(id);
+      setOpenTaskIds((s) =>
+        s.includes(id) ? s.slice(0, s.indexOf(id) + 1) : [...s, id],
+      );
       loadLogs(id);
     },
     [loadLogs],
   );
+
+  /* ---- Create a subtask, then open it stacked on top ---- */
+  // The POST returns the created row with its real id, so we open that (avoids
+  // the temp-id reconciliation problem plain optimistic creates would have).
+  async function addSubtask(parentId: string, title: string) {
+    const text = title.trim();
+    if (!text) return;
+    const { task } = await api<{ task: Task }>("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        title: text,
+        status: "backlog",
+        assignees: [meName],
+        boardId: taskMap[parentId]?.boardId ?? null,
+        parentId,
+      }),
+    });
+    await fetchAll();
+    await refreshVersion();
+    openTask(task.id);
+  }
 
   /* ---- Comments (post to a task's conversation thread) ---- */
   // Optimistically append the note (attributed to "You"), POST it, then
@@ -605,6 +845,98 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }),
     );
     loadLogs(id); // reconcile the temp entry with the server's stored comment
+  }
+
+  /* ---- Workflow: lock / decisions / notes / summaries ---- */
+
+  // Lock the code (freeze it) and return the ready-to-paste work prompt. The
+  // server is idempotent, so a second click just re-returns the same prompt.
+  async function lockTask(id: string): Promise<string> {
+    const res = await api<{ task: Task; prompt: string }>(
+      `/api/tasks/${id}/lock`,
+      { method: "POST" },
+    );
+    setTaskMap((prev) =>
+      prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
+    );
+    return res.prompt;
+  }
+
+  // Optimistically append a temp row (rendered with a small "saving" spinner),
+  // POST it, then reload so the temp entry is replaced by the server row.
+  async function recordDecision(
+    id: string,
+    input: { category: DecisionCategory; decision: string; rationale?: string },
+  ) {
+    const tempId = `temp-${Date.now()}`;
+    const now = new Date().toISOString();
+    await mutate(
+      () =>
+        setDecisions((prev) => ({
+          ...prev,
+          [id]: [
+            ...(prev[id] ?? []),
+            {
+              id: tempId,
+              taskId: id,
+              category: input.category,
+              decision: input.decision,
+              rationale: input.rationale,
+              phase: "execution",
+              author: meName,
+              createdAt: now,
+            },
+          ],
+        })),
+      () =>
+        api(`/api/tasks/${id}/decisions`, {
+          method: "POST",
+          body: JSON.stringify(input),
+        }),
+    );
+    loadLogs(id);
+  }
+
+  async function addNote(id: string, input: { note: string; type?: NoteType }) {
+    const tempId = `temp-${Date.now()}`;
+    const now = new Date().toISOString();
+    await mutate(
+      () =>
+        setNotes((prev) => ({
+          ...prev,
+          [id]: [
+            ...(prev[id] ?? []),
+            {
+              id: tempId,
+              taskId: id,
+              note: input.note,
+              type: input.type,
+              author: meName,
+              createdAt: now,
+            },
+          ],
+        })),
+      () =>
+        api(`/api/tasks/${id}/notes`, {
+          method: "POST",
+          body: JSON.stringify(input),
+        }),
+    );
+    loadLogs(id);
+  }
+
+  async function editWorkflow(
+    id: string,
+    patch: Partial<Pick<Task, "analysisSummary" | "plan" | "summary">>,
+  ) {
+    await mutate(
+      () =>
+        setTaskMap((prev) =>
+          prev[id] ? { ...prev, [id]: { ...prev[id], ...patch } } : prev,
+        ),
+      () => api(`/api/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+    );
+    loadLogs(id);
   }
 
   /* ---- Attachments (upload / remove images) ---- */
@@ -646,10 +978,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         nodes,
         taskMap,
         logs,
+        decisions,
+        notes,
+        commits,
         projects,
-        openTaskId,
+        openTaskIds,
         openTask,
-        closeTask: () => setOpenTaskId(null),
+        closeTask: () => setOpenTaskIds((s) => s.slice(0, -1)),
+        closeAllTasks: () => setOpenTaskIds([]),
+        addSubtask,
         childrenOf,
         nodeById,
         start,
@@ -661,13 +998,19 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         moveToBoard,
         addTask,
         addComment,
+        lockTask,
+        recordDecision,
+        addNote,
+        editWorkflow,
         addAttachment,
         removeAttachment,
         createProject,
         renameProject,
+        uploadProjectAvatar,
         deleteProject,
         createBoard,
         renameBoard,
+        uploadBoardAvatar,
         deleteBoard,
         reorderBoards,
         notice,

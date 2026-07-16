@@ -25,6 +25,7 @@ import {
   listTasks,
   listTasksFlat,
   listToday,
+  searchTasks,
   getTask,
   createTask,
   updateTask,
@@ -36,6 +37,19 @@ import {
   bulkApply,
   getAttachmentById,
   toMarkdown,
+  listProjects,
+  createProject,
+  updateProject,
+  createBoard,
+  updateBoard,
+  mintRef,
+  recordDecision,
+  listDecisions,
+  reviewDecision,
+  addNote,
+  listNotes,
+  linkCommit,
+  standup,
 } from "@/lib/db/service";
 import {
   listEvents,
@@ -45,6 +59,8 @@ import {
   CalendarError,
 } from "@/lib/google/calendar";
 import { listPublicConnections } from "@/lib/google/connections";
+import { SYNC_NOTE } from "@/lib/repo-sync";
+import { WORKFLOW } from "@/lib/workflow";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -79,6 +95,16 @@ const customFieldsArg = z.record(
   z.union([z.string(), z.number(), z.boolean()]),
 );
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
+const isoDateTime = z.string().min(1).max(40);
+const decisionCategoryEnum = z.enum([
+  "business",
+  "product",
+  "ux",
+  "technical",
+  "scope",
+]);
+const decisionOutcomeEnum = z.enum(["good", "mixed", "bad"]);
+const noteTypeEnum = z.enum(["progress", "blocker", "question", "fyi"]);
 
 /** MCP-authored changes are attributed to "Claude" in the activity log. */
 const AI_AUTHOR = "Claude";
@@ -155,7 +181,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8). Pass parentId to create it as a subtask.",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects).",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -170,6 +196,7 @@ const handler = createMcpHandler(
         description: z.string().max(10_000).optional(),
         tags: z.array(z.string()).optional(),
         parentId: z.string().optional(),
+        boardId: z.string().nullable().optional(),
       },
       async (input) =>
         text({ task: await createTask(input, currentUser(), AI_AUTHOR) }),
@@ -177,7 +204,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn/tags.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn/tags. WORKFLOW: write the revisable summaries here — `analysisSummary` when analysis is done (also set `analyzedAt`), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect). Set lifecycle timestamps (`analyzedAt` etc.) to the current time as an ISO string when the corresponding milestone is reached; analysisStartedAt/workStartedAt auto-fire from record_decision/link_commit, so you rarely set those by hand.",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -192,6 +219,12 @@ const handler = createMcpHandler(
         difficulty: fibEnum.nullable().optional(),
         description: z.string().max(10_000).nullable().optional(),
         tags: z.array(z.string()).optional(),
+        analysisSummary: z.string().max(20_000).nullable().optional(),
+        plan: z.string().max(20_000).nullable().optional(),
+        summary: z.string().max(20_000).nullable().optional(),
+        analysisStartedAt: isoDateTime.nullable().optional(),
+        analyzedAt: isoDateTime.nullable().optional(),
+        workStartedAt: isoDateTime.nullable().optional(),
         expectedUpdatedAt: z
           .string()
           .optional()
@@ -219,11 +252,12 @@ const handler = createMcpHandler(
 
     server.tool(
       "move_task",
-      "Reorder or re-nest a task: change its status (move between groups), parentId (nest under another task, or null for top level), and/or position.",
+      "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), and/or position.",
       {
         id: z.string(),
         status: statusEnum.optional(),
         parentId: z.string().nullable().optional(),
+        boardId: z.string().nullable().optional(),
         position: z.number().optional(),
       },
       async ({ id, ...target }) => {
@@ -257,6 +291,359 @@ const handler = createMcpHandler(
       "Delete a task. Its subtasks are re-parented to the top level (not deleted).",
       { id: z.string() },
       async ({ id }) => text({ ok: await deleteTask(id, currentUser()) }),
+    );
+
+    server.tool(
+      "search_tasks",
+      "Query your tasks by any combination of filters — PREFER this over list_tasks for targeted questions like 'what's overdue?', 'urgent work tasks', or 'what's assigned to Simon?'. All filters are optional and AND together. Returns a flat list.",
+      {
+        status: z.array(statusEnum).optional(),
+        assignee: z.string().max(120).optional().describe("matches one of a task's assignees"),
+        tag: z.string().optional(),
+        text: z.string().max(200).optional().describe("substring of title or description"),
+        dueBefore: ymd.optional(),
+        dueAfter: ymd.optional(),
+        overdue: z.boolean().optional().describe("past due and not done"),
+        boardId: z.string().optional(),
+        projectId: z.string().optional(),
+        format: z.enum(["json", "markdown"]).optional().default("json"),
+      },
+      async ({ format, ...filter }) => {
+        const result = await searchTasks(currentUser(), filter);
+        return text(
+          format === "markdown"
+            ? toMarkdown(result)
+            : { count: result.length, tasks: result },
+        );
+      },
+    );
+
+    /* ----------------------------------------------------------------- */
+    /* WORKFLOW — the process layer: lock the code, record decisions +    */
+    /* notes as they happen, link commits. See work_on_task / finish_task */
+    /* prompts for the protocol. All auto-fire lifecycle timestamps.      */
+    /* ----------------------------------------------------------------- */
+
+    server.tool(
+      "lock_task",
+      "Lock (freeze) a task's human code so it's stable to cite in commits — e.g. GH-20* becomes GH-20. Idempotent: locking an already-locked task just returns it. Normally you don't call this directly — the work_on_task prompt locks on handoff — but call it if you're about to commit work referencing a task whose code is still soft (ends with *).",
+      { id: z.string() },
+      async ({ id }) => {
+        const task = await mintRef(id, currentUser());
+        return task ? text({ task }) : text({ error: "Task not found" });
+      },
+    );
+
+    server.tool(
+      "record_decision",
+      "Record a decision made while working a task — LOG EACH ONE AS IT HAPPENS, not saved up for the end. `category` is one of business/product/ux/technical/scope (use `scope` for capabilities you added on the fly that never got their own task — this is how scope-creep stays visible). The first decision auto-starts the analysis clock. Decisions are queryable across all tasks (see list_decisions) and reviewed later for outcome.",
+      {
+        id: z.string(),
+        category: decisionCategoryEnum,
+        decision: z.string().min(1).max(2_000),
+        rationale: z.string().max(10_000).optional(),
+      },
+      async ({ id, category, decision, rationale }) => {
+        const d = await recordDecision(
+          id,
+          { category, decision, rationale },
+          currentUser(),
+          AI_AUTHOR,
+        );
+        return d ? text({ decision: d }) : text({ error: "Task not found" });
+      },
+    );
+
+    server.tool(
+      "list_decisions",
+      "Query decisions ACROSS all your tasks — filter by category, board, project, date range, or unreviewed-only. Use for retros ('review our technical decisions') and audits. All filters optional and AND together.",
+      {
+        taskId: z.string().optional(),
+        category: decisionCategoryEnum.optional(),
+        boardId: z.string().optional(),
+        projectId: z.string().optional(),
+        unreviewed: z.boolean().optional().describe("only decisions with no outcome yet"),
+        from: z.string().max(40).optional().describe("lower bound (ISO/date, inclusive)"),
+        to: z.string().max(40).optional().describe("upper bound (ISO/date, inclusive)"),
+      },
+      async (filter) => {
+        const decisions = await listDecisions(currentUser(), filter);
+        return text({ count: decisions.length, decisions });
+      },
+    );
+
+    server.tool(
+      "review_decision",
+      "Fill in a decision's retro verdict — was it good? `outcome` is good/mixed/bad, with an optional note. Use after list_decisions surfaces the ones worth grading.",
+      {
+        id: z.string(),
+        outcome: decisionOutcomeEnum,
+        reviewNote: z.string().max(10_000).optional(),
+      },
+      async ({ id, outcome, reviewNote }) => {
+        const d = await reviewDecision(id, { outcome, reviewNote }, currentUser());
+        return d ? text({ decision: d }) : text({ error: "Decision not found" });
+      },
+    );
+
+    server.tool(
+      "add_note",
+      "Add a team-facing note to a task — the raw material for standup. Use whenever something standup-worthy happens: a blocker, a milestone, a question for the team. `type` is progress/blocker/question/fyi (drives how the standup digest groups it).",
+      {
+        id: z.string(),
+        note: z.string().min(1).max(10_000),
+        type: noteTypeEnum.optional(),
+      },
+      async ({ id, note, type }) => {
+        const n = await addNote(id, { note, type }, currentUser(), AI_AUTHOR);
+        return n ? text({ note: n }) : text({ error: "Task not found" });
+      },
+    );
+
+    server.tool(
+      "list_notes",
+      "Query team notes ACROSS all your tasks — filter by task, type, or date range. Powers the standup digest.",
+      {
+        taskId: z.string().optional(),
+        type: noteTypeEnum.optional(),
+        from: z.string().max(40).optional(),
+        to: z.string().max(40).optional(),
+      },
+      async (filter) => {
+        const notes = await listNotes(currentUser(), filter);
+        return text({ count: notes.length, notes });
+      },
+    );
+
+    server.tool(
+      "link_commit",
+      "Record a git commit against a task so the task page lists what shipped it. Pass the `sha` (and ideally the `subject` line). Idempotent per (task, sha). The first linked commit auto-starts the work clock. Commit messages should reference the task's locked code, e.g. `[GH-20] …`.",
+      {
+        id: z.string(),
+        sha: z.string().min(4).max(64),
+        subject: z.string().max(500).optional(),
+      },
+      async ({ id, sha, subject }) => {
+        const c = await linkCommit(id, sha, subject ?? null, currentUser());
+        return c ? text({ commit: c }) : text({ error: "Task not found" });
+      },
+    );
+
+    server.tool(
+      "standup",
+      "Assemble a standup digest for a date window: team notes (grouped by type), tasks finished in the window with their summaries, and decisions made. Dates are ISO/YYYY-MM-DD (inclusive).",
+      {
+        from: z.string().min(1).max(40).describe("start of window (inclusive)"),
+        to: z.string().min(1).max(40).describe("end of window (inclusive)"),
+      },
+      async ({ from, to }) => text(await standup(currentUser(), from, to)),
+    );
+
+    /* ----------------------------------------------------------------- */
+    /* PROJECTS & BOARDS — so the AI can see + shape the hierarchy and    */
+    /* file tasks onto the right board (deletes omitted on purpose).      */
+    /* ----------------------------------------------------------------- */
+
+    server.tool(
+      "list_projects",
+      `List your projects, each with its boards. Every project AND board includes: \`id\`, \`name\`, \`code\` (its ≤4-char shortname / ref prefix, e.g. "GH"), \`color\` (hex), \`image\` (picture URL or null), \`gitFolder\` (the path to its git working directory — where its code lives on disk, or null if unset), and \`description\` (a Markdown readme explaining what it is and its constraints, or null). READ each \`description\` and \`gitFolder\` first to understand what a project/board is about and where its code lives before working on its tasks. ${SYNC_NOTE} Use a board \`id\` as the \`boardId\` when creating or moving tasks to file them under the right board.`,
+      {},
+      async () => text({ projects: await listProjects(currentUser()) }),
+    );
+
+    server.tool(
+      "create_project",
+      "Create a new project (a top-level container for boards). Besides the name you can set: `code` (the project's ≤4-char shortname / ref prefix, used for tasks scoped to the project but no board; auto-derived from the name if omitted), `color` (#rrggbb hex accent), `image` (a public picture URL), `gitFolder` (the path to the project's git working directory — where its code lives), and `description` (a Markdown readme explaining what the project is, its purpose, and constraints). ALWAYS write a `description` so that AIs without access to the code can understand the project.",
+      {
+        name: z.string().min(1).max(120),
+        code: z
+          .string()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("Shortname / ref prefix (≤4 chars used)"),
+        color: z
+          .string()
+          .regex(/^#[0-9a-fA-F]{6}$/)
+          .optional()
+          .describe("Accent color as a #rrggbb hex string"),
+        image: z
+          .string()
+          .url()
+          .max(2048)
+          .optional()
+          .describe("Project picture — a public image URL"),
+        gitFolder: z
+          .string()
+          .max(512)
+          .optional()
+          .describe("Path to the project's git working directory (where its code lives)"),
+        description: z
+          .string()
+          .max(20000)
+          .optional()
+          .describe(
+            `Markdown readme: what the project is, its purpose, and constraints. ${SYNC_NOTE}`,
+          ),
+      },
+      async ({ name, code, color, image, gitFolder, description }) =>
+        text({
+          project: await createProject(currentUser(), name, {
+            code,
+            color,
+            image,
+            gitFolder,
+            description,
+          }),
+        }),
+    );
+
+    server.tool(
+      "create_board",
+      "Create a board inside a project. Besides the name you can set: `code` (the board's ≤4-char shortname / ref prefix used in task refs, e.g. \"GH\" → GH-12; auto-derived from the name if omitted), `color` (a #rrggbb hex accent), `image` (a public picture URL), `gitFolder` (the path to this board's git working directory so you know where its code lives on disk), and `description` (a Markdown readme explaining what the board is, its purpose, and constraints). ALWAYS write a `description` so that AIs without access to the code can understand the board. Returns an error if the project isn't found or isn't yours.",
+      {
+        projectId: z.string(),
+        name: z.string().min(1).max(120),
+        code: z
+          .string()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("Shortname / ref prefix (≤4 chars used), e.g. \"GH\""),
+        color: z
+          .string()
+          .regex(/^#[0-9a-fA-F]{6}$/)
+          .optional()
+          .describe("Accent color as a #rrggbb hex string"),
+        image: z
+          .string()
+          .url()
+          .max(2048)
+          .optional()
+          .describe("Board picture — a public image URL"),
+        gitFolder: z
+          .string()
+          .max(512)
+          .optional()
+          .describe("Path to the board's git working directory (where its code lives)"),
+        description: z
+          .string()
+          .max(20000)
+          .optional()
+          .describe(
+            `Markdown readme: what the board is, its purpose, and constraints. ${SYNC_NOTE}`,
+          ),
+      },
+      async ({ projectId, name, code, color, image, gitFolder, description }) => {
+        const board = await createBoard(currentUser(), projectId, name, {
+          code,
+          color,
+          image,
+          gitFolder,
+          description,
+        });
+        return board ? text({ board }) : text({ error: "Project not found" });
+      },
+    );
+
+    server.tool(
+      "rename_board",
+      "Update a board: rename it, and/or change its `code` (≤4-char shortname / ref prefix, e.g. \"GH\"), `color` (#rrggbb hex), `image` (picture URL, or null to clear), `gitFolder` (path to the board's git working directory, or null to clear), or `description` (a Markdown readme of what the board is and its constraints, or null to clear). A code change only affects tasks whose code is still soft (unlocked) — locked refs are frozen. The code is kept unique across your boards/projects.",
+      {
+        id: z.string(),
+        name: z.string().min(1).max(120).optional(),
+        code: z
+          .string()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("Shortname / ref prefix (≤4 chars used), e.g. \"GH\""),
+        color: z
+          .string()
+          .regex(/^#[0-9a-fA-F]{6}$/)
+          .optional()
+          .describe("Accent color as a #rrggbb hex string"),
+        image: z
+          .string()
+          .url()
+          .max(2048)
+          .nullable()
+          .optional()
+          .describe("Board picture URL, or null to clear"),
+        gitFolder: z
+          .string()
+          .max(512)
+          .nullable()
+          .optional()
+          .describe("Path to the board's git working directory, or null to clear"),
+        description: z
+          .string()
+          .max(20000)
+          .nullable()
+          .optional()
+          .describe(`Markdown readme of the board, or null to clear. ${SYNC_NOTE}`),
+      },
+      async ({ id, name, code, color, image, gitFolder, description }) => {
+        const board = await updateBoard(currentUser(), id, {
+          name,
+          code,
+          color,
+          image,
+          gitFolder,
+          description,
+        });
+        return board ? text({ board }) : text({ error: "Board not found" });
+      },
+    );
+
+    server.tool(
+      "rename_project",
+      "Update a project: rename it, and/or change its `code` (≤4-char shortname / ref prefix, used as a task's ref prefix when it has no board), `color` (#rrggbb hex), `image` (picture URL, or null to clear), `gitFolder` (path to the project's git working directory, or null to clear), or `description` (a Markdown readme of what the project is and its constraints, or null to clear). Code is kept unique across your boards/projects.",
+      {
+        id: z.string(),
+        name: z.string().min(1).max(120).optional(),
+        code: z
+          .string()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("Shortname / ref prefix (≤4 chars used)"),
+        color: z
+          .string()
+          .regex(/^#[0-9a-fA-F]{6}$/)
+          .optional()
+          .describe("Accent color as a #rrggbb hex string"),
+        image: z
+          .string()
+          .url()
+          .max(2048)
+          .nullable()
+          .optional()
+          .describe("Project picture URL, or null to clear"),
+        gitFolder: z
+          .string()
+          .max(512)
+          .nullable()
+          .optional()
+          .describe("Path to the project's git working directory, or null to clear"),
+        description: z
+          .string()
+          .max(20000)
+          .nullable()
+          .optional()
+          .describe(`Markdown readme of the project, or null to clear. ${SYNC_NOTE}`),
+      },
+      async ({ id, name, code, color, image, gitFolder, description }) => {
+        const project = await updateProject(currentUser(), id, {
+          name,
+          code,
+          color,
+          image,
+          gitFolder,
+          description,
+        });
+        return project ? text({ project }) : text({ error: "Project not found" });
+      },
     );
 
     server.tool(
@@ -411,6 +798,18 @@ const handler = createMcpHandler(
     );
 
     server.registerResource(
+      "workflow",
+      "todo://workflow",
+      {
+        title: "How to work a task",
+        description:
+          "The canonical todo workflow contract — how an AI should behave when starting, working, or finishing a task. Same text as the server instructions; read it whenever you begin or modify work.",
+        mimeType: "text/markdown",
+      },
+      async (uri) => md(uri.href, WORKFLOW),
+    );
+
+    server.registerResource(
       "task",
       new ResourceTemplate("todo://task/{id}", {
         // Let clients browse the current task ids as addressable resources.
@@ -522,9 +921,120 @@ const handler = createMcpHandler(
         );
       },
     );
+
+    /* ----------------------------------------------------------------- */
+    /* WORKFLOW PROMPTS — the handoff + finish protocol, board-aware.     */
+    /* work_on_task LOCKS the code so it's citable in commits.            */
+    /* ----------------------------------------------------------------- */
+
+    server.registerPrompt(
+      "work_on_task",
+      {
+        title: "Work on a task",
+        description:
+          "Hand a task to the AI: locks its code, then loads full context + the workflow protocol.",
+        argsSchema: { taskId: z.string() },
+      },
+      async ({ taskId }) => {
+        // Handoff = the mint point. Lock the code so every commit can cite it.
+        const locked = await mintRef(taskId, currentUser());
+        const result = await getTask(taskId, currentUser());
+        if (!locked || !result)
+          return userMsg(
+            `Task ${taskId} was not found on my board. Please ask me to pick a valid task id or code.`,
+          );
+        const code = result.task.code ?? taskId;
+        return userMsg(
+          `I want you to work on task **${code} — ${result.task.title}** (id: ${taskId}).\n\n` +
+            `Here it is:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
+            `Follow the todo workflow contract (in your server instructions / the ` +
+            `\`todo://workflow\` resource) using the todo MCP tools — read it if you ` +
+            `haven't. Its code is locked, so reference **${code}** in every commit ` +
+            `and \`link_commit\` each sha. Start by understanding the task and the ` +
+            `relevant code, and ask me anything unclear before deciding.`,
+        );
+      },
+    );
+
+    server.registerPrompt(
+      "finish_task",
+      {
+        title: "Finish a task",
+        description:
+          "Reconcile what actually shipped against the git diff (not memory), write the summary, mark done.",
+        argsSchema: { taskId: z.string() },
+      },
+      async ({ taskId }) => {
+        const result = await getTask(taskId, currentUser());
+        if (!result)
+          return userMsg(
+            `Task ${taskId} was not found. Please ask me to pick a valid task id or code.`,
+          );
+        const t = result.task;
+        const since = t.workStartedAt ?? t.analyzedAt ?? t.analysisStartedAt;
+        return userMsg(
+          `Let's finish task **${t.code ?? taskId} — ${t.title}** (id: ${taskId}).\n\n` +
+            `Recorded plan:\n${t.plan ?? "_(none)_"}\n\n` +
+            `Recorded decisions:\n${
+              result.decisions.length
+                ? result.decisions
+                    .map((d) => `- [${d.category}] ${d.decision}`)
+                    .join("\n")
+                : "_(none)_"
+            }\n\n` +
+            `Run the **Finish** step of the todo workflow contract (in your server ` +
+            `instructions / the \`todo://workflow\` resource): reconcile, don't ` +
+            `recollect. Diff git since work started${since ? ` (~${since})` : ""} ` +
+            `(or the branch point), compare against the plan + decisions above, and ` +
+            `write the \`summary\` from what ACTUALLY shipped. Make sure every commit ` +
+            `referenced **${t.code ?? taskId}**.`,
+        );
+      },
+    );
+
+    server.registerPrompt(
+      "review_decisions",
+      {
+        title: "Review decisions",
+        description: "Grade past decisions (were they good?) — a retro pass.",
+      },
+      async () => {
+        const decisions = await listDecisions(currentUser(), { unreviewed: true });
+        const body = decisions.length
+          ? decisions
+              .map(
+                (d) =>
+                  `- \`${d.id}\` [${d.category}] ${d.decision}${d.rationale ? ` — ${d.rationale}` : ""}`,
+              )
+              .join("\n")
+          : "_(no unreviewed decisions)_";
+        return userMsg(
+          `Here are decisions still awaiting a verdict:\n\n${body}\n\n` +
+            `For each, assess how it actually turned out against the current code and outcomes, then record a verdict with \`review_decision\` (outcome good/mixed/bad + a short note). Flag any that were later reversed.`,
+        );
+      },
+    );
+
+    server.registerPrompt(
+      "standup_report",
+      {
+        title: "Standup",
+        description: "A shareable standup digest for a recent window.",
+        argsSchema: { from: z.string(), to: z.string() },
+      },
+      async ({ from, to }) => {
+        const data = await standup(currentUser(), from, to);
+        return userMsg(
+          `Here's the raw material for a standup covering ${from} → ${to}:\n\n` +
+            `${JSON.stringify(data, null, 2)}\n\n` +
+            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, and **Questions**; list what shipped (finished tasks + one-line summaries); and call out any notable decisions. Keep it tight enough to paste into a team channel.`,
+        );
+      },
+    );
   },
   {
-    // Server metadata / capabilities (defaults are fine).
+    // The canonical workflow contract, delivered to every client on connect.
+    instructions: WORKFLOW,
   },
   {
     basePath: "/api",

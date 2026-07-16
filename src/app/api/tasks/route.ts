@@ -17,25 +17,39 @@ import {
   listTasksFlat,
   createTask,
   toMarkdown,
+  type TaskFilter,
 } from "@/lib/db/service";
+import type { TaskStatus } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export const GET = route(async (req: NextRequest, { userId }) => {
-  const url = new URL(req.url);
-  const filter = {
-    boardId: url.searchParams.get("boardId") ?? undefined,
-    projectId: url.searchParams.get("projectId") ?? undefined,
+  const sp = new URL(req.url).searchParams;
+  const statusCsv = sp.get("status");
+  const overdue = sp.get("overdue");
+  const filter: TaskFilter = {
+    boardId: sp.get("boardId") ?? undefined,
+    projectId: sp.get("projectId") ?? undefined,
+    status: statusCsv
+      ? (statusCsv.split(",").map((s) => s.trim()).filter(Boolean) as TaskStatus[])
+      : undefined,
+    assignee: sp.get("assignee") ?? undefined,
+    tag: sp.get("tag") ?? undefined,
+    text: sp.get("text") ?? sp.get("q") ?? undefined,
+    dueBefore: sp.get("dueBefore") ?? undefined,
+    dueAfter: sp.get("dueAfter") ?? undefined,
+    // presence => true; ?overdue=false / ?overdue=0 => false
+    overdue: overdue == null ? undefined : overdue !== "false" && overdue !== "0",
   };
-  if (url.searchParams.get("format") === "markdown") {
+  if (sp.get("format") === "markdown") {
     const md = toMarkdown(await listTasks(userId, filter));
     return new NextResponse(md, {
       status: 200,
       headers: { "content-type": "text/markdown; charset=utf-8" },
     });
   }
-  const flat = url.searchParams.get("flat");
+  const flat = sp.get("flat");
   const tasks = flat
     ? await listTasksFlat(userId, filter)
     : await listTasks(userId, filter);

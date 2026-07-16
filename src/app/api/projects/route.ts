@@ -23,7 +23,16 @@ export const GET = route(async (_req: NextRequest, { userId }: AuthedCtx) => {
 });
 
 export const POST = route(async (req: NextRequest, { userId }: AuthedCtx) => {
-  const { name } = await body(req, createProjectSchema);
-  const project = await createProject(userId, name);
+  const { name, code, color, image, gitFolder, description } = await body(
+    req,
+    createProjectSchema,
+  );
+  const project = await createProject(userId, name, {
+    code,
+    color,
+    image,
+    gitFolder,
+    description,
+  });
   return json({ project }, 201);
 });

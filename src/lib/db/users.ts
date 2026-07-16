@@ -20,12 +20,18 @@ export interface PublicUser {
   id: string;
   email: string;
   name: string;
+  /** Avatar ring/stroke color (hex). */
+  color: string;
+  /** Profile picture URL, or null (fall back to initials). */
+  avatarUrl: string | null;
 }
 
 const toPublic = (u: UserRow): PublicUser => ({
   id: u.id,
   email: u.email,
   name: u.name,
+  color: u.color,
+  avatarUrl: u.avatarUrl,
 });
 
 /* -------------------------------------------------------------------- */
@@ -65,6 +71,39 @@ export async function getUserByEmail(email: string): Promise<PublicUser | null> 
 
 export async function getUserById(id: string): Promise<PublicUser | null> {
   const row = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  return row ? toPublic(row) : null;
+}
+
+/** Everyone who can be assigned — the roster the UI resolves assignee names
+ *  against (for avatar picture + color) and the assignee picker draws from. */
+export async function listUsers(): Promise<PublicUser[]> {
+  const rows = await db.select().from(users).orderBy(users.name);
+  return rows.map(toPublic);
+}
+
+/** Fields a user may edit on their own profile. */
+export interface ProfilePatch {
+  name?: string;
+  color?: string;
+  /** null clears the picture (back to initials). */
+  avatarUrl?: string | null;
+}
+
+/** Update the given user's profile. Returns the fresh public view. */
+export async function updateUserProfile(
+  userId: string,
+  patch: ProfilePatch,
+): Promise<PublicUser | null> {
+  const set: Partial<UserRow> = {};
+  if (patch.name !== undefined) set.name = patch.name.trim();
+  if (patch.color !== undefined) set.color = patch.color;
+  if (patch.avatarUrl !== undefined) set.avatarUrl = patch.avatarUrl;
+  if (Object.keys(set).length === 0) return getUserById(userId);
+  const [row] = await db
+    .update(users)
+    .set(set)
+    .where(eq(users.id, userId))
+    .returning();
   return row ? toPublic(row) : null;
 }
 

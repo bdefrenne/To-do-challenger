@@ -1,17 +1,19 @@
 # To-do Challenger
 
-A lightweight, **ClickUp-style task list** — grouped by status, drag-and-drop
-reordering/nesting, priorities, tags, due dates, sub-tasks, a per-task detail
-modal with an activity log, and a **Today** view.
+A **ClickUp-style task manager** — projects & boards, a grouped list view, kanban
+boards, sub-tasks with drag-and-drop nesting, tags, assignees, start/due dates,
+value/difficulty (Fibonacci) points, recurrence, dependencies, image attachments,
+a per-task detail modal with an activity log, and a **Today** view.
 
-What makes it different: it's **AI-native**. The task board is a real database
-behind one API, and **Claude Code (or any AI) can read *and* write your tasks**
+What makes it different: it's **AI-native**. The board is a real database behind
+one service layer, and **Claude Code (or any AI) can read *and* write your tasks**
 over the [Model Context Protocol](https://modelcontextprotocol.io) — a true
 two-way link. You edit in the browser; Claude edits over MCP; you're both writing
-to the same source of truth, and the board updates live.
+to the same source of truth, and the board updates live (~2s). It also connects to
+**Google Calendar** so tasks and meetings live side by side.
 
 Built with **Next.js 16** · React 19 · TypeScript · Tailwind v4 · **Neon Postgres**
-· **Drizzle** · **MCP**.
+· **Drizzle** · **Vercel Blob** · **MCP** · **Google Calendar**.
 
 ## Architecture — one source of truth, many clients
 
@@ -26,7 +28,8 @@ Built with **Next.js 16** · React 19 · TypeScript · Tailwind v4 · **Neon Pos
 ```
 
 The web UI is just another API client — the exact same door the AI uses — so
-humans and AI can never drift out of sync.
+humans and AI can never drift out of sync. Everything (list, kanban, REST, MCP)
+goes through [`src/lib/db/service.ts`](src/lib/db/service.ts).
 
 ## Multi-user
 
@@ -35,12 +38,12 @@ edit, or expose to an AI the tasks you own.
 
 - **Web login** — email + password. A signed, HttpOnly session cookie keeps you
   logged in; unauthenticated visits redirect to `/login`.
-- **Accounts** are created by the workspace owner (there's no public signup) —
-  see `npm run db:seed` and the "Add a user" script below.
+- **Accounts** are created by the workspace owner (no public signup) — see
+  `npm run db:seed` and `npm run user:create` below.
 - **Connect your Claude** — each user mints their own **personal API token** on
-  the in-app **Connect Claude** page. That token identifies the user, so a
-  user's Claude (or any MCP/REST client) is scoped to *only that user's* tasks.
-  Tokens are stored hashed and shown in plaintext exactly once.
+  the in-app **Connect Claude** page. That token identifies the user, so a user's
+  Claude (or any MCP/REST client) is scoped to *only that user's* tasks. Tokens
+  are stored hashed and shown in plaintext exactly once.
 
 ## Setup
 
@@ -59,16 +62,28 @@ Or copy `.env.example` → `.env.local` and paste a connection string.
 ### 2. Session secret
 
 Login cookies are signed with `SESSION_SECRET` (required in production; a dev
-fallback keeps localhost working). Generate one into `.env.local` **and** your
-Vercel env:
+fallback keeps localhost working):
 
 ```bash
 openssl rand -hex 32              # put the result in SESSION_SECRET
 ```
 
-There is **no** global API token any more — access is per-user (see above).
+There is **no** global API token — access is per-user (see above).
 
-### 3. Create tables + seed
+### 3. Google Calendar (optional)
+
+To use the Calendar view + calendar MCP tools, add a Google OAuth client and a
+token-encryption key (full instructions in [`.env.example`](.env.example)):
+
+```
+GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   # OAuth client (Web application)
+GOOGLE_TOKEN_ENC_KEY                       # openssl rand -hex 32 — encrypts refresh tokens at rest
+```
+
+Redirect URI: `${origin}/api/google/callback`. Then connect a calendar in
+**Settings → Calendars**. Skip this section and everything except calendar works.
+
+### 4. Create tables + seed
 
 ```bash
 npm install
@@ -84,17 +99,15 @@ npm run dev                       # http://localhost:3000
 ### Add another user
 
 ```bash
-SEED_EMAIL=teammate@example.com SEED_NAME="Teammate" SEED_PASSWORD=… \
-  npx tsx -e 'import {loadEnvConfig} from "@next/env"; loadEnvConfig(process.cwd(),true); \
-    import("./src/lib/db/users").then(m => m.createUser(process.env.SEED_EMAIL!, process.env.SEED_NAME!, process.env.SEED_PASSWORD!)).then(u => {console.log("created", u.email); process.exit(0)})'
+npm run user:create -- teammate@example.com "Teammate" a-strong-password
 ```
 
-(Or wipe everything and re-seed from scratch: `npm run db:reset && npm run db:migrate && npm run db:seed`.)
+(Or wipe everything and start over: `npm run db:reset && npm run db:migrate && npm run db:seed`.)
 
 ## Connect Claude Code (the direct link)
 
 Open the **Connect Claude** page in the app, create a token, and copy the
-ready-made command it shows you. It looks like:
+ready-made command it shows you:
 
 ```bash
 claude mcp add --transport http todo \
@@ -104,17 +117,22 @@ claude mcp add --transport http todo \
 
 (Swap the URL for `https://<your-app>.vercel.app/api/mcp` once deployed.)
 
-Claude now has these tools: `list_tasks`, `get_task`, `create_task`,
-`update_task`, `move_task`, `complete_task`, `add_comment`, `delete_task` — all
-scoped to your tasks. Anything Claude changes shows up on your board within a
-few seconds, and its edits are attributed to **Claude** in each task's activity
-log.
+Everything Claude changes shows up on your board within ~2s, attributed to
+**Claude** in each task's activity log. Tools (all scoped to your tasks):
+
+| Group | Tools |
+|---|---|
+| **Tasks** | `list_tasks`, `get_task`, `create_task`, `update_task`, `move_task`, `complete_task`, `add_comment`, `delete_task` |
+| **Search** | `search_tasks` — filter by status, assignee, tag, text, due window, or overdue (prefer over `list_tasks` for targeted questions) |
+| **Organize** | `list_projects`, `create_project`, `create_board`, `rename_board`, `rename_project` — plus `boardId` on `create_task`/`move_task` to file work onto a board |
+| **Bulk** | `bulk_update` (same patch to many), `bulk_apply` (ordered mixed create/update/move/complete/comment/delete) |
+| **Attachments** | `get_attachment` (view an image inline) |
+| **Calendar** | `list_calendars`, `list_calendar_events`, `create_calendar_event`, `update_calendar_event`, `delete_calendar_event` |
 
 ### Resources — attachable context
 
-The server also exposes your board as MCP **resources**: read-only context you
-can drop straight into a Claude Code conversation (`@`-mention them) without
-spending a tool call. All are scoped to your tasks.
+Read-only board context you can `@`-mention into a Claude Code conversation
+without spending a tool call. All scoped to your tasks.
 
 | URI | What it is |
 |---|---|
@@ -125,54 +143,81 @@ spending a tool call. All are scoped to your tasks.
 
 ### Prompts — board-aware slash commands
 
-And a set of **prompts** — canned commands that pre-fill Claude with your real
-data plus instructions:
+Canned commands that pre-fill Claude with your real data plus instructions:
 
 | Prompt | Does |
 |---|---|
 | `/plan_my_day` | Embeds today's tasks and asks for a prioritized plan; can reorder via `move_task`/`update_task`. |
-| `/triage_backlog` | Embeds the backlog and proposes priorities + due dates via `update_task`. |
+| `/triage_backlog` | Embeds the backlog and proposes value/difficulty + due dates via `update_task`. |
 | `/weekly_review` | Summarizes what you completed this week and what's gone stale, with next steps. |
 | `/breakdown_task` | Takes a `taskId`, proposes subtasks creatable via `create_task`. |
 
-For example, in a Claude Code session:
-
-```
-/plan_my_day
-```
-
-Claude sees your live `todo://today` and comes back with an ordered plan.
-
 ## REST API (for any AI / script)
 
-All endpoints require a credential that identifies the user: either the login
-session cookie (web UI) or `Authorization: Bearer <your-personal-token>`.
+Every endpoint requires a credential that identifies the user: the login session
+cookie (web UI) or `Authorization: Bearer <your-personal-token>`.
+
+### Tasks
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/tasks` | list all tasks (nested tree) |
+| `GET` | `/api/tasks` | list tasks (nested tree); supports filters below |
 | `GET` | `/api/tasks?flat=1` | flat list |
 | `GET` | `/api/tasks?format=markdown` | AI-skimmable board as Markdown |
-| `POST` | `/api/tasks` | create `{ title, status?, priority?, … }` |
-| `GET` | `/api/tasks/:id` | one task + activity log |
-| `PATCH` | `/api/tasks/:id` | update fields (partial) |
-| `DELETE` | `/api/tasks/:id` | delete |
-| `POST` | `/api/tasks/:id/move` | `{ parentId?, status?, position? }` |
+| `POST` | `/api/tasks` | create `{ title, status?, assignees?, dueDate?, value?, difficulty?, tags?, parentId?, boardId?, … }` |
+| `GET` | `/api/tasks/:id` | one task + activity log + attachments |
+| `PATCH` | `/api/tasks/:id` | update fields (partial); optional `expectedUpdatedAt` optimistic lock |
+| `DELETE` | `/api/tasks/:id` | delete (subtasks re-parented to top) |
+| `POST` | `/api/tasks/:id/move` | `{ parentId?, status?, position?, boardId? }` |
 | `POST` | `/api/tasks/:id/complete` | `{ done?: boolean }` |
 | `POST` | `/api/tasks/:id/comments` | `{ message, author? }` |
+| `POST` | `/api/tasks/:id/attachments` | multipart `file` (image, ≤4 MB) → Vercel Blob |
+| `DELETE` | `/api/tasks/:id/attachments/:attachmentId` | remove an attachment |
+| `POST` | `/api/tasks/bulk` | `{ ids, patch }` **or** `{ operations: [...] }` |
+
+**Filters** on `GET /api/tasks` (combine freely, AND-ed together):
+`boardId`, `projectId`, `status` (csv, e.g. `in-progress,planned`), `assignee`,
+`tag`, `text` (or `q`), `dueBefore`, `dueAfter`, `overdue`.
 
 ```bash
-curl -s https://<app>/api/tasks?format=markdown \
-  -H "Authorization: Bearer $API_TOKEN"
+curl -s "https://<app>/api/tasks?status=in-progress,planned&overdue=1&text=doc" \
+  -H "Authorization: Bearer $TOKEN"
 ```
+
+### Projects, boards, tokens, sync
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/api/projects` | list / create projects |
+| `PATCH` `DELETE` | `/api/projects/:id` | rename / delete a project |
+| `POST` | `/api/boards` | create a board `{ projectId, name }` |
+| `PATCH` `DELETE` | `/api/boards/:id` | rename / delete a board |
+| `POST` | `/api/boards/reorder` | `{ projectId, orderedIds }` |
+| `GET` `POST` | `/api/tokens` | list / mint personal API tokens |
+| `DELETE` | `/api/tokens/:id` | revoke a token |
+| `GET` | `/api/version` | change-cursor for cheap polling |
+| `POST` | `/api/auth/login` · `/api/auth/logout` | session cookie |
+
+### Google Calendar
+
+OAuth: `GET /api/google/connect` → `GET /api/google/callback`. Connections and
+events are managed under `/api/calendar/connections/*` and `/api/calendar/events/*`
+(and the calendar MCP tools). See [`src/app/api/calendar/`](src/app/api/calendar/)
+and [`src/lib/google/`](src/lib/google/).
 
 ## Data model
 
-`tasks` (self-referential `parentId` for nesting, fractional `position` for
-order, `statusSince` for the "N days in status" display) and `task_logs`
-(activity + comments). Schema lives in
-[`src/lib/db/schema.ts`](src/lib/db/schema.ts); it mirrors the app types in
-[`src/lib/types.ts`](src/lib/types.ts).
+Schema lives in [`src/lib/db/schema.ts`](src/lib/db/schema.ts) and mirrors the app
+types in [`src/lib/types.ts`](src/lib/types.ts):
+
+- **users**, **api_tokens** (per-user bearer tokens, stored hashed)
+- **projects** → **boards** (fractional `position` order)
+- **tasks** — `boardId`, self-referential `parentId` (nesting), `position`,
+  `status`/`statusSince`/`completedAt`, `assignees[]`, `startDate`/`dueDate`,
+  `recurrence`, `dependsOn[]`, `value`/`difficulty` (Fibonacci), `tags[]`,
+  `customFields` (JSONB)
+- **task_logs** (activity + comments), **task_attachments** (image metadata; bytes in Vercel Blob)
+- Google Calendar connections (encrypted refresh tokens; see `src/lib/google/`)
 
 ## Scripts
 
@@ -183,7 +228,10 @@ npm run db:generate  # generate a migration from schema changes
 npm run db:migrate   # apply migrations
 npm run db:push      # push schema directly (dev)
 npm run db:studio    # Drizzle Studio (browse the DB)
-npm run db:seed      # reset + load sample data
+npm run db:seed      # create the owner account + sample tasks
+npm run db:reset     # drop everything (pair with db:migrate + db:seed)
+npm run db:backfill  # backfill boards for pre-existing tasks
+npm run user:create  # create a user (SEED_EMAIL/NAME/PASSWORD)
 ```
 
 ## Design tokens

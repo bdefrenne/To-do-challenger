@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import type { Task } from "@/lib/types";
-import { AvatarStack, PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { AvatarStack } from "@/components/PersonAvatar";
 import { formatDue } from "@/lib/format";
 
 /** Mime used to carry the dragged task id across kanban columns/boards. */

@@ -6,6 +6,8 @@ import type { Board, Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskCard, TASK_DND_MIME } from "./TaskCard";
+import { BoardModal } from "./BoardModal";
+import { Avatar } from "@/components/ui/Badge";
 
 /** DnD payload type for dragging a whole board column (distinct from task
  *  cards, which use TASK_DND_MIME, so the two drag surfaces never collide). */
@@ -25,7 +27,6 @@ export function BoardsColumns({ project }: { project: Project }) {
     openTask,
     moveToBoard,
     addTask,
-    createBoard,
     deleteBoard,
     reorderBoards,
   } = useWorkspace();
@@ -33,6 +34,9 @@ export function BoardsColumns({ project }: { project: Project }) {
 
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [overBoardId, setOverBoardId] = useState<string | null>(null);
+  const [modal, setModal] = useState<
+    { mode: "create" } | { mode: "edit"; board: Board } | null
+  >(null);
 
   function handleReorderDrop(targetId: string) {
     if (dragBoardId && dragBoardId !== targetId) {
@@ -61,6 +65,7 @@ export function BoardsColumns({ project }: { project: Project }) {
             openTask={openTask}
             onDropCard={(id, status) => moveToBoard(id, board.id, status)}
             onAdd={(title) => addTask("backlog", title, board.id)}
+            onEdit={() => setModal({ mode: "edit", board })}
             onDelete={() => {
               if (confirm(`Delete board “${board.name}” and its tasks?`))
                 deleteBoard(board.id);
@@ -76,7 +81,21 @@ export function BoardsColumns({ project }: { project: Project }) {
           />
         ))
       )}
-      <NewBoard onCreate={(name) => createBoard(project.id, name)} />
+      <button
+        onClick={() => setModal({ mode: "create" })}
+        className="flex w-64 shrink-0 items-center gap-1.5 rounded-xl border border-dashed border-border-strong px-3 py-2 text-sm text-muted transition-colors hover:border-accent hover:text-accent"
+      >
+        <span className="text-base leading-none">+</span> New board
+      </button>
+
+      {modal ? (
+        <BoardModal
+          mode={modal.mode}
+          projectId={project.id}
+          board={modal.mode === "edit" ? modal.board : undefined}
+          onClose={() => setModal(null)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -88,6 +107,7 @@ function BoardColumn({
   openTask,
   onDropCard,
   onAdd,
+  onEdit,
   onDelete,
   isOver,
   onReorderStart,
@@ -101,6 +121,7 @@ function BoardColumn({
   openTask: (id: string) => void;
   onDropCard: (id: string, status: TaskStatus) => void;
   onAdd: (title: string) => void;
+  onEdit: () => void;
   onDelete: () => void;
   isOver: boolean;
   onReorderStart: () => void;
@@ -146,6 +167,7 @@ function BoardColumn({
         >
           ⠿
         </span>
+        <Avatar name={board.name} size={18} imageUrl={board.image} color={board.color} />
         <Link
           href={`/boards/${board.id}`}
           className="truncate text-sm font-semibold tracking-tight text-fg hover:text-accent"
@@ -154,8 +176,14 @@ function BoardColumn({
         </Link>
         <span className="nums text-xs text-faint">{count}</span>
         <button
+          onClick={onEdit}
+          className="ml-auto rounded-md px-2 py-0.5 text-xs text-faint transition-colors hover:bg-surface-3 hover:text-fg"
+        >
+          Edit
+        </button>
+        <button
           onClick={onDelete}
-          className="ml-auto rounded-md px-2 py-0.5 text-xs text-faint transition-colors hover:bg-nerf-soft hover:text-nerf"
+          className="rounded-md px-2 py-0.5 text-xs text-faint transition-colors hover:bg-nerf-soft hover:text-nerf"
         >
           Delete
         </button>
@@ -282,41 +310,3 @@ function AddCard({ onAdd }: { onAdd: (title: string) => void }) {
   );
 }
 
-function NewBoard({ onCreate }: { onCreate: (name: string) => void }) {
-  const [editing, setEditing] = useState(false);
-  const [text, setText] = useState("");
-
-  if (!editing) {
-    return (
-      <button
-        onClick={() => setEditing(true)}
-        className="flex w-64 shrink-0 items-center gap-1.5 rounded-xl border border-dashed border-border-strong px-3 py-2 text-sm text-muted transition-colors hover:border-accent hover:text-accent"
-      >
-        <span className="text-base leading-none">+</span> New board
-      </button>
-    );
-  }
-
-  return (
-    <input
-      autoFocus
-      value={text}
-      onChange={(e) => setText(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" && text.trim()) {
-          onCreate(text.trim());
-          setText("");
-          setEditing(false);
-        } else if (e.key === "Escape") {
-          setText("");
-          setEditing(false);
-        }
-      }}
-      onBlur={() => {
-        if (!text.trim()) setEditing(false);
-      }}
-      placeholder="Board name, then Enter…"
-      className="w-64 shrink-0 rounded-xl border border-border bg-surface px-3 py-2 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
-    />
-  );
-}

@@ -15,9 +15,12 @@
     "db:reset": "tsx scripts/reset-db.ts",
     "db:seed": "tsx scripts/seed.ts",
     "db:backfill": "tsx scripts/backfill-boards.ts",
-    "user:create": "tsx scripts/create-user.ts"
+    "db:backfill:refs": "tsx scripts/backfill-refs.ts",
+    "user:create": "tsx scripts/create-user.ts",
+    "telegram:webhook": "tsx scripts/setup-telegram-webhook.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
     "@neondatabase/serverless": "^1.1.0",
     "@vercel/blob": "^2.6.1",
     "drizzle-orm": "^0.45.2",

@@ -3,8 +3,10 @@
 import { useState, type DragEvent } from "react";
 import type { Task, TaskStatus } from "@/lib/types";
 import type { DropPos, TaskNode } from "./WorkspaceContext";
-import { AvatarStack, PointsChip, TagChip } from "@/components/ui/Badge";
+import { PointsChip, TagChip } from "@/components/ui/Badge";
+import { AvatarStack } from "@/components/PersonAvatar";
 import { StatusPill } from "./StatusPill";
+import { BoardPill, type BoardGroup } from "./BoardPill";
 import { formatRelative, formatDue } from "@/lib/format";
 
 /** Shared grid template so header and rows line up. */
@@ -22,10 +24,12 @@ export function TaskTableRow({
   hasChildren,
   expanded,
   draggingId,
-  boardName,
+  currentBoardId,
+  currentBoardName,
+  boardGroups,
+  onChangeBoard,
   onToggleExpand,
   onOpen,
-  onStart,
   onToggleDone,
   onSetStatus,
   onDragStartRow,
@@ -37,11 +41,16 @@ export function TaskTableRow({
   hasChildren: boolean;
   expanded: boolean;
   draggingId: string | null;
-  /** When set, a small chip with the task's board name (mixed-board views). */
-  boardName?: string;
+  /** The task's current board id, or null when unassigned. */
+  currentBoardId: string | null;
+  /** Resolved current board name; null → the pill shows "No board". */
+  currentBoardName: string | null;
+  /** Boards the task may move to, grouped by project (see BoardPill). */
+  boardGroups: BoardGroup[];
+  /** Move the task onto another board. */
+  onChangeBoard: (boardId: string) => void;
   onToggleExpand: () => void;
   onOpen: () => void;
-  onStart: () => void;
   onToggleDone: () => void;
   onSetStatus: (s: TaskStatus) => void;
   onDragStartRow: (id: string) => void;
@@ -124,29 +133,10 @@ export function TaskTableRow({
           ✓
         </button>
 
-        {/* quick-start (hover) → move to In progress */}
-        {!inProgress && !done ? (
-          <button
-            onClick={onStart}
-            title="Start (move to In Progress)"
-            className="shrink-0 text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
-          >
-            ▶
-          </button>
-        ) : null}
-
         <button onClick={onOpen} className="flex min-w-0 items-center gap-2 text-left">
           <span className={`truncate ${done ? "text-faint line-through" : "text-fg"}`}>
             {task.title}
           </span>
-          {boardName ? (
-            <span
-              className="shrink-0 rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
-              title={`Board: ${boardName}`}
-            >
-              {boardName}
-            </span>
-          ) : null}
           {(task.tags ?? []).map((t) => (
             <TagChip key={t} id={t} />
           ))}
@@ -156,6 +146,14 @@ export function TaskTableRow({
             </span>
           ) : null}
         </button>
+
+        {/* Board picker — sibling of the title button (can't nest buttons). */}
+        <BoardPill
+          currentBoardId={currentBoardId}
+          currentBoardName={currentBoardName}
+          groups={boardGroups}
+          onChange={onChangeBoard}
+        />
       </div>
 
       {/* Assignees */}
