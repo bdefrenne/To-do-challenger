@@ -21,12 +21,16 @@ export interface BoardGroup {
 export function BoardPill({
   currentBoardId,
   currentBoardName,
+  color,
   groups,
   onChange,
 }: {
   currentBoardId: string | null;
   /** Resolved name of the current board; null → render "No board". */
   currentBoardName: string | null;
+  /** Resolved accent color for the current board (board's own, or its
+   *  project's as a fallback). Shown as a dot; ignored when there's no board. */
+  color?: string | null;
   /** Selectable destinations, grouped by project. */
   groups: BoardGroup[];
   /** Move the task onto `boardId` (no-op if it's already the current board). */
@@ -70,10 +74,17 @@ export function BoardPill({
           setOpen((v) => (v ? (close(), false) : true));
         }}
         title={currentBoardName ? `Board: ${currentBoardName}` : "No board — click to assign"}
-        className={`rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium hover:bg-surface-2 ${
+        className={`inline-flex items-center gap-1.5 rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium hover:bg-surface-2 ${
           currentBoardName ? "bg-surface-2 text-muted" : "bg-transparent text-faint italic"
         }`}
       >
+        {currentBoardName ? (
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
+            style={{ backgroundColor: color ?? "var(--color-accent)" }}
+            aria-hidden
+          />
+        ) : null}
         {currentBoardName ?? "No board"}
       </button>
 

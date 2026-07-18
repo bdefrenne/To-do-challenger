@@ -20,6 +20,7 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -314,6 +315,33 @@ export const boards = pgTable(
   ],
 );
 
+/* ---- Project members ----
+   Which roster users belong to a project. Purely a CURATION layer for the
+   assignee picker — a member does NOT gain read/write access to the owner's
+   project (data stays owner-private; see the userId fences in service.ts).
+   When a task on a project/board is assigned, the picker offers only these
+   people (falling back to the whole roster when a project has no members set).
+   Boards/tasks inherit their project's members — membership is project-level.
+   The owner is always kept as a member (new tasks auto-assign to them). */
+export const projectMembers = pgTable(
+  "project_members",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.projectId, t.userId] }),
+    index("project_members_user_idx").on(t.userId),
+  ],
+);
+
 /* ---- Enums (mirror the string unions in types.ts) ---- */
 export const taskStatus = pgEnum("task_status", [
   "backlog",
@@ -354,14 +382,21 @@ export const tasks = pgTable(
     id: text("id")
       .primaryKey()
       .default(sql`gen_random_uuid()`),
-    /** Owner. A task is only ever visible to (and editable by) this user. */
+    /** Creator. TEAM-VISIBLE like canvases: every signed-in user can see and
+     *  edit every task, so `userId` is only "who created it" metadata + the
+     *  ref-code namespace (a task Simon creates reads `SIM-…`) — never a
+     *  read/write fence. */
     userId: text("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     title: text("title").notNull(),
     status: taskStatus("status").notNull().default("backlog"),
-    /** People assigned (display names). Empty array = unassigned. */
-    assignees: text("assignees")
+    /** Assigned people, as `users.id`s (resolved from name/email/id at the
+     *  write boundary). Empty array = unassigned. NB: the physical column is
+     *  still named `assignees` (it once held display-name strings; a data
+     *  migration backfilled the ids in place) — the property is the source of
+     *  truth for its meaning. */
+    assigneeIds: text("assignees")
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
@@ -408,10 +443,9 @@ export const tasks = pgTable(
     /** When the code was locked. */
     lockedAt: timestamp("locked_at", { withTimezone: true }),
     /* ---- Lifecycle timestamps (informational, non-gating) ----
-       Phase is DERIVED from these; kanban `status` stays orthogonal. */
-    analysisStartedAt: timestamp("analysis_started_at", { withTimezone: true }),
+       Just `analyzedAt` (optional — set when analysis is done). Progress lives
+       in the kanban `status`; we don't track when analysis/work "started". */
     analyzedAt: timestamp("analyzed_at", { withTimezone: true }),
-    workStartedAt: timestamp("work_started_at", { withTimezone: true }),
     /* ---- Revisable summaries (rewritten in place; decisions/notes are logs) ---- */
     analysisSummary: text("analysis_summary"),
     plan: text("plan"),
@@ -495,66 +529,16 @@ export const taskAttachments = pgTable(
    filled LATER in a retro pass ("were these good?"). Its own table (not the
    activity log) precisely because you retrieve + filter these across all tasks
    on a Decisions page. */
-export const decisionCategory = pgEnum("decision_category", [
-  "business",
-  "product",
-  "ux",
-  "technical",
-  "scope",
-]);
-
-/** Which lifecycle phase the decision was made in (auto-stamped from the task). */
-export const decisionPhase = pgEnum("decision_phase", ["analysis", "execution"]);
-
-/** Retro verdict — nullable until reviewed. */
-export const decisionOutcome = pgEnum("decision_outcome", [
-  "good",
-  "mixed",
-  "bad",
-]);
-
-export const taskDecisions = pgTable(
-  "task_decisions",
-  {
-    id: text("id")
-      .primaryKey()
-      .default(sql`gen_random_uuid()`),
-    taskId: text("task_id")
-      .notNull()
-      .references(() => tasks.id, { onDelete: "cascade" }),
-    /** Denormalized owner (like tasks/boards) for cheap per-user scoping. */
-    userId: text("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    category: decisionCategory("category").notNull(),
-    /** The decision itself, one line. */
-    decision: text("decision").notNull(),
-    /** Why — the reasoning behind it. */
-    rationale: text("rationale"),
-    phase: decisionPhase("phase").notNull().default("analysis"),
-    author: text("author"),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-    /* ---- Retro (filled later) ---- */
-    outcome: decisionOutcome("outcome"),
-    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
-    reviewNote: text("review_note"),
-    /** A later decision that reversed/replaced this one (retro signal). */
-    supersededById: text("superseded_by_id"),
-  },
-  (t) => [
-    index("task_decisions_task_idx").on(t.taskId),
-    index("task_decisions_user_idx").on(t.userId),
-  ],
-);
-
 /* ---- Notes ----
-   Team-facing callouts (from human or AI) meant to be surfaced at standup:
-   "blocked on design", "endpoint shipped, needs QA". Sibling of decisions —
-   its own table + Notes page — but deliberately NOT graded (no outcome). */
+   One log for everything worth remembering on a task — from a human or the AI.
+   `type` says what kind: a `decision` (a choice made, optionally with a "Why"),
+   or a standup-worthy callout (`progress` / `milestone` / `blocker` /
+   `question` / `fyi`). `tags` are free-form labels (e.g. a decision's old
+   category like "technical"). Deliberately NOT graded — no retro/outcome. */
 export const noteType = pgEnum("note_type", [
+  "decision",
   "progress",
+  "milestone",
   "blocker",
   "question",
   "fyi",
@@ -574,6 +558,7 @@ export const taskNotes = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     type: noteType("type"),
     note: text("note").notNull(),
+    tags: text("tags").array().notNull().default(sql`'{}'::text[]`),
     author: text("author"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -613,10 +598,93 @@ export const taskCommits = pgTable(
   ],
 );
 
+/* ---- Canvas / whiteboard ----
+   A free-form brainstorming space (Miro/Figma-style). A `canvas` is a
+   standalone document; `canvasNodes` are the things on it — text blocks and
+   sections (board containers) — positioned in canvas coordinates.
+   `viewport`/`data` are jsonb so the shape can grow (last pan/zoom, per-node
+   font size, a section's bound board) without a migration. Everything is
+   user-scoped like the rest of the app.
+   NOTE: `frame` is a legacy enum value — the frame feature was removed and
+   nothing writes it; it's left in the enum to avoid a Postgres enum migration. */
+export const canvasNodeKind = pgEnum("canvas_node_kind", [
+  "text",
+  "frame",
+  "section",
+]);
+
+export const canvases = pgTable(
+  "canvases",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    /** Last-saved pan/zoom, so reopening restores the view: { x, y, scale }. */
+    viewport: jsonb("viewport").notNull().default(sql`'{}'::jsonb`),
+    /** Fractional sort key for ordering canvases in the index. */
+    position: doublePrecision("position").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index("canvases_user_idx").on(t.userId)],
+);
+
+export const canvasNodes = pgTable(
+  "canvas_nodes",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    canvasId: text("canvas_id")
+      .notNull()
+      .references(() => canvases.id, { onDelete: "cascade" }),
+    /** "text" = a markdown text block; "section" = a Figma-style titled outline
+     *  bound to a board (`data.boardId`), whose lines are that board's live
+     *  tasks. ("frame" is a removed legacy kind — see the enum note above.) */
+    kind: canvasNodeKind("kind").notNull(),
+    /** Markdown for a text node; the label/title for a section. */
+    content: text("content").notNull().default(""),
+    /** Position + size in canvas coordinates (unaffected by pan/zoom). */
+    x: doublePrecision("x").notNull().default(0),
+    y: doublePrecision("y").notNull().default(0),
+    width: doublePrecision("width").notNull().default(200),
+    height: doublePrecision("height").notNull().default(80),
+    /** Optional accent (hex) — e.g. a sticky's tint. */
+    color: text("color"),
+    /** Fractional z-order (higher = on top). */
+    position: doublePrecision("position").notNull().default(0),
+    /** Free-form extras: font size, and a section's bound `boardId`. */
+    data: jsonb("data").notNull().default(sql`'{}'::jsonb`),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    index("canvas_nodes_user_idx").on(t.userId),
+    index("canvas_nodes_canvas_idx").on(t.canvasId),
+  ],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type NewProjectRow = typeof projects.$inferInsert;
 export type BoardRow = typeof boards.$inferSelect;
 export type NewBoardRow = typeof boards.$inferInsert;
+export type ProjectMemberRow = typeof projectMembers.$inferSelect;
+export type NewProjectMemberRow = typeof projectMembers.$inferInsert;
 export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
 export type TaskLogRow = typeof taskLogs.$inferSelect;
@@ -633,9 +701,11 @@ export type TelegramLinkCodeRow = typeof telegramLinkCodes.$inferSelect;
 export type NewTelegramLinkCodeRow = typeof telegramLinkCodes.$inferInsert;
 export type GoogleConnectionRow = typeof googleConnections.$inferSelect;
 export type NewGoogleConnectionRow = typeof googleConnections.$inferInsert;
-export type TaskDecisionRow = typeof taskDecisions.$inferSelect;
-export type NewTaskDecisionRow = typeof taskDecisions.$inferInsert;
 export type TaskNoteRow = typeof taskNotes.$inferSelect;
 export type NewTaskNoteRow = typeof taskNotes.$inferInsert;
 export type TaskCommitRow = typeof taskCommits.$inferSelect;
 export type NewTaskCommitRow = typeof taskCommits.$inferInsert;
+export type CanvasRow = typeof canvases.$inferSelect;
+export type NewCanvasRow = typeof canvases.$inferInsert;
+export type CanvasNodeRow = typeof canvasNodes.$inferSelect;
+export type NewCanvasNodeRow = typeof canvasNodes.$inferInsert;

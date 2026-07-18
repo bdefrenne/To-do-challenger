@@ -50,6 +50,15 @@ export function TaskTable({
     return m;
   }, [projects]);
 
+  // boardId → its accent color, falling back to the project's color.
+  const boardColorById = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of projects)
+      for (const b of p.boards ?? [])
+        m[b.id] = b.color || p.color || "#7b68ee";
+    return m;
+  }, [projects]);
+
   const toGroup = (p: Project): BoardGroup => ({
     projectId: p.id,
     projectName: p.name,
@@ -87,6 +96,7 @@ export function TaskTable({
           draggingId={draggingId}
           currentBoardId={node.boardId}
           currentBoardName={node.boardId ? boardNameById[node.boardId] ?? null : null}
+          boardColor={node.boardId ? boardColorById[node.boardId] ?? null : null}
           boardGroups={boardGroupsFor(node.boardId)}
           onChangeBoard={(bid) => moveToBoard(node.id, bid)}
           onToggleExpand={() =>
@@ -113,7 +123,7 @@ export function TaskTable({
       className="overflow-x-auto rounded-xl border border-border bg-surface shadow-sm"
       onDragEnd={() => setDraggingId(null)}
     >
-      <div className="min-w-[800px]">
+      <div className="min-w-[940px]">
         {/* column header */}
         <div
           className={`${GRID} border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-faint`}
@@ -121,6 +131,7 @@ export function TaskTable({
           <div>Name</div>
           <div className="text-center">Owners</div>
           <div className="text-center">Points</div>
+          <div>Board</div>
           <div>Status</div>
           <div>Due</div>
           <div>Updated</div>

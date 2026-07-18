@@ -24,7 +24,7 @@ export interface SessionUser {
 const NAV = [
   { href: "/", label: "All tasks", icon: "☰" },
   { href: "/today", label: "Today", icon: "◎" },
-  { href: "/decisions", label: "Decisions", icon: "◇" },
+  { href: "/canvas", label: "Canvas", icon: "◳" },
   { href: "/notes", label: "Notes", icon: "✎" },
   { href: "/calendar", label: "Calendar", icon: "▦" },
 ];
@@ -38,15 +38,29 @@ export function AppShell({
 }) {
   return (
     <PeopleProvider me={user}>
-      <WorkspaceProvider meName={user.name}>
+      <WorkspaceProvider meName={user.name} meId={user.id}>
         <div className="flex min-h-screen">
           <Sidebar user={user} />
           <main className="flex-1 overflow-x-hidden">{children}</main>
         </div>
         <TaskDetailModal />
+        <GlobalProjectSettings />
         <Notice />
       </WorkspaceProvider>
     </PeopleProvider>
+  );
+}
+
+/** The single project-settings modal opened from anywhere via the workspace's
+ *  `openProjectSettings(id)` — e.g. the assignee picker's "Edit Project
+ *  Members" button. Distinct from the sidebar gear's own local modal. */
+function GlobalProjectSettings() {
+  const { projects, projectSettingsId, closeProjectSettings } = useWorkspace();
+  if (!projectSettingsId) return null;
+  const project = projects.find((p) => p.id === projectSettingsId);
+  if (!project) return null;
+  return (
+    <ProjectModal mode="edit" project={project} onClose={closeProjectSettings} />
   );
 }
 
@@ -101,7 +115,7 @@ function Sidebar({ user }: { user: SessionUser }) {
   const { me } = usePeople();
   const identity = me ?? user;
   return (
-    <aside className="sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r border-border bg-surface">
+    <aside className="sticky top-0 flex h-screen shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex items-center gap-2.5 px-5 py-5">
         <div className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
           ✓

@@ -15,8 +15,6 @@ import type {
   TaskLogEntry,
   Project,
   Board,
-  Decision,
-  DecisionCategory,
   Note,
   NoteType,
   TaskCommit,
@@ -52,7 +50,6 @@ interface WorkspaceContextValue {
   taskMap: Record<string, Task>;
   logs: Record<string, TaskLogEntry[]>;
   /** Per-task workflow detail, loaded alongside the activity log. */
-  decisions: Record<string, Decision[]>;
   notes: Record<string, Note[]>;
   commits: Record<string, TaskCommit[]>;
   projects: Project[];
@@ -83,19 +80,11 @@ interface WorkspaceContextValue {
   addComment: (id: string, message: string) => Promise<void>;
   /** Lock the task's code (freeze it) and return a ready-to-paste work prompt. */
   lockTask: (id: string) => Promise<string>;
-  /** Enter the analysis phase (stamps analysisStartedAt + logs it) and return a
-   *  ready-to-paste "analyze this" prompt. */
-  startAnalysis: (id: string) => Promise<string>;
-  /** Enter the work phase (stamps workStartedAt + logs it) and return a
-   *  ready-to-paste "build this" prompt. */
-  startWork: (id: string) => Promise<string>;
-  /** Record a decision on a task, then reload its detail. */
-  recordDecision: (
+  /** Add a note to a task (decision or standup callout), then reload its detail. */
+  addNote: (
     id: string,
-    input: { category: DecisionCategory; decision: string; rationale?: string },
+    input: { note: string; type?: NoteType; tags?: string[] },
   ) => Promise<void>;
-  /** Add a standup note to a task, then reload its detail. */
-  addNote: (id: string, input: { note: string; type?: NoteType }) => Promise<void>;
   /** Edit workflow summary fields (analysisSummary / plan / summary). */
   editWorkflow: (
     id: string,
@@ -113,9 +102,12 @@ interface WorkspaceContextValue {
     color?: string;
     gitFolder?: string;
     description?: string;
+    /** Roster user ids to seed as members (owner auto-included). */
+    members?: string[];
   }) => Promise<Project | null>;
-  /** Edit a project's name / shortname / color / picture / git folder / readme.
-   *  `image`/`gitFolder`/`description` accept null to clear. */
+  /** Edit a project's name / shortname / color / picture / git folder / readme /
+   *  members. `image`/`gitFolder`/`description` accept null to clear; `members`
+   *  replaces the whole set (owner always kept). */
   renameProject: (
     id: string,
     patch: {
@@ -125,6 +117,7 @@ interface WorkspaceContextValue {
       image?: string | null;
       gitFolder?: string | null;
       description?: string | null;
+      members?: string[];
     },
   ) => Promise<void>;
   /** Upload a project picture (client crops to a square first). */
@@ -160,9 +153,17 @@ interface WorkspaceContextValue {
   deleteBoard: (id: string) => void;
   /** Reorder the boards within a project (drives Boards view + sidebar). */
   reorderBoards: (projectId: string, orderedIds: string[]) => void;
+  /** Force-reload tasks + projects now (e.g. after a canvas Section commits a
+   *  batch of tasks directly via /api/tasks/bulk, bypassing the mutate layer). */
+  refresh: () => Promise<void>;
   /** Transient user-facing message (e.g. a concurrent-edit conflict). */
   notice: string | null;
   clearNotice: () => void;
+  /** Id of the project whose settings modal is open (from anywhere — e.g. the
+   *  assignee picker's "Edit Project Members"), or null. */
+  projectSettingsId: string | null;
+  openProjectSettings: (id: string) => void;
+  closeProjectSettings: () => void;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
@@ -175,7 +176,7 @@ export type TaskEdit = Partial<
     Task,
     | "title"
     | "status"
-    | "assignees"
+    | "assigneeIds"
     | "startDate"
     | "dueDate"
     | "recurrence"
@@ -184,6 +185,7 @@ export type TaskEdit = Partial<
     | "value"
     | "difficulty"
     | "description"
+    | "analyzedAt"
   >
 >;
 
@@ -193,7 +195,7 @@ export type TaskEdit = Partial<
 const CONTENT_FIELDS: (keyof TaskEdit)[] = [
   "title",
   "description",
-  "assignees",
+  "assigneeIds",
   "startDate",
   "dueDate",
   "recurrence",
@@ -263,16 +265,18 @@ function isDescendant(nodes: TaskNode[], ancestorId: string, nodeId: string): bo
 
 export function WorkspaceProvider({
   children,
-  /** Display name of the signed-in user — new tasks are assigned to them. */
+  /** Display name of the signed-in user — used as the authorship label. */
   meName = "You",
+  /** Account id of the signed-in user — new tasks are auto-assigned to them. */
+  meId,
 }: {
   children: ReactNode;
   meName?: string;
+  meId?: string;
 }) {
   const [nodes, setNodes] = useState<TaskNode[]>([]);
   const [taskMap, setTaskMap] = useState<Record<string, Task>>({});
   const [logs, setLogs] = useState<Record<string, TaskLogEntry[]>>({});
-  const [decisions, setDecisions] = useState<Record<string, Decision[]>>({});
   const [notes, setNotes] = useState<Record<string, Note[]>>({});
   const [commits, setCommits] = useState<Record<string, TaskCommit[]>>({});
   const [projects, setProjects] = useState<Project[]>([]);
@@ -280,6 +284,10 @@ export function WorkspaceProvider({
   const [openTaskIds, setOpenTaskIds] = useState<string[]>([]);
   // Transient, user-facing message (e.g. a write was rejected as a conflict).
   const [notice, setNotice] = useState<string | null>(null);
+  // Project whose settings modal is open globally (opened from the assignee
+  // picker's "Edit Project Members", the sidebar gear, etc.). AppShell renders
+  // the single ProjectModal driven by this.
+  const [projectSettingsId, setProjectSettingsId] = useState<string | null>(null);
 
   // Pause polling while a local mutation is in flight, so a background
   // refetch can't clobber an optimistic update mid-op.
@@ -355,13 +363,11 @@ export function WorkspaceProvider({
     api<{
       task: Task;
       logs: TaskLogEntry[];
-      decisions?: Decision[];
       notes?: Note[];
       commits?: TaskCommit[];
     }>(`/api/tasks/${id}`)
       .then((r) => {
         setLogs((prev) => ({ ...prev, [id]: r.logs }));
-        setDecisions((prev) => ({ ...prev, [id]: r.decisions ?? [] }));
         setNotes((prev) => ({ ...prev, [id]: r.notes ?? [] }));
         setCommits((prev) => ({ ...prev, [id]: r.commits ?? [] }));
         // Keep the task map fresh (code/phase/summaries may have changed).
@@ -643,6 +649,7 @@ export function WorkspaceProvider({
     color?: string;
     gitFolder?: string;
     description?: string;
+    members?: string[];
   }): Promise<Project | null> => {
     let created: Project | null = null;
     await mutateProjects(async () => {
@@ -663,6 +670,7 @@ export function WorkspaceProvider({
       image?: string | null;
       gitFolder?: string | null;
       description?: string | null;
+      members?: string[];
     },
   ) =>
     mutateProjects(() =>
@@ -763,7 +771,7 @@ export function WorkspaceProvider({
       () => {
         setTaskMap((prev) => ({
           ...prev,
-          [tempId]: { id: tempId, title, status, assignees: [meName], boardId, updatedAt: now },
+          [tempId]: { id: tempId, title, status, assigneeIds: meId ? [meId] : [], boardId, updatedAt: now },
         }));
         setNodes((prev) => [
           ...prev,
@@ -773,7 +781,7 @@ export function WorkspaceProvider({
       () =>
         api("/api/tasks", {
           method: "POST",
-          body: JSON.stringify({ title, status, assignees: [meName], boardId }),
+          body: JSON.stringify({ title, status, assigneeIds: meId ? [meId] : [], boardId }),
         }),
     );
   }
@@ -802,7 +810,7 @@ export function WorkspaceProvider({
       body: JSON.stringify({
         title: text,
         status: "backlog",
-        assignees: [meName],
+        assigneeIds: meId ? [meId] : [],
         boardId: taskMap[parentId]?.boardId ?? null,
         parentId,
       }),
@@ -851,7 +859,7 @@ export function WorkspaceProvider({
     loadLogs(id); // reconcile the temp entry with the server's stored comment
   }
 
-  /* ---- Workflow: lock / decisions / notes / summaries ---- */
+  /* ---- Workflow: lock / notes / summaries ---- */
 
   // Lock the code (freeze it) and return the ready-to-paste work prompt. The
   // server is idempotent, so a second click just re-returns the same prompt.
@@ -866,58 +874,12 @@ export function WorkspaceProvider({
     return res.prompt;
   }
 
-  // Enter a phase (analysis or work): the server stamps the start timestamp,
-  // logs an attributed `started` entry, and returns the phase prompt. Both are
-  // idempotent, so a second click just re-returns the prompt.
-  async function enterPhase(id: string, phase: "analysis" | "work") {
-    const res = await api<{ task: Task; prompt: string }>(
-      `/api/tasks/${id}/start-${phase === "analysis" ? "analysis" : "work"}`,
-      { method: "POST" },
-    );
-    setTaskMap((prev) =>
-      prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
-    );
-    return res.prompt;
-  }
-  const startAnalysis = (id: string) => enterPhase(id, "analysis");
-  const startWork = (id: string) => enterPhase(id, "work");
-
   // Optimistically append a temp row (rendered with a small "saving" spinner),
   // POST it, then reload so the temp entry is replaced by the server row.
-  async function recordDecision(
+  async function addNote(
     id: string,
-    input: { category: DecisionCategory; decision: string; rationale?: string },
+    input: { note: string; type?: NoteType; tags?: string[] },
   ) {
-    const tempId = `temp-${Date.now()}`;
-    const now = new Date().toISOString();
-    await mutate(
-      () =>
-        setDecisions((prev) => ({
-          ...prev,
-          [id]: [
-            ...(prev[id] ?? []),
-            {
-              id: tempId,
-              taskId: id,
-              category: input.category,
-              decision: input.decision,
-              rationale: input.rationale,
-              phase: "execution",
-              author: meName,
-              createdAt: now,
-            },
-          ],
-        })),
-      () =>
-        api(`/api/tasks/${id}/decisions`, {
-          method: "POST",
-          body: JSON.stringify(input),
-        }),
-    );
-    loadLogs(id);
-  }
-
-  async function addNote(id: string, input: { note: string; type?: NoteType }) {
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
     await mutate(
@@ -931,6 +893,7 @@ export function WorkspaceProvider({
               taskId: id,
               note: input.note,
               type: input.type,
+              tags: input.tags ?? [],
               author: meName,
               createdAt: now,
             },
@@ -998,7 +961,6 @@ export function WorkspaceProvider({
         nodes,
         taskMap,
         logs,
-        decisions,
         notes,
         commits,
         projects,
@@ -1019,9 +981,6 @@ export function WorkspaceProvider({
         addTask,
         addComment,
         lockTask,
-        startAnalysis,
-        startWork,
-        recordDecision,
         addNote,
         editWorkflow,
         addAttachment,
@@ -1035,8 +994,15 @@ export function WorkspaceProvider({
         uploadBoardAvatar,
         deleteBoard,
         reorderBoards,
+        refresh: async () => {
+          await Promise.all([fetchAll(), fetchProjects()]);
+          await refreshVersion();
+        },
         notice,
         clearNotice: () => setNotice(null),
+        projectSettingsId,
+        openProjectSettings: setProjectSettingsId,
+        closeProjectSettings: () => setProjectSettingsId(null),
       }}
     >
       {children}

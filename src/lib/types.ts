@@ -53,59 +53,41 @@ export interface Project {
   /** Markdown readme: what this project is and its constraints. */
   description?: string | null;
   boards?: Board[];
+  /** Roster user ids who are members of this project — the assignee picker on
+   *  the project's tasks offers only these people (empty ⇒ whole-roster
+   *  fallback). Boards inherit their project's members. The owner is always
+   *  included. */
+  members?: string[];
 }
 
 /**
- * A task's workflow phase, DERIVED from its lifecycle timestamps + lock state
- * (never stored). Kanban `status` is orthogonal to this.
+ * A task's workflow phase, DERIVED from its lifecycle state (never stored).
+ * Progress ("am I working on it") lives in the kanban `status`; phase only
+ * tracks the analysis lifecycle.
  */
 export type TaskPhase =
   | "draft" // code still soft (unlocked)
-  | "ready" // locked, analysis not started
-  | "analyzing" // analysisStartedAt set, analyzedAt not
-  | "analyzed" // analyzedAt set, workStartedAt not
-  | "working" // workStartedAt set, not done
+  | "ready" // locked, not yet analyzed
+  | "analyzed" // analyzedAt set
   | "done"; // completedAt set
 
-/** A decision's category — drives the Decisions-page filter. */
-export type DecisionCategory =
-  | "business"
-  | "product"
-  | "ux"
-  | "technical"
-  | "scope";
+/** A note's type. `decision` = a choice made (optional "Why" in the body);
+ *  the rest are standup-worthy callouts. */
+export type NoteType =
+  | "decision"
+  | "progress"
+  | "milestone"
+  | "blocker"
+  | "question"
+  | "fyi";
 
-/** Which lifecycle phase a decision was made in. */
-export type DecisionPhase = "analysis" | "execution";
-
-/** Retro verdict on a decision (null until reviewed). */
-export type DecisionOutcome = "good" | "mixed" | "bad";
-
-/** A recorded decision — first-class, cross-task, retro-reviewable. */
-export interface Decision {
-  id: string;
-  taskId: string;
-  category: DecisionCategory;
-  decision: string;
-  rationale?: string | null;
-  phase: DecisionPhase;
-  author?: string | null;
-  createdAt: string; // ISO
-  outcome?: DecisionOutcome | null;
-  reviewedAt?: string | null;
-  reviewNote?: string | null;
-  supersededById?: string | null;
-}
-
-/** A note's type — lets the standup digest group them. */
-export type NoteType = "progress" | "blocker" | "question" | "fyi";
-
-/** A team-facing note surfaced at standup. */
+/** A note on a task — a decision or a standup-worthy callout. */
 export interface Note {
   id: string;
   taskId: string;
   type?: NoteType | null;
   note: string;
+  tags: string[];
   author?: string | null;
   createdAt: string; // ISO
 }
@@ -146,10 +128,8 @@ export interface Task {
   refLocked?: boolean;
   /** Derived workflow phase (see TaskPhase) — not the kanban status. */
   phase?: TaskPhase;
-  /** Lifecycle timestamps (ISO) — informational, non-gating. */
-  analysisStartedAt?: string | null;
+  /** When analysis was marked done (ISO) — optional, informational. */
   analyzedAt?: string | null;
-  workStartedAt?: string | null;
   /** Revisable summaries written across the workflow. */
   analysisSummary?: string | null;
   plan?: string | null;
@@ -158,8 +138,10 @@ export interface Task {
   boardId?: string | null;
   /** Which project the task is scoped to (for board-less tasks). */
   projectId?: string | null;
-  /** Display names of the people assigned (empty/undefined = unassigned). */
-  assignees?: string[];
+  /** Account ids of the people assigned (empty/undefined = unassigned).
+   *  Resolve to a person via PeopleContext (`resolveById`). Writes accept a
+   *  name/email/id and are resolved to ids server-side. */
+  assigneeIds?: string[];
   /** ISO date work should start — pairs with dueDate (the end). */
   startDate?: string;
   /** ISO date the task is due — drives the Due column (overdue shows red). */
@@ -186,6 +168,50 @@ export interface Task {
   subtasks?: Task[];
   /** Image attachments (pasted or uploaded). */
   attachments?: Attachment[];
+}
+
+/* ---- Canvas / whiteboard ---- */
+
+/** What a canvas node is: a markdown text block, or a section (a Figma-style
+ *  titled board container whose lines are that board's live tasks). The
+ *  `canvas_node_kind` DB enum still carries a legacy `frame` value (the feature
+ *  was removed); nothing writes it, so it never reaches this type. */
+export type CanvasNodeKind = "text" | "section";
+
+/** Last-saved pan/zoom of a canvas. Canvas coordinates, not screen pixels. */
+export interface CanvasViewport {
+  x: number;
+  y: number;
+  scale: number;
+}
+
+/** A standalone whiteboard document. `nodes` is attached when fetching one. */
+export interface Canvas {
+  id: string;
+  name: string;
+  viewport?: Partial<CanvasViewport>;
+  createdAt?: string; // ISO
+  updatedAt?: string; // ISO
+  nodes?: CanvasNode[];
+}
+
+/** One element on a canvas — a text block or a section (board). Position/size
+ *  are in canvas coordinates so they're stable under pan/zoom. */
+export interface CanvasNode {
+  id: string;
+  kind: CanvasNodeKind;
+  /** Markdown for a text node; the label/title for a section. */
+  content: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Optional accent (hex). */
+  color?: string | null;
+  /** Fractional z-order (higher = on top). */
+  position: number;
+  /** Free-form extras (e.g. a section's bound `boardId`). */
+  data?: Record<string, unknown>;
 }
 
 /** One entry in a task's activity log (shown in the detail modal). */

@@ -154,7 +154,7 @@ function BoardColumn({
         }
       }}
       className={[
-        "flex w-80 shrink-0 flex-col rounded-xl border bg-surface-2 transition-colors",
+        "flex w-[440px] shrink-0 flex-col rounded-xl border bg-surface-2 transition-colors",
         isOver ? "border-accent ring-1 ring-accent" : "border-border",
       ].join(" ")}
     >
@@ -211,7 +211,6 @@ function BoardColumn({
             <StatusSection
               key={status}
               status={status}
-              count={cards.length}
               onDropCard={(id) => onDropCard(id, status)}
             >
               {cards.map((n) => {
@@ -233,12 +232,10 @@ function BoardColumn({
  *  its cards. Dropping a card here moves it to this board + status. */
 function StatusSection({
   status,
-  count,
   onDropCard,
   children,
 }: {
   status: TaskStatus;
-  count: number;
   onDropCard: (id: string) => void;
   children: React.ReactNode;
 }) {
@@ -272,7 +269,6 @@ function StatusSection({
         <span className={`text-[11px] font-bold uppercase tracking-wide ${tone.text}`}>
           {STATUS_LABEL[status]}
         </span>
-        <span className="nums text-[11px] text-faint">{count}</span>
       </div>
       {children}
     </div>

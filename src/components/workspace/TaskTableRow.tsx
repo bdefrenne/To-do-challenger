@@ -11,7 +11,7 @@ import { formatRelative, formatDue } from "@/lib/format";
 
 /** Shared grid template so header and rows line up. */
 export const GRID =
-  "grid grid-cols-[minmax(240px,1fr)_64px_96px_150px_104px_92px] items-center";
+  "grid grid-cols-[minmax(240px,1fr)_64px_96px_140px_150px_104px_92px] items-center";
 
 /**
  * One draggable table row. Click the name to open the task; drag onto the
@@ -26,6 +26,7 @@ export function TaskTableRow({
   draggingId,
   currentBoardId,
   currentBoardName,
+  boardColor,
   boardGroups,
   onChangeBoard,
   onToggleExpand,
@@ -45,6 +46,8 @@ export function TaskTableRow({
   currentBoardId: string | null;
   /** Resolved current board name; null → the pill shows "No board". */
   currentBoardName: string | null;
+  /** Resolved board accent color (board's own, or its project's fallback). */
+  boardColor?: string | null;
   /** Boards the task may move to, grouped by project (see BoardPill). */
   boardGroups: BoardGroup[];
   /** Move the task onto another board. */
@@ -143,20 +146,12 @@ export function TaskTableRow({
             </span>
           ) : null}
         </button>
-
-        {/* Board picker — sibling of the title button (can't nest buttons). */}
-        <BoardPill
-          currentBoardId={currentBoardId}
-          currentBoardName={currentBoardName}
-          groups={boardGroups}
-          onChange={onChangeBoard}
-        />
       </div>
 
       {/* Assignees */}
       <div className="flex justify-center">
-        {task.assignees?.length ? (
-          <AvatarStack names={task.assignees} />
+        {task.assigneeIds?.length ? (
+          <AvatarStack ids={task.assigneeIds} />
         ) : (
           <span className="grid h-[22px] w-[22px] place-items-center rounded-full border border-dashed border-border-strong text-[10px] text-faint">
             +
@@ -173,6 +168,17 @@ export function TaskTableRow({
         {task.value == null && task.difficulty == null ? (
           <span className="text-faint">—</span>
         ) : null}
+      </div>
+
+      {/* Board picker */}
+      <div onClick={(e) => e.stopPropagation()}>
+        <BoardPill
+          currentBoardId={currentBoardId}
+          currentBoardName={currentBoardName}
+          color={boardColor}
+          groups={boardGroups}
+          onChange={onChangeBoard}
+        />
       </div>
 
       {/* Status */}

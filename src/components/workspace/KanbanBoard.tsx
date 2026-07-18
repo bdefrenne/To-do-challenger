@@ -26,7 +26,6 @@ export function KanbanBoard({ boardId }: { boardId: string }) {
           <KanbanColumn
             key={status}
             status={status}
-            count={cards.length}
             onDropCard={(id) => moveToBoard(id, boardId, status)}
             onAdd={(title) => addTask(status, title, boardId)}
           >
@@ -45,13 +44,11 @@ export function KanbanBoard({ boardId }: { boardId: string }) {
 
 function KanbanColumn({
   status,
-  count,
   onDropCard,
   onAdd,
   children,
 }: {
   status: TaskStatus;
-  count: number;
   onDropCard: (id: string) => void;
   onAdd: (title: string) => void;
   children: React.ReactNode;
@@ -68,7 +65,6 @@ function KanbanColumn({
           <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} aria-hidden />
           {STATUS_LABEL[status]}
         </span>
-        <span className="nums text-xs text-faint">{count}</span>
       </div>
 
       <div

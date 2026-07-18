@@ -43,7 +43,7 @@ async function insertTask(
     boardId,
     title: t.title,
     status: t.status,
-    assignees: t.assignees ?? [],
+    assigneeIds: t.assigneeIds ?? [],
     startDate: t.startDate,
     dueDate: t.dueDate,
     recurrence: t.recurrence,
@@ -67,7 +67,7 @@ async function insertTask(
     at: created,
     kind: "created",
     message: "Task created",
-    author: t.assignees?.[0] ?? "You",
+    author: t.assigneeIds?.[0] ?? "You",
   });
   if (t.status !== "backlog") {
     await db.insert(taskLogs).values({
@@ -80,7 +80,7 @@ async function insertTask(
           : t.status === "in-progress"
             ? "Started"
             : `Moved to ${STATUS_LABEL[t.status]}`,
-      author: t.assignees?.[0] ?? "You",
+      author: t.assigneeIds?.[0] ?? "You",
     });
   }
   // Seed a couple of comments so commentCount is honest.

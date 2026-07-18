@@ -5,20 +5,18 @@ import type {
   Task,
   TaskLogEntry,
   TaskPhase,
-  Decision,
-  DecisionCategory,
   Note,
-  NoteType,
   TaskCommit,
 } from "@/lib/types";
 import { Button } from "@/components/ui/Button";
 import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip } from "@/components/ui/Badge";
-import { AvatarStack, PersonAvatar } from "@/components/PersonAvatar";
-import { usePeople } from "@/components/PeopleContext";
+import { PersonAvatar } from "@/components/PersonAvatar";
 import { formatTime, formatShortDate, formatAge, formatDue } from "@/lib/format";
 import { STATUS_LABEL, RECURRENCE_LABEL } from "@/lib/statuses";
 import { StatusPill } from "./StatusPill";
+import { StatusSelect } from "./StatusSelect";
+import { AssigneeEditor } from "./AssigneeEditor";
 import { useWorkspace } from "./WorkspaceContext";
 
 const LOG_ICON: Record<TaskLogEntry["kind"], string> = {
@@ -85,22 +83,19 @@ function TaskDetailLevel({
     addSubtask,
     taskMap,
     logs,
-    decisions,
     notes,
     commits,
     nodeById,
-    start,
-    toggleDone,
     setStatus,
+    toggleDone,
     childrenOf,
     addComment,
-    startAnalysis,
-    startWork,
-    recordDecision,
-    addNote,
+    lockTask,
     addAttachment,
     removeAttachment,
     editTask,
+    projects,
+    openProjectSettings,
   } = useWorkspace();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -110,9 +105,8 @@ function TaskDetailLevel({
   // in the lightbox). One index drives both, so selecting persists across open/close.
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-  // Which phase-prompt button is mid-request / just-copied ("analysis" | "work").
-  const [busyPhase, setBusyPhase] = useState<null | "analysis" | "work">(null);
-  const [copiedPhase, setCopiedPhase] = useState<null | "analysis" | "work">(null);
+  const [copied, setCopied] = useState(false);
+  const [locking, setLocking] = useState(false);
   // Inline "add subtask" composer.
   const [subtaskTitle, setSubtaskTitle] = useState("");
   const [addingSub, setAddingSub] = useState(false);
@@ -179,6 +173,12 @@ function TaskDetailLevel({
   // refresh); render nothing for this level until it arrives.
   if (!task || !node) return null;
 
+  // The project this task belongs to (if any) — its member set scopes the
+  // assignee picker. `projectId` is set whenever the task is on a board too.
+  const taskProject = task.projectId
+    ? projects.find((p) => p.id === task.projectId)
+    : undefined;
+
   const allEntries = logs[taskId] ?? [];
   // Comments are their own conversation thread (oldest → newest, chat order);
   // everything else stays in the Activity timeline (newest first).
@@ -236,23 +236,19 @@ function TaskDetailLevel({
 
   const lightboxItem = lightboxOpen ? featured : null;
 
-  // Enter a phase server-side (stamps its start timestamp + logs it) and copy
-  // the ready-to-paste prompt that tells the AI to call the matching
-  // get_task_for_* tool. startAnalysis also locks the code, so soft codes still
-  // freeze on handoff.
-  const copyPhasePrompt = async (phase: "analysis" | "work") => {
-    if (busyPhase) return;
-    setBusyPhase(phase);
+  // Lock the code (if still soft) and copy the ready-to-paste work prompt.
+  const copyPrompt = async () => {
+    if (locking) return;
+    setLocking(true);
     try {
-      const prompt =
-        phase === "analysis" ? await startAnalysis(taskId) : await startWork(taskId);
+      const prompt = await lockTask(taskId);
       await navigator.clipboard?.writeText(prompt);
-      setCopiedPhase(phase);
-      setTimeout(() => setCopiedPhase(null), 2000);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     } catch (e) {
-      console.error(`[modal] copy ${phase} prompt failed`, e);
+      console.error("[modal] copy prompt failed", e);
     } finally {
-      setBusyPhase(null);
+      setLocking(false);
     }
   };
 
@@ -264,7 +260,7 @@ function TaskDetailLevel({
       onClick={closeTask}
     >
       <div
-        className="mt-12 w-full max-w-[940px] rounded-xl border border-border bg-surface shadow-2xl"
+        className="mt-12 w-full max-w-[1090px] rounded-xl border border-border bg-surface shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -285,32 +281,18 @@ function TaskDetailLevel({
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             <button
-              onClick={() => copyPhasePrompt("analysis")}
-              disabled={busyPhase !== null}
+              onClick={copyPrompt}
+              disabled={locking}
               className="flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
-              title="Start analysis (records the start) and copy a ready-to-paste prompt for your AI"
+              title="Lock the code and copy a ready-to-paste prompt for your AI"
             >
-              {busyPhase === "analysis" ? (
+              {locking ? (
                 <span
                   className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
                   aria-hidden
                 />
               ) : null}
-              {copiedPhase === "analysis" ? "✓ Copied" : "⧉ Copy analysis prompt"}
-            </button>
-            <button
-              onClick={() => copyPhasePrompt("work")}
-              disabled={busyPhase !== null}
-              className="flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
-              title="Start work (records the start) and copy a ready-to-paste prompt for your AI"
-            >
-              {busyPhase === "work" ? (
-                <span
-                  className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
-                  aria-hidden
-                />
-              ) : null}
-              {copiedPhase === "work" ? "✓ Copied" : "⧉ Copy work prompt"}
+              {copied ? "✓ Copied" : "⧉ Copy prompt"}
             </button>
             <button
               onClick={closeTask}
@@ -322,21 +304,28 @@ function TaskDetailLevel({
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-5 p-5 md:grid-cols-[1fr_240px]">
+        <div className="grid grid-cols-1 gap-5 p-5 md:grid-cols-[1fr_390px]">
           {/* Left: details */}
           <div className="space-y-5">
             {/* actions */}
             <div className="flex flex-wrap items-center gap-2">
-              <StatusPill status={node.status} onChange={(s) => setStatus(taskId, s)} />
-              {node.status !== "in-progress" && !done ? (
-                <Button variant="primary" size="sm" onClick={() => start(taskId)}>
-                  ▶ Start
-                </Button>
-              ) : null}
-              <Button variant="success" size="sm" onClick={() => toggleDone(taskId)}>
-                {done ? "↺ Reopen" : "✓ Mark done"}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+              >
+                {uploading ? "Uploading…" : "+ Add image"}
               </Button>
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+              onChange={onPickFiles}
+            />
 
             {/* description — rendered Markdown; click Edit for the raw source */}
             <div>
@@ -403,42 +392,17 @@ function TaskDetailLevel({
               )}
             </div>
 
-            {/* workflow — summaries, decisions, notes, commits */}
+            {/* workflow — summaries, notes (incl. decisions), commits */}
             <WorkflowSection
               task={task}
-              decisions={decisions[taskId] ?? []}
               notes={notes[taskId] ?? []}
               commits={commits[taskId] ?? []}
-              onDecision={(input) => recordDecision(taskId, input)}
-              onNote={(input) => addNote(taskId, input)}
             />
 
-            {/* attachments */}
-            <div>
-              <div className="flex items-center justify-between">
+            {/* attachments — hidden entirely when there are none */}
+            {featured ? (
+              <div>
                 <SectionLabel>Attachments · {attachments.length}</SectionLabel>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploading}
-                  className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2 disabled:opacity-50"
-                >
-                  {uploading ? "Uploading…" : "+ Add image"}
-                </button>
-              </div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                multiple
-                hidden
-                onChange={onPickFiles}
-              />
-              {attachments.length === 0 ? (
-                <p className="mt-1 text-xs text-faint">
-                  Paste an image (⌘/Ctrl+V) or click “Add image”.
-                </p>
-              ) : featured ? (
                 <div className="mt-2 space-y-2">
                   {/* Featured — full width; click to open full screen. */}
                   <div className="group relative overflow-hidden rounded-lg border border-border bg-surface-2">
@@ -492,66 +456,14 @@ function TaskDetailLevel({
                     </div>
                   ) : null}
                 </div>
-              ) : null}
-            </div>
-
-            {/* subtasks */}
-            <div>
-              <SectionLabel>Sub-tasks · {kids.length}</SectionLabel>
-              {kids.length > 0 ? (
-                <ul className="mt-1 space-y-1">
-                  {kids.map((k) => (
-                    <li
-                      key={k.id}
-                      className="flex items-center gap-2 rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm"
-                    >
-                      <StatusPill status={k.status} onChange={(s) => setStatus(k.id, s)} compact />
-                      <button
-                        onClick={() => openTask(k.id)}
-                        className="truncate text-left text-fg hover:underline"
-                      >
-                        {taskMap[k.id]?.title}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-              {/* add subtask — creates the child and opens its modal on top */}
-              <div className="mt-2 flex items-center gap-1.5">
-                <input
-                  value={subtaskTitle}
-                  onChange={(e) => setSubtaskTitle(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && subtaskTitle.trim() && !addingSub) {
-                      const title = subtaskTitle.trim();
-                      setSubtaskTitle("");
-                      setAddingSub(true);
-                      addSubtask(taskId, title).finally(() => setAddingSub(false));
-                    }
-                  }}
-                  disabled={addingSub}
-                  placeholder="Add a subtask…"
-                  className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-50"
-                />
-                {addingSub ? (
-                  <span
-                    className="h-3.5 w-3.5 animate-spin rounded-full border border-faint border-t-transparent"
-                    aria-label="Adding subtask"
-                  />
-                ) : null}
               </div>
-            </div>
+            ) : null}
 
             {/* comments — the conversation thread (you ⇄ Claude) */}
             <div>
               <SectionLabel>Comments · {comments.length}</SectionLabel>
               <div className="mt-2 space-y-3">
-                {comments.length === 0 ? (
-                  <p className="text-xs text-faint">
-                    No comments yet — start the conversation with your Claude.
-                  </p>
-                ) : (
-                  comments.map((c) => {
+                {comments.map((c) => {
                     const author = c.author ?? "You";
                     const mine = author === "You";
                     return (
@@ -581,8 +493,7 @@ function TaskDetailLevel({
                         </div>
                       </div>
                     );
-                  })
-                )}
+                  })}
               </div>
               {/* composer */}
               <div className="mt-3 flex items-end gap-2">
@@ -635,8 +546,36 @@ function TaskDetailLevel({
 
           {/* Right: meta */}
           <div className="space-y-3">
+            {/* Big workflow CTAs — analyze / finish */}
+            <div className="space-y-2">
+              <Button
+                variant={task.analyzedAt ? "success" : "outline"}
+                onClick={() =>
+                  editTask(taskId, {
+                    analyzedAt: task.analyzedAt ? null : new Date().toISOString(),
+                  })
+                }
+                className="w-full py-3 text-base"
+              >
+                {task.analyzedAt ? "✓ Analyzed" : "Mark analyzed"}
+              </Button>
+              <Button
+                variant={done ? "success" : "primary"}
+                onClick={() => toggleDone(taskId)}
+                className="w-full py-3 text-base"
+              >
+                {done ? "✓ Finished" : "Mark finished"}
+              </Button>
+            </div>
             <Meta label="Status">
-              <StatusPill status={node.status} onChange={(s) => setStatus(taskId, s)} />
+              <StatusSelect
+                status={node.status}
+                onChange={(s) => setStatus(taskId, s)}
+                disabled={done}
+              />
+              {done ? (
+                <p className="mt-1.5 text-[11px] text-faint">Reopen to change status.</p>
+              ) : null}
             </Meta>
             {task.value != null || task.difficulty != null ? (
               <Meta label="Points">
@@ -655,8 +594,18 @@ function TaskDetailLevel({
                 </span>
               </Meta>
             ) : null}
-            <Meta label={(task.assignees?.length ?? 0) > 1 ? "Assignees" : "Assignee"}>
-              <AssigneeEditor taskId={taskId} assignees={task.assignees ?? []} onChange={editTask} />
+            <Meta label={(task.assigneeIds?.length ?? 0) > 1 ? "Assignees" : "Assignee"}>
+              <AssigneeEditor
+                taskId={taskId}
+                assigneeIds={task.assigneeIds ?? []}
+                onChange={editTask}
+                memberIds={taskProject?.members}
+                onEditMembers={
+                  taskProject
+                    ? () => openProjectSettings(taskProject.id)
+                    : undefined
+                }
+              />
             </Meta>
             {task.startDate ? (
               <Meta label="Start">
@@ -718,6 +667,53 @@ function TaskDetailLevel({
                 </dl>
               </Meta>
             ) : null}
+
+            {/* subtasks */}
+            <div>
+              <SectionLabel>Sub-tasks · {kids.length}</SectionLabel>
+              {kids.length > 0 ? (
+                <ul className="mt-1 space-y-1">
+                  {kids.map((k) => (
+                    <li
+                      key={k.id}
+                      className="flex items-center gap-2 rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm"
+                    >
+                      <StatusPill status={k.status} onChange={(s) => setStatus(k.id, s)} compact />
+                      <button
+                        onClick={() => openTask(k.id)}
+                        className="truncate text-left text-fg hover:underline"
+                      >
+                        {taskMap[k.id]?.title}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {/* add subtask — creates the child and opens its modal on top */}
+              <div className="mt-2 flex items-center gap-1.5">
+                <input
+                  value={subtaskTitle}
+                  onChange={(e) => setSubtaskTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && subtaskTitle.trim() && !addingSub) {
+                      const title = subtaskTitle.trim();
+                      setSubtaskTitle("");
+                      setAddingSub(true);
+                      addSubtask(taskId, title).finally(() => setAddingSub(false));
+                    }
+                  }}
+                  disabled={addingSub}
+                  placeholder="Add a subtask…"
+                  className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-50"
+                />
+                {addingSub ? (
+                  <span
+                    className="h-3.5 w-3.5 animate-spin rounded-full border border-faint border-t-transparent"
+                    aria-label="Adding subtask"
+                  />
+                ) : null}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -822,9 +818,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 const PHASE_LABEL: Record<TaskPhase, string> = {
   draft: "Draft",
   ready: "Ready",
-  analyzing: "Analyzing",
   analyzed: "Analyzed",
-  working: "Working",
   done: "Done",
 };
 
@@ -837,40 +831,17 @@ export function PhaseBadge({ phase }: { phase: TaskPhase }) {
   );
 }
 
-const DECISION_CATEGORIES: DecisionCategory[] = [
-  "business",
-  "product",
-  "ux",
-  "technical",
-  "scope",
-];
-const NOTE_TYPES: NoteType[] = ["progress", "blocker", "question", "fyi"];
-
-/** Workflow block: revisable summaries + decisions + notes + commits. */
+/** Workflow block: revisable summaries + notes (incl. decisions) + commits.
+ *  Notes are written by AIs only, so this is read-only. */
 function WorkflowSection({
   task,
-  decisions,
   notes,
   commits,
-  onDecision,
-  onNote,
 }: {
   task: Task;
-  decisions: Decision[];
   notes: Note[];
   commits: TaskCommit[];
-  onDecision: (input: {
-    category: DecisionCategory;
-    decision: string;
-    rationale?: string;
-  }) => void;
-  onNote: (input: { note: string; type?: NoteType }) => void;
 }) {
-  const [dCat, setDCat] = useState<DecisionCategory>("technical");
-  const [dText, setDText] = useState("");
-  const [nType, setNType] = useState<NoteType>("progress");
-  const [nText, setNText] = useState("");
-
   const summaries: [string, string | null | undefined][] = [
     ["Analysis", task.analysisSummary],
     ["Plan", task.plan],
@@ -895,117 +866,50 @@ function WorkflowSection({
         </div>
       ) : null}
 
-      {/* Decisions */}
-      <div>
-        <SectionLabel>Decisions · {decisions.length}</SectionLabel>
-        <ul className="mt-1 space-y-1">
-          {decisions.map((d) => {
-            const saving = d.id.startsWith("temp-");
-            return (
-              <li
-                key={d.id}
-                className={`rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""}`}
-              >
-                <span className="mr-1.5 rounded bg-accent-soft px-1 py-0.5 font-mono text-[10px] uppercase text-accent">
-                  {d.category}
-                </span>
-                <span className="text-fg">{d.decision}</span>
-                {d.rationale ? (
-                  <span className="text-faint"> — {d.rationale}</span>
-                ) : null}
-                {d.outcome ? (
-                  <span className="ml-1.5 text-[11px] text-muted">({d.outcome})</span>
-                ) : null}
-                {saving ? (
-                  <span
-                    className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
-                    aria-label="Saving"
-                  />
-                ) : null}
-              </li>
-            );
-          })}
-        </ul>
-        <div className="mt-2 flex items-center gap-1.5">
-          <select
-            value={dCat}
-            onChange={(e) => setDCat(e.target.value as DecisionCategory)}
-            className="rounded-md border border-border bg-surface-2 px-1.5 py-1 text-xs text-fg"
-          >
-            {DECISION_CATEGORIES.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <input
-            value={dText}
-            onChange={(e) => setDText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && dText.trim()) {
-                onDecision({ category: dCat, decision: dText.trim() });
-                setDText("");
-              }
-            }}
-            placeholder="Record a decision…"
-            className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none"
-          />
+      {/* Notes (decisions + standup callouts) — written by AIs only; hidden
+          when there are none */}
+      {notes.length ? (
+        <div>
+          <SectionLabel>Notes · {notes.length}</SectionLabel>
+          <ul className="mt-1 space-y-1">
+            {notes.map((n) => {
+              const saving = n.id.startsWith("temp-");
+              const isDecision = n.type === "decision";
+              return (
+                <li
+                  key={n.id}
+                  className={`rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""}`}
+                >
+                  {n.type ? (
+                    <span
+                      className={`mr-1.5 rounded px-1 py-0.5 font-mono text-[10px] uppercase ${
+                        isDecision
+                          ? "bg-accent-soft text-accent"
+                          : "bg-buff-soft text-buff"
+                      }`}
+                    >
+                      {n.type}
+                    </span>
+                  ) : null}
+                  <span className="text-fg">{n.note}</span>
+                  {n.tags?.length ? (
+                    <span className="text-faint">
+                      {" "}
+                      {n.tags.map((t) => `#${t}`).join(" ")}
+                    </span>
+                  ) : null}
+                  {saving ? (
+                    <span
+                      className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
+                      aria-label="Saving"
+                    />
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
         </div>
-      </div>
-
-      {/* Notes */}
-      <div>
-        <SectionLabel>Notes · {notes.length}</SectionLabel>
-        <ul className="mt-1 space-y-1">
-          {notes.map((n) => {
-            const saving = n.id.startsWith("temp-");
-            return (
-              <li
-                key={n.id}
-                className={`rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""}`}
-              >
-                {n.type ? (
-                  <span className="mr-1.5 rounded bg-buff-soft px-1 py-0.5 font-mono text-[10px] uppercase text-buff">
-                    {n.type}
-                  </span>
-                ) : null}
-                <span className="text-fg">{n.note}</span>
-                {saving ? (
-                  <span
-                    className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
-                    aria-label="Saving"
-                  />
-                ) : null}
-              </li>
-            );
-          })}
-        </ul>
-        <div className="mt-2 flex items-center gap-1.5">
-          <select
-            value={nType}
-            onChange={(e) => setNType(e.target.value as NoteType)}
-            className="rounded-md border border-border bg-surface-2 px-1.5 py-1 text-xs text-fg"
-          >
-            {NOTE_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-          <input
-            value={nText}
-            onChange={(e) => setNText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && nText.trim()) {
-                onNote({ note: nText.trim(), type: nType });
-                setNText("");
-              }
-            }}
-            placeholder="Add a standup note…"
-            className="flex-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none"
-          />
-        </div>
-      </div>
+      ) : null}
 
       {/* Commits */}
       {commits.length ? (
@@ -1021,83 +925,6 @@ function WorkflowSection({
               </li>
             ))}
           </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/** Assign/unassign real users. Opens a dropdown of the roster; toggling a
- *  person persists the new assignee-name list via `editTask`. */
-function AssigneeEditor({
-  taskId,
-  assignees,
-  onChange,
-}: {
-  taskId: string;
-  assignees: string[];
-  onChange: (id: string, patch: { assignees: string[] }) => void;
-}) {
-  const { people } = usePeople();
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
-
-  const has = (name: string) => assignees.some((a) => a.toLowerCase() === name.toLowerCase());
-  const toggle = (name: string) => {
-    const next = has(name)
-      ? assignees.filter((a) => a.toLowerCase() !== name.toLowerCase())
-      : [...assignees, name];
-    onChange(taskId, { assignees: next });
-  };
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left hover:bg-surface"
-      >
-        {assignees.length ? (
-          <>
-            <AvatarStack names={assignees} size={20} />
-            <span className="truncate text-fg">{assignees.join(", ")}</span>
-          </>
-        ) : (
-          <span className="text-faint">Unassigned — click to assign</span>
-        )}
-        <span className="ml-auto text-faint">▾</span>
-      </button>
-
-      {open ? (
-        <div className="absolute left-0 right-0 z-30 mt-1 max-h-56 overflow-y-auto rounded-lg border border-border bg-surface py-1 shadow-lg">
-          {people.length === 0 ? (
-            <p className="px-3 py-2 text-xs text-faint">No users yet.</p>
-          ) : (
-            people.map((p) => {
-              const on = has(p.name);
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => toggle(p.name)}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-surface-2"
-                >
-                  <PersonAvatar name={p.name} size={20} />
-                  <span className="flex-1 truncate text-fg">{p.name}</span>
-                  {on ? <span className="text-accent">✓</span> : null}
-                </button>
-              );
-            })
-          )}
         </div>
       ) : null}
     </div>

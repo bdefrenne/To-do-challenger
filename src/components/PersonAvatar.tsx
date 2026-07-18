@@ -34,28 +34,30 @@ export function PersonAvatar({
   );
 }
 
-/** Overlapping avatars for multiple assignees; collapses the overflow to "+N". */
+/** Overlapping avatars for multiple assignees (by account id); collapses the
+ *  overflow to "+N". Unknown ids (e.g. a removed account) show a neutral "?". */
 export function AvatarStack({
-  names,
+  ids,
   size = 22,
   max = 3,
 }: {
-  names: string[];
+  ids: string[];
   size?: number;
   max?: number;
 }) {
-  const { resolve } = usePeople();
-  if (!names.length) return null;
-  const shown = names.slice(0, max);
-  const extra = names.length - shown.length;
+  const { resolveById } = usePeople();
+  if (!ids.length) return null;
+  const shown = ids.slice(0, max);
+  const extra = ids.length - shown.length;
+  const label = ids.map((id) => resolveById(id)?.name ?? "?").join(", ");
   return (
-    <span className="flex items-center" title={names.join(", ")}>
-      {shown.map((name, i) => {
-        const p = resolve(name);
+    <span className="flex items-center" title={label}>
+      {shown.map((id, i) => {
+        const p = resolveById(id);
         return (
-          <span key={`${name}-${i}`} style={{ marginLeft: i === 0 ? 0 : -size * 0.3 }}>
+          <span key={`${id}-${i}`} style={{ marginLeft: i === 0 ? 0 : -size * 0.3 }}>
             <Avatar
-              name={name}
+              name={p?.name ?? "?"}
               size={size}
               imageUrl={p?.avatarUrl ?? undefined}
               color={p?.color}

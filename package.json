@@ -17,10 +17,14 @@
     "db:backfill": "tsx scripts/backfill-boards.ts",
     "db:backfill:refs": "tsx scripts/backfill-refs.ts",
     "user:create": "tsx scripts/create-user.ts",
+    "team:create": "tsx scripts/create-team.ts",
     "telegram:webhook": "tsx scripts/setup-telegram-webhook.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.111.0",
+    "@liveblocks/client": "^3.22.0",
+    "@liveblocks/node": "^3.22.0",
+    "@liveblocks/react": "^3.22.0",
     "@neondatabase/serverless": "^1.1.0",
     "@vercel/blob": "^2.6.1",
     "drizzle-orm": "^0.45.2",

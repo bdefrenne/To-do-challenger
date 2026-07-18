@@ -20,7 +20,9 @@ export const fibSchema = z.union([
   z.literal(8),
 ]);
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
-const assigneesSchema = z.array(z.string().max(120)).max(20);
+/** Assignee refs — each a user id, email, or display name; the service
+ *  resolves them to account ids on write. */
+const assigneeIdsSchema = z.array(z.string().max(120)).max(20);
 const dependsOnSchema = z.array(z.string()).max(50);
 const customFieldsSchema = z.record(
   z.string(),
@@ -30,7 +32,7 @@ const customFieldsSchema = z.record(
 export const createTaskSchema = z.object({
   title: z.string().min(1, "title is required").max(500),
   status: statusSchema.optional(),
-  assignees: assigneesSchema.optional(),
+  assigneeIds: assigneeIdsSchema.optional(),
   startDate: ymd.optional(),
   dueDate: ymd.optional(),
   recurrence: recurrenceSchema.optional(),
@@ -50,7 +52,7 @@ export const updateTaskSchema = z
   .object({
     title: z.string().min(1).max(500),
     status: statusSchema,
-    assignees: assigneesSchema,
+    assigneeIds: assigneeIdsSchema,
     startDate: ymd.nullable(),
     dueDate: ymd.nullable(),
     recurrence: recurrenceSchema,
@@ -63,38 +65,25 @@ export const updateTaskSchema = z
     analysisSummary: z.string().max(20_000).nullable(),
     plan: z.string().max(20_000).nullable(),
     summary: z.string().max(20_000).nullable(),
-    /* ---- Workflow: lifecycle timestamps (ISO, or null to clear) ---- */
-    analysisStartedAt: isoDateTime.nullable(),
+    /* ---- Workflow: lifecycle timestamp (ISO, or null to clear) ---- */
     analyzedAt: isoDateTime.nullable(),
-    workStartedAt: isoDateTime.nullable(),
   })
   .partial();
 
-/* ---- Workflow: decisions, notes, commits ---- */
-export const decisionCategorySchema = z.enum([
-  "business",
-  "product",
-  "ux",
-  "technical",
-  "scope",
+/* ---- Workflow: notes, commits ---- */
+export const noteTypeSchema = z.enum([
+  "decision",
+  "progress",
+  "milestone",
+  "blocker",
+  "question",
+  "fyi",
 ]);
-export const decisionOutcomeSchema = z.enum(["good", "mixed", "bad"]);
-export const noteTypeSchema = z.enum(["progress", "blocker", "question", "fyi"]);
-
-export const recordDecisionSchema = z.object({
-  category: decisionCategorySchema,
-  decision: z.string().min(1).max(2_000),
-  rationale: z.string().max(10_000).nullable().optional(),
-});
-
-export const reviewDecisionSchema = z.object({
-  outcome: decisionOutcomeSchema,
-  reviewNote: z.string().max(10_000).nullable().optional(),
-});
 
 export const addNoteSchema = z.object({
   note: z.string().min(1).max(10_000),
   type: noteTypeSchema.nullable().optional(),
+  tags: z.array(z.string().min(1).max(60)).max(20).optional(),
 });
 
 export const linkCommitSchema = z.object({
@@ -208,6 +197,8 @@ const pictureUrl = z.string().url().max(2048);
 const gitFolder = z.string().max(512);
 /** Markdown readme explaining what a project/board is and its constraints. */
 const description = z.string().max(20000);
+/** Roster user ids for a project's member set (assignee-picker curation). */
+const memberIds = z.array(z.string().min(1)).max(50);
 
 export const createProjectSchema = z.object({
   name: z.string().min(1, "name is required").max(120),
@@ -216,6 +207,7 @@ export const createProjectSchema = z.object({
   image: pictureUrl.optional(),
   gitFolder: gitFolder.optional(),
   description: description.optional(),
+  members: memberIds.optional(),
 });
 
 export const updateProjectSchema = z
@@ -226,8 +218,14 @@ export const updateProjectSchema = z
     image: pictureUrl.nullable(),
     gitFolder: gitFolder.nullable(),
     description: description.nullable(),
+    members: memberIds,
   })
   .partial();
+
+/** Add a single member to a project (POST …/members). */
+export const projectMemberSchema = z.object({
+  userId: z.string().min(1, "userId is required"),
+});
 
 export const createBoardSchema = z.object({
   projectId: z.string().min(1, "projectId is required"),
@@ -255,6 +253,49 @@ export const updateBoardSchema = z
 export const reorderBoardsSchema = z.object({
   projectId: z.string().min(1, "projectId is required"),
   orderedIds: z.array(z.string().min(1)).min(1),
+});
+
+/* ---- Canvas / whiteboard ---- */
+const canvasNodeKindSchema = z.enum(["text", "section"]);
+const canvasNodeData = z.record(z.string(), z.unknown());
+
+export const createCanvasSchema = z.object({
+  name: z.string().min(1, "name is required").max(120),
+});
+
+export const updateCanvasSchema = z
+  .object({
+    name: z.string().min(1).max(120),
+    viewport: z.object({
+      x: z.number(),
+      y: z.number(),
+      scale: z.number(),
+    }),
+  })
+  .partial()
+  .refine((v) => v.name !== undefined || v.viewport !== undefined, {
+    message: "provide name and/or viewport",
+  });
+
+/** One node in a batch save. `id` is optional — omit it for a fresh node the
+ *  server will assign an id to; include it to update an existing node. */
+export const canvasNodeInputSchema = z.object({
+  id: z.string().optional(),
+  kind: canvasNodeKindSchema,
+  content: z.string().max(20_000).optional(),
+  x: z.number(),
+  y: z.number(),
+  width: z.number().positive().max(100_000),
+  height: z.number().positive().max(100_000),
+  color: z.string().max(40).nullable().optional(),
+  position: z.number().optional(),
+  data: canvasNodeData.optional(),
+});
+
+/** The canvas editor's debounced save: upsert some nodes, delete others. */
+export const saveCanvasNodesSchema = z.object({
+  upserts: z.array(canvasNodeInputSchema).max(2000).optional(),
+  deletes: z.array(z.string()).max(2000).optional(),
 });
 
 /**

@@ -16,21 +16,25 @@ import {
   tasks,
   taskLogs,
   taskAttachments,
-  taskDecisions,
   taskNotes,
   taskCommits,
   projects,
+  projectMembers,
   boards,
   users,
+  canvases,
+  canvasNodes,
   type TaskRow,
   type TaskAttachmentRow,
-  type TaskDecisionRow,
   type TaskNoteRow,
   type TaskCommitRow,
   type ProjectRow,
   type BoardRow,
+  type CanvasRow,
+  type CanvasNodeRow,
 } from "./schema";
 import { STATUS_LABEL } from "@/lib/statuses";
+import type { PublicUser } from "./users";
 import { ConflictError } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
@@ -45,12 +49,13 @@ import type {
   Attachment,
   Project,
   Board,
-  Decision,
-  DecisionCategory,
-  DecisionOutcome,
   Note,
   NoteType,
   TaskCommit,
+  Canvas,
+  CanvasNode,
+  CanvasNodeKind,
+  CanvasViewport,
 } from "@/lib/types";
 
 /** A Task plus the fields AIs care about (nesting/order/timestamps). */
@@ -78,35 +83,40 @@ const rowToAttachment = (r: TaskAttachmentRow): Attachment => ({
 /* Codes / refs                                                          */
 /* -------------------------------------------------------------------- */
 
-/** Preloaded owner codes, so a list of tasks renders soft codes with no N+1. */
+/** Preloaded owner codes, so a list of tasks renders soft codes with no N+1.
+ *  TEAM-WIDE: tasks are visible to everyone, so we preload every owner's codes
+ *  and resolve each task's prefix by its own creator (`row.userId`). */
 interface CodeCtx {
   board: Map<string, string | null>;
   project: Map<string, string | null>;
-  userCode: string | null;
+  /** Every user's personal code, keyed by user id (the board→project→USER
+   *  fallback prefix for that user's board-less tasks). */
+  userCode: Map<string, string | null>;
 }
 
-/** Load every code a user owns (board/project/user) in one shot. */
-async function codeCtx(userId: string): Promise<CodeCtx> {
+/** Load every board/project/user code on the instance in one shot. The
+ *  `userId` arg is ignored (kept so the many callers don't churn). */
+async function codeCtx(_userId?: string): Promise<CodeCtx> {
   const [boardRows, projectRows, userRows] = await Promise.all([
-    db.select({ id: boards.id, code: boards.code }).from(boards).where(eq(boards.userId, userId)),
-    db.select({ id: projects.id, code: projects.code }).from(projects).where(eq(projects.userId, userId)),
-    db.select({ code: users.code }).from(users).where(eq(users.id, userId)).limit(1),
+    db.select({ id: boards.id, code: boards.code }).from(boards),
+    db.select({ id: projects.id, code: projects.code }).from(projects),
+    db.select({ id: users.id, code: users.code }).from(users),
   ]);
   return {
     board: new Map(boardRows.map((r) => [r.id, r.code])),
     project: new Map(projectRows.map((r) => [r.id, r.code])),
-    userCode: userRows[0]?.code ?? null,
+    userCode: new Map(userRows.map((r) => [r.id, r.code])),
   };
 }
 
-/** Resolve the current prefix for a task (board → project → user). */
+/** Resolve the current prefix for a task (board → project → owning user). */
 function resolvePrefix(row: TaskRow, ctx?: CodeCtx): string | null {
   if (!ctx) return null;
   const fromBoard = row.boardId ? ctx.board.get(row.boardId) : null;
   if (fromBoard) return fromBoard;
   const fromProject = row.projectId ? ctx.project.get(row.projectId) : null;
   if (fromProject) return fromProject;
-  return ctx.userCode ?? null;
+  return ctx.userCode.get(row.userId) ?? null;
 }
 
 /** The displayed code: the frozen `ref` when locked, else a soft `PREFIX-seq*`. */
@@ -118,12 +128,12 @@ function displayCode(row: TaskRow, ctx?: CodeCtx): string | undefined {
   return formatCode(prefix, row.seq, false);
 }
 
-/** Derive the workflow phase from lifecycle timestamps + lock state. */
+/** Derive the workflow phase from lifecycle state. Progress ("am I working on
+ *  it") lives in the kanban `status`, so phase only tracks the analysis
+ *  lifecycle: draft → ready (code locked) → analyzed → done. */
 function derivePhase(row: TaskRow): TaskPhase {
   if (row.completedAt) return "done";
-  if (row.workStartedAt) return "working";
   if (row.analyzedAt) return "analyzed";
-  if (row.analysisStartedAt) return "analyzing";
   if (row.refLocked) return "ready";
   return "draft";
 }
@@ -142,13 +152,11 @@ function rowToTask(
     ref: row.ref,
     refLocked: row.refLocked,
     phase: derivePhase(row),
-    analysisStartedAt: iso(row.analysisStartedAt) ?? null,
     analyzedAt: iso(row.analyzedAt) ?? null,
-    workStartedAt: iso(row.workStartedAt) ?? null,
     analysisSummary: row.analysisSummary,
     plan: row.plan,
     summary: row.summary,
-    assignees: row.assignees ?? [],
+    assigneeIds: row.assigneeIds ?? [],
     startDate: row.startDate ?? undefined,
     dueDate: row.dueDate ?? undefined,
     recurrence: row.recurrence,
@@ -192,23 +200,27 @@ async function allocSeq(scope: "board" | "project" | "user", id: string): Promis
   return Number(r.next) - 1;
 }
 
-/** Current ref owner for a task (board → project → user). */
+/** Current ref owner for a task (board → project → owning user). The user-scope
+ *  fallback is the task's CREATOR (`row.userId`) so a board-less task keeps its
+ *  owner's code prefix even when another team member edits it; `userId` is the
+ *  fallback for brand-new rows that don't carry a creator yet. */
 function ownerOf(
-  row: { boardId: string | null; projectId: string | null },
+  row: { boardId: string | null; projectId: string | null; userId?: string },
   userId: string,
 ): { scope: "board" | "project" | "user"; id: string } {
   if (row.boardId) return { scope: "board", id: row.boardId };
   if (row.projectId) return { scope: "project", id: row.projectId };
-  return { scope: "user", id: userId };
+  return { scope: "user", id: row.userId ?? userId };
 }
 
-/** Every code a user owns — used to keep prefixes unique across their world. */
+/** Every code on the instance — used to keep prefixes unique TEAM-WIDE (so a
+ *  ref like `MKT-3` resolves to exactly one task across all owners). */
 async function existingCodes(userId: string): Promise<Set<string>> {
   const ctx = await codeCtx(userId);
   const set = new Set<string>();
   for (const c of ctx.board.values()) if (c) set.add(c.toUpperCase());
   for (const c of ctx.project.values()) if (c) set.add(c.toUpperCase());
-  if (ctx.userCode) set.add(ctx.userCode.toUpperCase());
+  for (const c of ctx.userCode.values()) if (c) set.add(c.toUpperCase());
   return set;
 }
 
@@ -239,9 +251,11 @@ const uniqueCode = (userId: string, name: string) =>
  * Triggered on handoff (work_on_task / Copy prompt) or as a backstop on the
  * first real mutation, so a "real" task never lacks a locked code.
  */
-export async function mintRef(id: string, userId: string): Promise<TaskDTO | null> {
+export async function mintRef(handle: string, userId: string): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
   const current = (
-    await db.select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+    await db.select().from(tasks).where(eq(tasks.id, id))
   )[0];
   if (!current) return null;
   const ctx = await codeCtx(userId);
@@ -301,28 +315,14 @@ async function ensureOwnerCode(
   return code;
 }
 
-/* ---- Row → DTO converters for decisions / notes / commits ---- */
-
-const rowToDecision = (r: TaskDecisionRow): Decision => ({
-  id: r.id,
-  taskId: r.taskId,
-  category: r.category,
-  decision: r.decision,
-  rationale: r.rationale,
-  phase: r.phase,
-  author: r.author,
-  createdAt: iso(r.createdAt)!,
-  outcome: r.outcome,
-  reviewedAt: iso(r.reviewedAt) ?? null,
-  reviewNote: r.reviewNote,
-  supersededById: r.supersededById,
-});
+/* ---- Row → DTO converters for notes / commits ---- */
 
 const rowToNote = (r: TaskNoteRow): Note => ({
   id: r.id,
   taskId: r.taskId,
   type: r.type,
   note: r.note,
+  tags: r.tags ?? [],
   author: r.author,
   createdAt: iso(r.createdAt)!,
 });
@@ -358,27 +358,26 @@ function buildTree(
   return roots;
 }
 
-/** Comment counts for one user's tasks (joined so we never leak others'). */
-async function commentCounts(userId: string): Promise<Map<string, number>> {
+/** Comment counts across the team's tasks (tasks are team-visible; see the
+ *  schema note on `tasks.userId`). The `userId` arg is ignored — kept only so
+ *  the many callers don't churn. */
+async function commentCounts(_userId?: string): Promise<Map<string, number>> {
   const rows = await db
     .select({ taskId: taskLogs.taskId, n: sql<number>`count(*)::int` })
     .from(taskLogs)
-    .innerJoin(tasks, eq(taskLogs.taskId, tasks.id))
-    .where(and(eq(taskLogs.kind, "comment"), eq(tasks.userId, userId)))
+    .where(eq(taskLogs.kind, "comment"))
     .groupBy(taskLogs.taskId);
   return new Map(rows.map((r) => [r.taskId, r.n]));
 }
 
-/** Attachments for one user's tasks, grouped by taskId (joined so we
- *  never leak others'). Ordered oldest-first. */
+/** Attachments grouped by taskId, team-wide (tasks are team-visible). Ordered
+ *  oldest-first. The `userId` arg is ignored — kept for caller stability. */
 async function attachmentsByTask(
-  userId: string,
+  _userId?: string,
 ): Promise<Map<string, Attachment[]>> {
   const rows = await db
     .select({ a: taskAttachments })
     .from(taskAttachments)
-    .innerJoin(tasks, eq(taskAttachments.taskId, tasks.id))
-    .where(eq(tasks.userId, userId))
     .orderBy(asc(taskAttachments.createdAt));
   const map = new Map<string, Attachment[]>();
   for (const { a } of rows) {
@@ -389,13 +388,69 @@ async function attachmentsByTask(
   return map;
 }
 
-/** True if the task exists and belongs to the user. */
-async function ownsTask(id: string, userId: string): Promise<boolean> {
+/**
+ * Resolve a task HANDLE — either a raw UUID or a human ref/code like `INBO-22`
+ * (locked) or `INBO-22*` (soft) — to the task's canonical UUID. Tasks are
+ * TEAM-WIDE, so this resolves across every owner's tasks; `userId` is ignored
+ * (kept so the many callers don't churn). Humans and AIs see and quote the ref
+ * everywhere (it's what `list_tasks`/`search_tasks` surface), so every
+ * id-taking entry point runs its handle through here first. Returns null if
+ * nothing matches.
+ */
+export async function resolveTaskId(
+  handle: string,
+  _userId?: string,
+): Promise<string | null> {
+  if (!handle) return null;
+
+  // Fast path: a direct UUID (what most callers already pass).
+  const direct = (
+    await db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(eq(tasks.id, handle))
+      .limit(1)
+  )[0];
+  if (direct) return direct.id;
+
+  // Human ref/code: `PREFIX-SEQ`, optionally with a trailing soft `*`.
+  const norm = handle.trim().replace(/\*+$/, "").toUpperCase();
+  const dash = norm.lastIndexOf("-");
+  if (dash <= 0 || dash === norm.length - 1) return null;
+
+  // Locked tasks freeze the exact string into `ref` — match it directly.
+  const locked = (
+    await db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(sql`upper(${tasks.ref}) = ${norm}`)
+      .limit(1)
+  )[0];
+  if (locked) return locked.id;
+
+  // Unlocked tasks show a SOFT code computed from owner prefix + seq (never
+  // stored), so resolve those by matching the current prefix against the seq.
+  const seq = Number(norm.slice(dash + 1));
+  if (!Number.isInteger(seq)) return null;
+  const prefix = norm.slice(0, dash);
+  const [seqRows, ctx] = await Promise.all([
+    db
+      .select()
+      .from(tasks)
+      .where(and(eq(tasks.seq, seq), eq(tasks.refLocked, false))),
+    codeCtx(),
+  ]);
+  const match = seqRows.find((row) => resolvePrefix(row, ctx) === prefix);
+  return match?.id ?? null;
+}
+
+/** True if the task exists (team-wide — anyone may reference/edit any task). */
+async function ownsTask(id: string, _userId?: string): Promise<boolean> {
   const row = (
     await db
       .select({ id: tasks.id })
       .from(tasks)
-      .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+      .where(eq(tasks.id, id))
       .limit(1)
   )[0];
   return !!row;
@@ -434,27 +489,19 @@ export interface TaskFilter {
   overdue?: boolean;
 }
 
-/** Build the WHERE for a user's tasks, narrowed by an optional filter. */
-function taskWhere(userId: string, filter?: TaskFilter): SQL | undefined {
-  const conds: (SQL | undefined)[] = [eq(tasks.userId, userId)];
+/** Build the WHERE for the team's tasks, narrowed by an optional filter. Tasks
+ *  are team-visible, so there is no owner fence; `userId` is ignored. */
+function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
+  const conds: (SQL | undefined)[] = [];
   if (filter?.boardId) conds.push(eq(tasks.boardId, filter.boardId));
   if (filter?.projectId) {
-    conds.push(
-      inArray(
-        tasks.boardId,
-        db
-          .select({ id: boards.id })
-          .from(boards)
-          .where(
-            and(eq(boards.userId, userId), eq(boards.projectId, filter.projectId)),
-          ),
-      ),
-    );
+    conds.push(eq(tasks.projectId, filter.projectId));
   }
   if (filter?.status?.length) conds.push(inArray(tasks.status, filter.status));
-  // Array-membership: assignees is a text[] column.
+  // Array-membership: assigneeIds is a text[] of user ids. The caller resolves
+  // a human name/email to an id before setting this filter.
   if (filter?.assignee)
-    conds.push(sql`${filter.assignee} = ANY(${tasks.assignees})`);
+    conds.push(sql`${filter.assignee} = ANY(${tasks.assigneeIds})`);
   if (filter?.text) {
     const pat = `%${filter.text}%`;
     conds.push(
@@ -540,7 +587,7 @@ async function tasksByIds(userId: string, ids: string[]): Promise<TaskDTO[]> {
     db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.userId, userId), inArray(tasks.id, ids)))
+      .where(inArray(tasks.id, ids))
       .orderBy(asc(tasks.position)),
     commentCounts(userId),
     codeCtx(userId),
@@ -549,30 +596,30 @@ async function tasksByIds(userId: string, ids: string[]): Promise<TaskDTO[]> {
 }
 
 export async function getTask(
-  id: string,
+  handle: string,
   userId: string,
 ): Promise<{
   task: TaskDTO;
   logs: TaskLogEntry[];
-  decisions: Decision[];
   notes: Note[];
   commits: TaskCommit[];
 } | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
   const row = (
     await db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+      .where(eq(tasks.id, id))
   )[0];
   if (!row) return null;
-  const [logRows, attachmentRows, decisionRows, noteRows, commitRows, childRows, ctx] =
+  const [logRows, attachmentRows, noteRows, commitRows, childRows, ctx] =
     await Promise.all([
       db.select().from(taskLogs).where(eq(taskLogs.taskId, id)).orderBy(asc(taskLogs.at)),
       db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(asc(taskAttachments.createdAt)),
-      db.select().from(taskDecisions).where(eq(taskDecisions.taskId, id)).orderBy(asc(taskDecisions.createdAt)),
       db.select().from(taskNotes).where(eq(taskNotes.taskId, id)).orderBy(asc(taskNotes.createdAt)),
       db.select().from(taskCommits).where(eq(taskCommits.taskId, id)).orderBy(asc(taskCommits.createdAt)),
-      db.select().from(tasks).where(and(eq(tasks.parentId, id), eq(tasks.userId, userId))).orderBy(asc(tasks.position)),
+      db.select().from(tasks).where(eq(tasks.parentId, id)).orderBy(asc(tasks.position)),
       codeCtx(userId),
     ]);
   const cCount = logRows.filter((l) => l.kind === "comment").length;
@@ -598,93 +645,36 @@ export async function getTask(
       message: l.message,
       author: l.author ?? undefined,
     })),
-    decisions: decisionRows.map(rowToDecision),
     notes: noteRows.map(rowToNote),
     commits: commitRows.map(rowToCommit),
   };
-}
-
-type TaskContext = Awaited<ReturnType<typeof getTask>>;
-
-/**
- * Enter the ANALYSIS phase — the required entry point before analysing a task.
- * Locks the code (so commits can cite it), stamps `analysisStartedAt` the FIRST
- * time only (set-if-null), leaves an attributed `started` activity row, and
- * returns the full task context. Idempotent: a second call just returns the
- * context without re-stamping or re-logging. This is what binds "started
- * analysing" to the act of fetching what you need to analyse — you can't get
- * the context without recording the start.
- */
-export async function startAnalysis(
-  id: string,
-  userId: string,
-  author = "You",
-): Promise<TaskContext> {
-  const locked = await mintRef(id, userId);
-  if (!locked) return null;
-  const current = (
-    await db.select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
-  )[0];
-  if (current && !current.analysisStartedAt) {
-    const now = new Date();
-    await db.update(tasks).set({ analysisStartedAt: now, updatedAt: now }).where(eq(tasks.id, id));
-    await log(id, "started", "Analysis started", author);
-  }
-  return getTask(id, userId);
-}
-
-/**
- * Enter the WORK phase — the required entry point before building a task.
- * Stamps `workStartedAt` the FIRST time only (set-if-null), leaves an attributed
- * `started` activity row, and returns the full working context. Idempotent.
- * Same principle as {@link startAnalysis}: fetching the build context is what
- * records that work began — no separate "remember to mark it" step, and no
- * reliance on the first commit (which lands late).
- */
-export async function startWork(
-  id: string,
-  userId: string,
-  author = "You",
-): Promise<TaskContext> {
-  const current = (
-    await db.select().from(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
-  )[0];
-  if (!current) return null;
-  if (!current.workStartedAt) {
-    const now = new Date();
-    await db.update(tasks).set({ workStartedAt: now, updatedAt: now }).where(eq(tasks.id, id));
-    await log(id, "started", "Work started", author);
-  }
-  return getTask(id, userId);
 }
 
 /** Cheap change-cursor for a user's board: moves on any create/update/
  *  move/complete/delete/comment (every mutation bumps updatedAt; deletes
  *  drop the row count). Lets clients poll "did anything change?" without
  *  re-fetching the whole list. One indexed aggregate (tasks_user_idx). */
-export async function getChangeCursor(userId: string): Promise<string> {
+export async function getChangeCursor(_userId: string): Promise<string> {
+  // Team-wide: the board is shared, so the cursor tracks the whole instance.
   const [taskAgg, boardAgg, projectAgg] = await Promise.all([
     db
       .select({
         n: sql<number>`count(*)::int`,
         u: sql<number>`coalesce(extract(epoch from max(${tasks.updatedAt}))::bigint, 0)`,
       })
-      .from(tasks)
-      .where(eq(tasks.userId, userId)),
+      .from(tasks),
     db
       .select({
         n: sql<number>`count(*)::int`,
         u: sql<number>`coalesce(extract(epoch from max(${boards.updatedAt}))::bigint, 0)`,
       })
-      .from(boards)
-      .where(eq(boards.userId, userId)),
+      .from(boards),
     db
       .select({
         n: sql<number>`count(*)::int`,
         u: sql<number>`coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0)`,
       })
-      .from(projects)
-      .where(eq(projects.userId, userId)),
+      .from(projects),
   ]);
   const [{ n, u }] = taskAgg;
   const [{ n: bn, u: bu }] = boardAgg;
@@ -699,7 +689,9 @@ export async function getChangeCursor(userId: string): Promise<string> {
 export interface CreateTaskInput {
   title: string;
   status?: TaskStatus;
-  assignees?: string[];
+  /** Assignee refs — each a user id, email, or display name; resolved to
+   *  account ids on write (see `resolveAssignees`). */
+  assigneeIds?: string[];
   startDate?: string;
   dueDate?: string;
   recurrence?: Recurrence;
@@ -712,9 +704,10 @@ export interface CreateTaskInput {
   boardId?: string | null;
 }
 
-/** Next position at the end of a user's (status, parent) group. */
+/** Next position at the end of the team's (status, parent) group. Team-wide,
+ *  so a shared board orders consistently for everyone; `userId` is ignored. */
 async function nextPosition(
-  userId: string,
+  _userId: string,
   status: TaskStatus,
   parentId: string | null,
 ): Promise<number> {
@@ -723,7 +716,6 @@ async function nextPosition(
     .from(tasks)
     .where(
       and(
-        eq(tasks.userId, userId),
         eq(tasks.status, status),
         parentId === null
           ? sql`${tasks.parentId} is null`
@@ -733,25 +725,53 @@ async function nextPosition(
   return Number(max) + 1;
 }
 
+/** Resolve assignee tokens — each a user id, email, or display name
+ *  (case-insensitive) — to canonical `users.id`s. Unknown tokens are dropped.
+ *  Order-preserving and de-duped. Lets the picker send ids and an AI/MCP caller
+ *  say "assign to Simon" while storage is always account ids. */
+export async function resolveAssignees(tokens: string[]): Promise<string[]> {
+  if (!tokens.length) return [];
+  const rosterRows = await db
+    .select({ id: users.id, email: users.email, name: users.name })
+    .from(users);
+  const byId = new Set(rosterRows.map((r) => r.id));
+  const byEmail = new Map(rosterRows.map((r) => [r.email.trim().toLowerCase(), r.id]));
+  const byName = new Map(rosterRows.map((r) => [r.name.trim().toLowerCase(), r.id]));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of tokens) {
+    const t = raw.trim();
+    if (!t) continue;
+    const id = byId.has(t)
+      ? t
+      : byEmail.get(t.toLowerCase()) ?? byName.get(t.toLowerCase());
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
 export async function createTask(
   input: CreateTaskInput,
   userId: string,
   author = "You",
 ): Promise<TaskDTO> {
   const status = input.status ?? "backlog";
-  // Only nest under a parent the user actually owns; otherwise top-level.
+  // Nest under any parent that exists (tasks are team-wide); else top-level.
   const parentId =
-    input.parentId && (await ownsTask(input.parentId, userId))
+    input.parentId && (await ownsTask(input.parentId))
       ? input.parentId
       : null;
-  // Only place on a board the user owns; otherwise leave unassigned.
+  // Place on any board that exists (team-wide); else leave unassigned.
   const board =
     input.boardId != null
       ? (
           await db
             .select({ id: boards.id, projectId: boards.projectId })
             .from(boards)
-            .where(and(eq(boards.id, input.boardId), eq(boards.userId, userId)))
+            .where(eq(boards.id, input.boardId))
             .limit(1)
         )[0]
       : undefined;
@@ -760,17 +780,18 @@ export async function createTask(
   // board → project → user). Board-less tasks are user-scoped for now.
   const projectId = board?.projectId ?? null;
   const position = await nextPosition(userId, status, parentId);
-  // Draw a soft number from the current owner (board → project → user). The
+  // Draw a soft number from the current owner (board → project → creator). The
   // code stays unlocked (soft, shows a trailing "*") until handoff / mint.
-  const owner = ownerOf({ boardId, projectId }, userId);
+  const owner = ownerOf({ boardId, projectId, userId }, userId);
   const seq = await allocSeq(owner.scope, owner.id);
+  const assigneeIds = await resolveAssignees(input.assigneeIds ?? []);
   const [row] = await db
     .insert(tasks)
     .values({
       userId,
       title: input.title,
       status,
-      assignees: input.assignees ?? [],
+      assigneeIds,
       startDate: input.startDate,
       dueDate: input.dueDate,
       recurrence: input.recurrence,
@@ -794,7 +815,8 @@ export async function createTask(
 export interface UpdateTaskInput {
   title?: string;
   status?: TaskStatus;
-  assignees?: string[];
+  /** Assignee refs — user id, email, or display name; resolved to ids on write. */
+  assigneeIds?: string[];
   startDate?: string | null;
   dueDate?: string | null;
   recurrence?: Recurrence;
@@ -808,9 +830,7 @@ export interface UpdateTaskInput {
   plan?: string | null;
   summary?: string | null;
   /* ---- Workflow: lifecycle timestamps (ISO string, or null to clear) ---- */
-  analysisStartedAt?: string | null;
   analyzedAt?: string | null;
-  workStartedAt?: string | null;
 }
 
 /** Parse an ISO string (or null) into a Date for a timestamp column. */
@@ -818,7 +838,7 @@ const toDate = (v: string | null | undefined): Date | null | undefined =>
   v === undefined ? undefined : v === null ? null : new Date(v);
 
 export async function updateTask(
-  id: string,
+  handle: string,
   patch: UpdateTaskInput,
   userId: string,
   author = "You",
@@ -829,11 +849,13 @@ export async function updateTask(
    */
   expectedUpdatedAt?: string,
 ): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
   const current = (
     await db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+      .where(eq(tasks.id, id))
   )[0];
   if (!current) return null;
   if (expectedUpdatedAt !== undefined && iso(current.updatedAt) !== expectedUpdatedAt)
@@ -842,7 +864,8 @@ export async function updateTask(
   const now = new Date();
   const values: Record<string, unknown> = { updatedAt: now };
   if (patch.title !== undefined) values.title = patch.title;
-  if (patch.assignees !== undefined) values.assignees = patch.assignees;
+  if (patch.assigneeIds !== undefined)
+    values.assigneeIds = await resolveAssignees(patch.assigneeIds);
   if (patch.startDate !== undefined) values.startDate = patch.startDate;
   if (patch.dueDate !== undefined) values.dueDate = patch.dueDate;
   if (patch.recurrence !== undefined) values.recurrence = patch.recurrence;
@@ -854,9 +877,7 @@ export async function updateTask(
   if (patch.analysisSummary !== undefined) values.analysisSummary = patch.analysisSummary;
   if (patch.plan !== undefined) values.plan = patch.plan;
   if (patch.summary !== undefined) values.summary = patch.summary;
-  if (patch.analysisStartedAt !== undefined) values.analysisStartedAt = toDate(patch.analysisStartedAt);
   if (patch.analyzedAt !== undefined) values.analyzedAt = toDate(patch.analyzedAt);
-  if (patch.workStartedAt !== undefined) values.workStartedAt = toDate(patch.workStartedAt);
 
   const statusChanged =
     patch.status !== undefined && patch.status !== current.status;
@@ -906,7 +927,7 @@ export async function updateTask(
 
 /** Move within/across groups: change parent, status, and/or position. */
 export async function moveTask(
-  id: string,
+  handle: string,
   target: {
     parentId?: string | null;
     status?: TaskStatus;
@@ -916,11 +937,19 @@ export async function moveTask(
   userId: string,
   author = "You",
 ): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
+  // The parent may also arrive as a ref (e.g. `move_task INBO-5 --parent INBO-3`).
+  if (target.parentId) {
+    const parent = await resolveTaskId(target.parentId, userId);
+    if (!parent) return null;
+    target = { ...target, parentId: parent };
+  }
   const current = (
     await db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+      .where(eq(tasks.id, id))
   )[0];
   if (!current) return null;
   if (target.parentId === id) return null; // can't parent to self
@@ -960,7 +989,9 @@ export async function moveTask(
   // the old). Locked codes are frozen and never touched.
   let seq = current.seq;
   const oldOwner = ownerOf(current, userId);
-  const newOwner = ownerOf({ boardId, projectId }, userId);
+  // Keep the task's own creator as the user-scope owner (board-less prefix),
+  // not whoever is moving it.
+  const newOwner = ownerOf({ boardId, projectId, userId: current.userId }, userId);
   if (
     !current.refLocked &&
     (oldOwner.scope !== newOwner.scope || oldOwner.id !== newOwner.id)
@@ -995,7 +1026,7 @@ export async function moveTask(
           await db
             .select()
             .from(tasks)
-            .where(and(eq(tasks.id, target.parentId), eq(tasks.userId, userId)))
+            .where(eq(tasks.id, target.parentId))
         )[0]?.title
       : null;
     await log(
@@ -1010,7 +1041,7 @@ export async function moveTask(
           await db
             .select({ name: boards.name })
             .from(boards)
-            .where(and(eq(boards.id, boardId), eq(boards.userId, userId)))
+            .where(eq(boards.id, boardId))
         )[0]?.name
       : null;
     await log(
@@ -1030,11 +1061,13 @@ export async function moveTask(
 
 /** Complete or reopen (reopen sends it back to Planned, like the UI). */
 export async function completeTask(
-  id: string,
+  handle: string,
   done = true,
   userId: string,
   author = "You",
 ): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
   return updateTask(
     id,
     { status: done ? "done" : "planned" },
@@ -1053,12 +1086,13 @@ export async function completeTask(
 }
 
 export async function addComment(
-  id: string,
+  handle: string,
   message: string,
   userId: string,
   author = "You",
 ): Promise<TaskLogEntry | null> {
-  if (!(await ownsTask(id, userId))) return null;
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
   const [row] = await db
     .insert(taskLogs)
     .values({ taskId: id, kind: "comment", message, author })
@@ -1070,8 +1104,9 @@ export async function addComment(
 /** Delete a task (cascades to its logs + attachment rows; subtasks are
  *  re-parented to top). Blob objects are cleaned up first, since the DB
  *  cascade drops the rows but not the files in Vercel Blob. */
-export async function deleteTask(id: string, userId: string): Promise<boolean> {
-  if (!(await ownsTask(id, userId))) return false;
+export async function deleteTask(handle: string, userId: string): Promise<boolean> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return false;
   const attachmentRows = await db
     .select({ url: taskAttachments.url })
     .from(taskAttachments)
@@ -1082,10 +1117,10 @@ export async function deleteTask(id: string, userId: string): Promise<boolean> {
   await db
     .update(tasks)
     .set({ parentId: null })
-    .where(and(eq(tasks.parentId, id), eq(tasks.userId, userId)));
+    .where(eq(tasks.parentId, id));
   const res = await db
     .delete(tasks)
-    .where(and(eq(tasks.id, id), eq(tasks.userId, userId)))
+    .where(eq(tasks.id, id))
     .returning();
   return res.length > 0;
 }
@@ -1130,10 +1165,10 @@ export const MAX_BULK_OPS = 200;
 function describeBulkPatch(patch: UpdateTaskInput): string {
   const parts: string[] = [];
   if (patch.title !== undefined) parts.push(`Title → “${patch.title}”`);
-  if (patch.assignees !== undefined)
+  if (patch.assigneeIds !== undefined)
     parts.push(
-      patch.assignees.length
-        ? `Assignees → ${patch.assignees.join(", ")}`
+      patch.assigneeIds.length
+        ? `Assignees → ${patch.assigneeIds.length}`
         : "Assignees cleared",
     );
   if (patch.value !== undefined)
@@ -1174,23 +1209,27 @@ export async function bulkUpdate(
   patch: UpdateTaskInput,
   author = "You",
 ): Promise<{ updated: number; skipped: string[]; tasks: TaskDTO[] }> {
-  // 1. Which ids does the user actually own? (also grabs prior status for logs)
-  const owned = ids.length
+  // 1. Resolve each handle (UUID or ref) to a canonical UUID the user owns;
+  //    anything that doesn't resolve is reported as skipped, not silently lost.
+  const resolved = await Promise.all(ids.map((h) => resolveTaskId(h, userId)));
+  const skipped = ids.filter((_, i) => !resolved[i]);
+  const resolvedIds = resolved.filter((x): x is string => x !== null);
+  // Grab prior status for the activity log (resolution already scoped to user).
+  const owned = resolvedIds.length
     ? await db
         .select({ id: tasks.id, status: tasks.status })
         .from(tasks)
-        .where(and(eq(tasks.userId, userId), inArray(tasks.id, ids)))
+        .where(inArray(tasks.id, resolvedIds))
     : [];
   const ownedIds = owned.map((r) => r.id);
-  const ownedSet = new Set(ownedIds);
-  const skipped = ids.filter((id) => !ownedSet.has(id));
   if (!ownedIds.length) return { updated: 0, skipped, tasks: [] };
 
   // 2. Build the column patch — same field set + null-clearing as updateTask.
   const now = new Date();
   const values: Record<string, unknown> = { updatedAt: now };
   if (patch.title !== undefined) values.title = patch.title;
-  if (patch.assignees !== undefined) values.assignees = patch.assignees;
+  if (patch.assigneeIds !== undefined)
+    values.assigneeIds = await resolveAssignees(patch.assigneeIds);
   if (patch.startDate !== undefined) values.startDate = patch.startDate;
   if (patch.dueDate !== undefined) values.dueDate = patch.dueDate;
   if (patch.recurrence !== undefined) values.recurrence = patch.recurrence;
@@ -1209,7 +1248,7 @@ export async function bulkUpdate(
   const rows = await db
     .update(tasks)
     .set(values)
-    .where(and(eq(tasks.userId, userId), inArray(tasks.id, ownedIds)))
+    .where(inArray(tasks.id, ownedIds))
     .returning();
 
   // 4. One batched INSERT into the activity log — a trail row per task.
@@ -1392,7 +1431,7 @@ export async function getAttachmentById(
       .select({ a: taskAttachments })
       .from(taskAttachments)
       .innerJoin(tasks, eq(taskAttachments.taskId, tasks.id))
-      .where(and(eq(taskAttachments.id, attachmentId), eq(tasks.userId, userId)))
+      .where(eq(taskAttachments.id, attachmentId))
       .limit(1)
   )[0];
   return row ? rowToAttachment(row.a) : null;
@@ -1409,7 +1448,7 @@ export async function deleteAttachment(
       .select({ a: taskAttachments })
       .from(taskAttachments)
       .innerJoin(tasks, eq(taskAttachments.taskId, tasks.id))
-      .where(and(eq(taskAttachments.id, attachmentId), eq(tasks.userId, userId)))
+      .where(eq(taskAttachments.id, attachmentId))
       .limit(1)
   )[0];
   if (!row) return false;
@@ -1424,119 +1463,6 @@ export async function deleteAttachment(
   return true;
 }
 
-/* -------------------------------------------------------------------- */
-/* Decisions                                                             */
-/* -------------------------------------------------------------------- */
-
-export interface RecordDecisionInput {
-  category: DecisionCategory;
-  decision: string;
-  rationale?: string | null;
-}
-
-/**
- * Record a decision on a task and AUTO-FIRE the lifecycle: the first decision
- * stamps `analysisStartedAt` (the first sign real analysis is underway). The
- * decision's phase is derived from whether work has started yet.
- */
-export async function recordDecision(
-  taskId: string,
-  input: RecordDecisionInput,
-  userId: string,
-  author = "You",
-): Promise<Decision | null> {
-  const task = (
-    await db.select().from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.userId, userId)))
-  )[0];
-  if (!task) return null;
-
-  const phase = task.workStartedAt ? "execution" : "analysis";
-  const [row] = await db
-    .insert(taskDecisions)
-    .values({
-      taskId,
-      userId,
-      category: input.category,
-      decision: input.decision,
-      rationale: input.rationale ?? null,
-      phase,
-      author,
-    })
-    .returning();
-
-  // Auto-fire: first decision during analysis starts the analysis clock.
-  const stamp: Record<string, unknown> = { updatedAt: new Date() };
-  if (phase === "analysis" && !task.analysisStartedAt)
-    stamp.analysisStartedAt = new Date();
-  await db.update(tasks).set(stamp).where(eq(tasks.id, taskId));
-
-  return rowToDecision(row);
-}
-
-/** Filters for querying decisions across all of a user's tasks. */
-export interface DecisionFilter {
-  taskId?: string;
-  category?: DecisionCategory;
-  boardId?: string;
-  projectId?: string;
-  /** Only decisions still awaiting a retro verdict. */
-  unreviewed?: boolean;
-  from?: string; // ISO/date lower bound (inclusive)
-  to?: string; // ISO/date upper bound (inclusive)
-}
-
-/** Query a user's decisions across tasks — powers the Decisions page + retro. */
-export async function listDecisions(
-  userId: string,
-  filter?: DecisionFilter,
-): Promise<Decision[]> {
-  const conds: (SQL | undefined)[] = [eq(taskDecisions.userId, userId)];
-  if (filter?.taskId) conds.push(eq(taskDecisions.taskId, filter.taskId));
-  if (filter?.category) conds.push(eq(taskDecisions.category, filter.category));
-  if (filter?.unreviewed) conds.push(sql`${taskDecisions.outcome} is null`);
-  if (filter?.from) conds.push(gte(taskDecisions.createdAt, new Date(filter.from)));
-  if (filter?.to) conds.push(lte(taskDecisions.createdAt, new Date(filter.to)));
-  if (filter?.boardId || filter?.projectId) {
-    const taskConds: SQL[] = [eq(tasks.userId, userId)];
-    if (filter.boardId) taskConds.push(eq(tasks.boardId, filter.boardId));
-    if (filter.projectId) taskConds.push(eq(tasks.projectId, filter.projectId));
-    conds.push(
-      inArray(
-        taskDecisions.taskId,
-        db.select({ id: tasks.id }).from(tasks).where(and(...taskConds)),
-      ),
-    );
-  }
-  const rows = await db
-    .select()
-    .from(taskDecisions)
-    .where(and(...conds))
-    .orderBy(desc(taskDecisions.createdAt));
-  return rows.map(rowToDecision);
-}
-
-export interface ReviewDecisionInput {
-  outcome: DecisionOutcome;
-  reviewNote?: string | null;
-}
-
-/** Fill in a decision's retro verdict (was it good?). */
-export async function reviewDecision(
-  id: string,
-  input: ReviewDecisionInput,
-  userId: string,
-): Promise<Decision | null> {
-  const [row] = await db
-    .update(taskDecisions)
-    .set({
-      outcome: input.outcome,
-      reviewNote: input.reviewNote ?? null,
-      reviewedAt: new Date(),
-    })
-    .where(and(eq(taskDecisions.id, id), eq(taskDecisions.userId, userId)))
-    .returning();
-  return row ? rowToDecision(row) : null;
-}
 
 /* -------------------------------------------------------------------- */
 /* Notes (standup material)                                              */
@@ -1545,19 +1471,30 @@ export async function reviewDecision(
 export interface AddNoteInput {
   note: string;
   type?: NoteType | null;
+  /** Free-form labels — e.g. a decision's area ("technical", "product"). */
+  tags?: string[];
 }
 
-/** Add a team-facing note to a task (raw material for the standup digest). */
+/** Add a note to a task — a decision (with optional "Why" in the body) or a
+ *  standup-worthy callout. Raw material for the standup digest + Notes page. */
 export async function addNote(
-  taskId: string,
+  handle: string,
   input: AddNoteInput,
   userId: string,
   author = "You",
 ): Promise<Note | null> {
-  if (!(await ownsTask(taskId, userId))) return null;
+  const taskId = await resolveTaskId(handle, userId);
+  if (!taskId) return null;
   const [row] = await db
     .insert(taskNotes)
-    .values({ taskId, userId, note: input.note, type: input.type ?? null, author })
+    .values({
+      taskId,
+      userId,
+      note: input.note,
+      type: input.type ?? null,
+      tags: input.tags ?? [],
+      author,
+    })
     .returning();
   await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, taskId));
   return rowToNote(row);
@@ -1576,7 +1513,11 @@ export async function listNotes(
   filter?: NoteFilter,
 ): Promise<Note[]> {
   const conds: (SQL | undefined)[] = [eq(taskNotes.userId, userId)];
-  if (filter?.taskId) conds.push(eq(taskNotes.taskId, filter.taskId));
+  if (filter?.taskId) {
+    const taskId = await resolveTaskId(filter.taskId, userId);
+    if (!taskId) return [];
+    conds.push(eq(taskNotes.taskId, taskId));
+  }
   if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
   if (filter?.from) conds.push(gte(taskNotes.createdAt, new Date(filter.from)));
   if (filter?.to) conds.push(lte(taskNotes.createdAt, new Date(filter.to)));
@@ -1593,17 +1534,18 @@ export async function listNotes(
 /* -------------------------------------------------------------------- */
 
 /**
- * Link a git commit back to a task, and AUTO-FIRE `workStartedAt` (the first
- * commit is the first sign execution is underway). Idempotent per (task, sha).
+ * Link a git commit back to a task. Idempotent per (task, sha).
  */
 export async function linkCommit(
-  taskId: string,
+  handle: string,
   sha: string,
   subject: string | null,
   userId: string,
 ): Promise<TaskCommit | null> {
+  const taskId = await resolveTaskId(handle, userId);
+  if (!taskId) return null;
   const task = (
-    await db.select().from(tasks).where(and(eq(tasks.id, taskId), eq(tasks.userId, userId)))
+    await db.select().from(tasks).where(eq(tasks.id, taskId))
   )[0];
   if (!task) return null;
   const [row] = await db
@@ -1612,9 +1554,7 @@ export async function linkCommit(
     .onConflictDoNothing({ target: [taskCommits.taskId, taskCommits.sha] })
     .returning();
 
-  const stamp: Record<string, unknown> = { updatedAt: new Date() };
-  if (!task.workStartedAt) stamp.workStartedAt = new Date();
-  await db.update(tasks).set(stamp).where(eq(tasks.id, taskId));
+  await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, taskId));
 
   // On a duplicate the insert returned nothing — fetch the existing row.
   if (!row) {
@@ -1634,11 +1574,12 @@ export async function linkCommit(
 /* Standup digest                                                        */
 /* -------------------------------------------------------------------- */
 
-/** Everything the standup prompt/view needs for a date window, in one call. */
+/** Everything the standup prompt/view needs for a date window, in one call.
+ *  Notes now carry decisions too (type "decision"), so there's no separate
+ *  decisions list. */
 export interface StandupData {
   notes: Note[];
   finished: TaskDTO[];
-  decisions: Decision[];
 }
 
 export async function standup(
@@ -1646,9 +1587,8 @@ export async function standup(
   from: string,
   to: string,
 ): Promise<StandupData> {
-  const [notes, decisions, ctx, finishedRows] = await Promise.all([
+  const [notes, ctx, finishedRows] = await Promise.all([
     listNotes(userId, { from, to }),
-    listDecisions(userId, { from, to }),
     codeCtx(userId),
     db
       .select()
@@ -1665,7 +1605,6 @@ export async function standup(
   ]);
   return {
     notes,
-    decisions,
     finished: finishedRows.map((r) => rowToTask(r, 0, [], ctx)),
   };
 }
@@ -1696,40 +1635,40 @@ const rowToProject = (r: ProjectRow): Omit<Project, "boards"> => ({
   description: r.description,
 });
 
-/** True if the project exists and belongs to the user. */
-async function ownsProject(id: string, userId: string): Promise<boolean> {
+/** True if the project exists (team-wide — anyone may edit any project). */
+async function ownsProject(id: string, _userId?: string): Promise<boolean> {
   const row = (
     await db
       .select({ id: projects.id })
       .from(projects)
-      .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+      .where(eq(projects.id, id))
       .limit(1)
   )[0];
   return !!row;
 }
 
-/** One board by id, scoped to the user (null if not found / not theirs). */
+/** One board by id (team-wide; null if it doesn't exist). */
 export async function getBoard(
-  userId: string,
+  _userId: string,
   id: string,
 ): Promise<Board | null> {
   const row = (
     await db
       .select()
       .from(boards)
-      .where(and(eq(boards.id, id), eq(boards.userId, userId)))
+      .where(eq(boards.id, id))
       .limit(1)
   )[0];
   return row ? rowToBoard(row) : null;
 }
 
-/** True if the board exists and belongs to the user. */
-async function ownsBoard(id: string, userId: string): Promise<boolean> {
+/** True if the board exists (team-wide — anyone may edit any board). */
+async function ownsBoard(id: string, _userId?: string): Promise<boolean> {
   const row = (
     await db
       .select({ id: boards.id })
       .from(boards)
-      .where(and(eq(boards.id, id), eq(boards.userId, userId)))
+      .where(eq(boards.id, id))
       .limit(1)
   )[0];
   return !!row;
@@ -1747,19 +1686,19 @@ async function nextOrdinal(
   return Number(max) + 1;
 }
 
-/** All of a user's projects, each with its boards nested (position order). */
-export async function listProjects(userId: string): Promise<Project[]> {
-  const [projectRows, boardRows] = await Promise.all([
+/** Every project on the instance, each with its boards nested (position order).
+ *  Team-wide: projects/boards are shared, so `userId` is ignored. */
+export async function listProjects(_userId: string): Promise<Project[]> {
+  const [projectRows, boardRows, memberRows] = await Promise.all([
+    db.select().from(projects).orderBy(asc(projects.position)),
+    db.select().from(boards).orderBy(asc(boards.position)),
+    // Every project's members (curation layer for the assignee picker).
     db
-      .select()
-      .from(projects)
-      .where(eq(projects.userId, userId))
-      .orderBy(asc(projects.position)),
-    db
-      .select()
-      .from(boards)
-      .where(eq(boards.userId, userId))
-      .orderBy(asc(boards.position)),
+      .select({
+        projectId: projectMembers.projectId,
+        userId: projectMembers.userId,
+      })
+      .from(projectMembers),
   ]);
   const byProject = new Map<string, Board[]>();
   for (const b of boardRows) {
@@ -1767,9 +1706,16 @@ export async function listProjects(userId: string): Promise<Project[]> {
     list.push(rowToBoard(b));
     byProject.set(b.projectId, list);
   }
+  const membersByProject = new Map<string, string[]>();
+  for (const m of memberRows) {
+    const list = membersByProject.get(m.projectId) ?? [];
+    list.push(m.userId);
+    membersByProject.set(m.projectId, list);
+  }
   return projectRows.map((p: ProjectRow) => ({
     ...rowToProject(p),
     boards: byProject.get(p.id) ?? [],
+    members: membersByProject.get(p.id) ?? [],
   }));
 }
 
@@ -1782,7 +1728,7 @@ export async function getProject(
     await db
       .select()
       .from(projects)
-      .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+      .where(eq(projects.id, id))
       .limit(1)
   )[0];
   return row ? rowToProject(row) : null;
@@ -1797,9 +1743,11 @@ export async function createProject(
     image?: string | null;
     gitFolder?: string | null;
     description?: string | null;
+    /** Roster user ids to seed as members (exactly these; none ⇒ no members). */
+    members?: string[];
   } = {},
 ): Promise<Project> {
-  const position = await nextOrdinal(projects, eq(projects.userId, userId));
+  const position = await nextOrdinal(projects, undefined);
   const code =
     opts.code !== undefined
       ? await uniqueFrom(userId, sanitizeCode(opts.code))
@@ -1817,7 +1765,14 @@ export async function createProject(
       ...(opts.description !== undefined ? { description: opts.description } : {}),
     })
     .returning();
-  return { ...rowToProject(row), boards: [] };
+  // Seed membership with exactly the requested ids (de-duped, FK-validated so
+  // unknown ids drop). Empty ⇒ no members ⇒ the picker falls back to everyone.
+  const validIds = await validUserIds([...new Set(opts.members ?? [])]);
+  if (validIds.length)
+    await db
+      .insert(projectMembers)
+      .values(validIds.map((uid) => ({ projectId: row.id, userId: uid })));
+  return { ...rowToProject(row), boards: [], members: validIds };
 }
 
 export async function updateProject(
@@ -1830,13 +1785,15 @@ export async function updateProject(
     image?: string | null;
     gitFolder?: string | null;
     description?: string | null;
+    /** Replace the member set (owner always kept). Omit to leave unchanged. */
+    members?: string[];
   },
 ): Promise<Project | null> {
   const cur = (
     await db
       .select({ code: projects.code })
       .from(projects)
-      .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+      .where(eq(projects.id, id))
       .limit(1)
   )[0];
   if (!cur) return null;
@@ -1857,18 +1814,127 @@ export async function updateProject(
       ...(patch.description !== undefined ? { description: patch.description } : {}),
       updatedAt: new Date(),
     })
-    .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+    .where(eq(projects.id, id))
     .returning();
-  return row ? rowToProject(row) : null;
+  if (!row) return null;
+  if (patch.members !== undefined) {
+    await setProjectMembers(userId, id, patch.members);
+  }
+  return rowToProject(row);
 }
 
 /** Delete a project (cascades to its boards, and their tasks). */
 export async function deleteProject(userId: string, id: string): Promise<boolean> {
   const res = await db
     .delete(projects)
-    .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+    .where(eq(projects.id, id))
     .returning();
   return res.length > 0;
+}
+
+/* ---- Project members ----
+   A curation layer for the assignee picker (see schema.ts): a task on a
+   project offers only its members (the whole roster when it has none). The set
+   is EXACTLY what's managed — nobody is auto-pinned, since the app is a shared
+   workspace where anyone can manage any project's members. The picker still
+   lets you manage whoever is already assigned even if they aren't a member
+   (see the pickers' candidate union), so an auto-assigned task creator is never
+   stranded. Membership references user ids; removing a member does NOT
+   un-assign existing tasks (matches the loose coupling elsewhere). */
+
+/** Keep only ids that are real user rows (guards the FK + drops junk). */
+async function validUserIds(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(inArray(users.id, ids));
+  const real = new Set(rows.map((r) => r.id));
+  return ids.filter((id) => real.has(id));
+}
+
+/** The roster users belonging to a project (owner-scoped; [] if not theirs). */
+export async function listProjectMembers(
+  userId: string,
+  projectId: string,
+): Promise<PublicUser[]> {
+  if (!(await ownsProject(projectId, userId))) return [];
+  const rows = await db
+    .select({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      color: users.color,
+      avatarUrl: users.avatarUrl,
+    })
+    .from(projectMembers)
+    .innerJoin(users, eq(projectMembers.userId, users.id))
+    .where(eq(projectMembers.projectId, projectId))
+    .orderBy(asc(users.name));
+  return rows;
+}
+
+/** Replace a project's whole member set (exactly the ids given). Returns the
+ *  new ids, or null if the project doesn't exist. */
+export async function setProjectMembers(
+  userId: string,
+  projectId: string,
+  memberIds: string[],
+): Promise<string[] | null> {
+  if (!(await ownsProject(projectId, userId))) return null;
+  const validIds = await validUserIds([...new Set(memberIds)]);
+  await db.transaction(async (tx) => {
+    await tx.delete(projectMembers).where(eq(projectMembers.projectId, projectId));
+    await tx
+      .insert(projectMembers)
+      .values(validIds.map((uid) => ({ projectId, userId: uid })));
+  });
+  return validIds;
+}
+
+/** Add one member to a project. Returns the new member id list, or null if the
+ *  project isn't the user's or the member isn't a real user. */
+export async function addProjectMember(
+  userId: string,
+  projectId: string,
+  memberId: string,
+): Promise<string[] | null> {
+  if (!(await ownsProject(projectId, userId))) return null;
+  const [valid] = await validUserIds([memberId]);
+  if (!valid) return null;
+  await db
+    .insert(projectMembers)
+    .values({ projectId, userId: valid })
+    .onConflictDoNothing();
+  return currentMemberIds(projectId);
+}
+
+/** Remove one member from a project. Returns the new member id list, or null if
+ *  the project doesn't exist. */
+export async function removeProjectMember(
+  userId: string,
+  projectId: string,
+  memberId: string,
+): Promise<string[] | null> {
+  if (!(await ownsProject(projectId, userId))) return null;
+  await db
+    .delete(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.projectId, projectId),
+        eq(projectMembers.userId, memberId),
+      ),
+    );
+  return currentMemberIds(projectId);
+}
+
+/** Raw member ids for a project (no ownership check — callers gate first). */
+async function currentMemberIds(projectId: string): Promise<string[]> {
+  const rows = await db
+    .select({ userId: projectMembers.userId })
+    .from(projectMembers)
+    .where(eq(projectMembers.projectId, projectId));
+  return rows.map((r) => r.userId);
 }
 
 export async function createBoard(
@@ -1884,10 +1950,7 @@ export async function createBoard(
   } = {},
 ): Promise<Board | null> {
   if (!(await ownsProject(projectId, userId))) return null;
-  const position = await nextOrdinal(
-    boards,
-    and(eq(boards.userId, userId), eq(boards.projectId, projectId)),
-  );
+  const position = await nextOrdinal(boards, eq(boards.projectId, projectId));
   // An explicit shortname takes precedence over the name-derived default;
   // either way it's made unique across the user's boards/projects.
   const code =
@@ -1927,7 +1990,7 @@ export async function updateBoard(
     await db
       .select({ code: boards.code })
       .from(boards)
-      .where(and(eq(boards.id, id), eq(boards.userId, userId)))
+      .where(eq(boards.id, id))
       .limit(1)
   )[0];
   if (!cur) return null;
@@ -1946,7 +2009,7 @@ export async function updateBoard(
       ...(patch.description !== undefined ? { description: patch.description } : {}),
       updatedAt: new Date(),
     })
-    .where(and(eq(boards.id, id), eq(boards.userId, userId)))
+    .where(eq(boards.id, id))
     .returning();
   return row ? rowToBoard(row) : null;
 }
@@ -1969,13 +2032,7 @@ export async function reorderBoards(
       db
         .update(boards)
         .set({ position: i + 1, updatedAt: now })
-        .where(
-          and(
-            eq(boards.id, id),
-            eq(boards.userId, userId),
-            eq(boards.projectId, projectId),
-          ),
-        ),
+        .where(and(eq(boards.id, id), eq(boards.projectId, projectId))),
     ),
   );
   return true;
@@ -1985,37 +2042,217 @@ export async function reorderBoards(
 export async function deleteBoard(userId: string, id: string): Promise<boolean> {
   const res = await db
     .delete(boards)
-    .where(and(eq(boards.id, id), eq(boards.userId, userId)))
+    .where(eq(boards.id, id))
     .returning();
   return res.length > 0;
+}
+
+/* -------------------------------------------------------------------- */
+/* Canvas / whiteboard                                                   */
+/* -------------------------------------------------------------------- */
+
+const rowToCanvasNode = (r: CanvasNodeRow): CanvasNode => ({
+  id: r.id,
+  kind: r.kind as CanvasNodeKind,
+  content: r.content,
+  x: r.x,
+  y: r.y,
+  width: r.width,
+  height: r.height,
+  color: r.color,
+  position: r.position,
+  data: (r.data as Record<string, unknown>) ?? {},
+});
+
+const rowToCanvas = (r: CanvasRow, nodes?: CanvasNode[]): Canvas => ({
+  id: r.id,
+  name: r.name,
+  viewport: (r.viewport as Partial<CanvasViewport>) ?? {},
+  createdAt: iso(r.createdAt),
+  updatedAt: iso(r.updatedAt),
+  ...(nodes ? { nodes } : {}),
+});
+
+/* Canvases are TEAM-VISIBLE (like Google calendars): every signed-in user can
+   see and edit every canvas, so people can brainstorm on the same board in
+   realtime. `canvases.userId` / `canvasNodes.userId` are kept only as "who
+   created it" metadata — never a read/write fence. (Tasks created by
+   convert-to-todos still land in the ACTING user's own todos.) */
+
+/** True if the canvas exists (team-wide — not scoped to a user). */
+async function canvasExists(id: string): Promise<boolean> {
+  const row = (
+    await db.select({ id: canvases.id }).from(canvases).where(eq(canvases.id, id)).limit(1)
+  )[0];
+  return !!row;
+}
+
+/** Every canvas on the instance (no nodes — the index only needs names). */
+export async function listCanvases(): Promise<Canvas[]> {
+  const rows = await db.select().from(canvases).orderBy(asc(canvases.position));
+  return rows.map((r) => rowToCanvas(r));
+}
+
+/** One canvas with all its nodes (team-wide; null if it doesn't exist). */
+export async function getCanvas(id: string): Promise<Canvas | null> {
+  const row = (
+    await db.select().from(canvases).where(eq(canvases.id, id)).limit(1)
+  )[0];
+  if (!row) return null;
+  const nodeRows = await db
+    .select()
+    .from(canvasNodes)
+    .where(eq(canvasNodes.canvasId, id))
+    .orderBy(asc(canvasNodes.position));
+  return rowToCanvas(row, nodeRows.map(rowToCanvasNode));
+}
+
+export async function createCanvas(
+  userId: string,
+  name: string,
+): Promise<Canvas> {
+  const [{ max }] = await db
+    .select({ max: sql<number>`coalesce(max(${canvases.position}), 0)` })
+    .from(canvases);
+  const [row] = await db
+    .insert(canvases)
+    .values({ userId, name, position: Number(max) + 1 })
+    .returning();
+  return rowToCanvas(row, []);
+}
+
+export async function updateCanvas(
+  id: string,
+  patch: { name?: string; viewport?: CanvasViewport },
+): Promise<Canvas | null> {
+  const [row] = await db
+    .update(canvases)
+    .set({
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.viewport !== undefined ? { viewport: patch.viewport } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(canvases.id, id))
+    .returning();
+  return row ? rowToCanvas(row) : null;
+}
+
+/** Delete a canvas (cascades to its nodes). */
+export async function deleteCanvas(id: string): Promise<boolean> {
+  const res = await db.delete(canvases).where(eq(canvases.id, id)).returning();
+  return res.length > 0;
+}
+
+/** One node in a batch save. Ids are CLIENT-generated UUIDs so the editor can
+ *  reference a node the instant it's drawn; the save is an idempotent upsert. */
+export interface CanvasNodeInput {
+  id?: string;
+  kind: CanvasNodeKind;
+  content?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color?: string | null;
+  position?: number;
+  data?: Record<string, unknown>;
+}
+
+/**
+ * The canvas editor's debounced save: upsert some nodes and delete others in
+ * one call. Upserts are keyed on the node id (client-generated), and the
+ * on-conflict update is fenced to rows this user owns on this canvas, so a
+ * stray id can never overwrite someone else's node. Returns the refreshed
+ * canvas (with nodes), or null if the canvas isn't the user's.
+ */
+export async function saveCanvasNodes(
+  userId: string,
+  canvasId: string,
+  changes: { upserts?: CanvasNodeInput[]; deletes?: string[] },
+): Promise<Canvas | null> {
+  if (!(await canvasExists(canvasId))) return null;
+  const now = new Date();
+  const deletes = changes.deletes ?? [];
+  const upserts = changes.upserts ?? [];
+
+  // Team canvas: any member can delete/edit any node — fence by canvas only.
+  if (deletes.length) {
+    await db
+      .delete(canvasNodes)
+      .where(
+        and(eq(canvasNodes.canvasId, canvasId), inArray(canvasNodes.id, deletes)),
+      );
+  }
+
+  await Promise.all(
+    upserts.map((n) => {
+      const values = {
+        kind: n.kind,
+        content: n.content ?? "",
+        x: n.x,
+        y: n.y,
+        width: n.width,
+        height: n.height,
+        color: n.color ?? null,
+        position: n.position ?? 0,
+        data: n.data ?? {},
+      };
+      return db
+        .insert(canvasNodes)
+        // `userId` stamps the creator on insert; updates never touch it.
+        .values({ ...(n.id ? { id: n.id } : {}), userId, canvasId, ...values })
+        .onConflictDoUpdate({
+          target: canvasNodes.id,
+          set: { ...values, updatedAt: now },
+          setWhere: eq(canvasNodes.canvasId, canvasId),
+        });
+    }),
+  );
+
+  await db.update(canvases).set({ updatedAt: now }).where(eq(canvases.id, canvasId));
+
+  return getCanvas(canvasId);
 }
 
 /* -------------------------------------------------------------------- */
 /* AI-readable Markdown rendering                                        */
 /* -------------------------------------------------------------------- */
 
-/** Render the whole board as compact Markdown — great for an AI to skim. */
-export function toMarkdown(tree: TaskDTO[]): string {
+/** Render the whole board as compact Markdown — great for an AI to skim.
+ *  `names` maps assignee user ids → display names so assignees render as
+ *  `@name`; without it they fall back to the raw id. */
+export function toMarkdown(tree: TaskDTO[], names?: Map<string, string>): string {
   const order: TaskStatus[] = ["in-progress", "planned", "backlog", "done"];
   const lines: string[] = ["# Tasks", ""];
   for (const status of order) {
     const group = tree.filter((t) => t.status === status);
     if (!group.length) continue;
     lines.push(`## ${STATUS_LABEL[status]}`, "");
-    for (const t of group) lines.push(...taskLines(t, 0));
+    for (const t of group) lines.push(...taskLines(t, 0, names));
     lines.push("");
   }
   return lines.join("\n").trim() + "\n";
 }
 
-function taskLines(t: TaskDTO, depth: number): string[] {
+/** Map of every user's id → display name, for rendering assignees as `@name`. */
+export async function userNameMap(): Promise<Map<string, string>> {
+  const rows = await db.select({ id: users.id, name: users.name }).from(users);
+  return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+function taskLines(
+  t: TaskDTO,
+  depth: number,
+  names?: Map<string, string>,
+): string[] {
   const pad = "  ".repeat(depth);
   const box = t.status === "done" ? "[x]" : "[ ]";
   const meta: string[] = [];
   if (t.phase && t.phase !== "draft" && t.phase !== "done") meta.push(`phase:${t.phase}`);
   if (t.value != null) meta.push(`value:${t.value}`);
   if (t.difficulty != null) meta.push(`diff:${t.difficulty}`);
-  if (t.assignees?.length) meta.push(...t.assignees.map((a) => `@${a}`));
+  if (t.assigneeIds?.length)
+    meta.push(...t.assigneeIds.map((a) => `@${names?.get(a) ?? a}`));
   if (t.startDate) meta.push(`start:${t.startDate}`);
   if (t.dueDate) meta.push(`due:${t.dueDate}`);
   if (t.recurrence && t.recurrence !== "none") meta.push(`↻${t.recurrence}`);
@@ -2026,6 +2263,6 @@ function taskLines(t: TaskDTO, depth: number): string[] {
   const codeTag = t.code ? `\`${t.code}\` ` : "";
   const lines = [`${pad}- ${box} ${codeTag}**${t.title}** \`${t.id}\`${tail}`];
   if (t.description) lines.push(`${pad}  ${t.description}`);
-  for (const s of t.subtasks ?? []) lines.push(...taskLines(s, depth + 1));
+  for (const s of t.subtasks ?? []) lines.push(...taskLines(s, depth + 1, names));
   return lines;
 }

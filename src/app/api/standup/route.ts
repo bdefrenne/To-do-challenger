@@ -1,7 +1,7 @@
 /*
   /api/standup?from=YYYY-MM-DD&to=YYYY-MM-DD
-    GET — the standup digest data for a window: notes + finished tasks +
-          decisions. Defaults to the last 24h if no range is given.
+    GET — the standup digest data for a window: notes (incl. decisions) +
+          finished tasks. Defaults to the last 24h if no range is given.
 */
 
 import { NextRequest } from "next/server";

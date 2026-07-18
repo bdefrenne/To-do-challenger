@@ -23,7 +23,7 @@ export const GET = route(async (_req: NextRequest, { userId }: AuthedCtx) => {
 });
 
 export const POST = route(async (req: NextRequest, { userId }: AuthedCtx) => {
-  const { name, code, color, image, gitFolder, description } = await body(
+  const { name, code, color, image, gitFolder, description, members } = await body(
     req,
     createProjectSchema,
   );
@@ -33,6 +33,7 @@ export const POST = route(async (req: NextRequest, { userId }: AuthedCtx) => {
     image,
     gitFolder,
     description,
+    members,
   });
   return json({ project }, 201);
 });

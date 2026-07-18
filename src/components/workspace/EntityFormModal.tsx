@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Avatar } from "@/components/ui/Badge";
 import { AvatarCropper } from "@/components/ui/AvatarCropper";
 import { SUMMARY_FILENAME } from "@/lib/repo-sync";
@@ -33,6 +33,10 @@ export function EntityFormModal({
   initial,
   onSave,
   onClose,
+  onDelete,
+  deleteDisabled = false,
+  deleteHint,
+  extraSection,
 }: {
   title: string;
   submitLabel: string;
@@ -52,6 +56,16 @@ export function EntityFormModal({
     picture: { blob: Blob | null; remove: boolean },
   ) => Promise<boolean>;
   onClose: () => void;
+  /** Optional destructive action (edit mode). Renders a "Delete" button on the
+   *  left of the footer; the handler owns confirmation + closing the modal. */
+  onDelete?: () => void | Promise<void>;
+  /** Block the delete button (e.g. the entity isn't empty yet). */
+  deleteDisabled?: boolean;
+  /** Faint explanation shown next to Delete when it's disabled. */
+  deleteHint?: string;
+  /** Extra content rendered below the description (e.g. a project's member
+   *  picker). The caller owns this state and reads it in its own `onSave`. */
+  extraSection?: ReactNode;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -107,6 +121,21 @@ export function EntityFormModal({
       else setErr("Could not save — please try again");
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Something went wrong");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (!onDelete) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      // The handler owns confirmation + closing on success; if the user backs
+      // out we just re-enable the form.
+      await onDelete();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not delete");
     } finally {
       setBusy(false);
     }
@@ -244,23 +273,47 @@ export function EntityFormModal({
           </span>
         </label>
 
+        {extraSection ? <div className="mt-3">{extraSection}</div> : null}
+
         {err ? <p className="mt-3 text-xs text-nerf">{err}</p> : null}
 
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            disabled={busy}
-            className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={save}
-            disabled={busy || !name.trim()}
-            className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            {busy ? "Saving…" : submitLabel}
-          </button>
+        <div className="mt-5 flex items-center justify-between gap-2">
+          {onDelete ? (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={remove}
+                disabled={busy || deleteDisabled}
+                title={deleteHint}
+                className="rounded-lg px-3 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                Delete
+              </button>
+              {deleteDisabled && deleteHint ? (
+                <span className="max-w-[16rem] text-[11px] leading-tight text-faint">
+                  {deleteHint}
+                </span>
+              ) : null}
+            </div>
+          ) : (
+            <span />
+          )}
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={onClose}
+              disabled={busy}
+              className="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={save}
+              disabled={busy || !name.trim()}
+              className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : submitLabel}
+            </button>
+          </div>
         </div>
       </div>
 

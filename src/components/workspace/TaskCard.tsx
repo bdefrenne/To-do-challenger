@@ -53,8 +53,8 @@ export function TaskCard({
       </div>
 
       <div className="mt-2 flex items-center gap-2 text-xs text-faint">
-        {task.assignees?.length ? (
-          <AvatarStack names={task.assignees} size={18} />
+        {task.assigneeIds?.length ? (
+          <AvatarStack ids={task.assigneeIds} size={18} />
         ) : null}
         {task.recurrence && task.recurrence !== "none" ? (
           <span title={`Repeats ${task.recurrence}`}>↻</span>

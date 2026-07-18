@@ -5,16 +5,27 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import type { Note, NoteType } from "@/lib/types";
 
-const TYPE_ORDER: NoteType[] = ["blocker", "progress", "question", "fyi"];
+const TYPE_ORDER: NoteType[] = [
+  "decision",
+  "blocker",
+  "progress",
+  "milestone",
+  "question",
+  "fyi",
+];
 const TYPE_LABEL: Record<NoteType, string> = {
+  decision: "Decisions",
   blocker: "Blockers",
   progress: "Progress",
+  milestone: "Milestones",
   question: "Questions",
   fyi: "FYI",
 };
 const TYPE_TONE: Record<NoteType, string> = {
+  decision: "text-accent",
   blocker: "text-nerf",
   progress: "text-buff",
+  milestone: "text-buff",
   question: "text-accent",
   fyi: "text-muted",
 };

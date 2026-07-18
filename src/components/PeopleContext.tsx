@@ -27,8 +27,11 @@ export interface Person {
 
 interface PeopleContextValue {
   people: Person[];
-  /** Resolve an assignee display-name to a person (case-insensitive). */
+  /** Resolve an assignee display-name to a person (case-insensitive). Used for
+   *  authorship labels (comments/activity), which are still name-based. */
   resolve: (name: string) => Person | undefined;
+  /** Resolve an assignee account id to a person. Assignees are stored as ids. */
+  resolveById: (id: string) => Person | undefined;
   /** The signed-in user (kept fresh from the roster). */
   me: Person | null;
   refresh: () => void;
@@ -37,6 +40,7 @@ interface PeopleContextValue {
 const EMPTY: PeopleContextValue = {
   people: [],
   resolve: () => undefined,
+  resolveById: () => undefined,
   me: null,
   refresh: () => {},
 };
@@ -90,9 +94,11 @@ export function PeopleProvider({
 
   const value = useMemo<PeopleContextValue>(() => {
     const byName = new Map(people.map((p) => [p.name.trim().toLowerCase(), p]));
+    const byId = new Map(people.map((p) => [p.id, p]));
     return {
       people,
       resolve: (name: string) => byName.get(name.trim().toLowerCase()),
+      resolveById: (id: string) => byId.get(id),
       me: people.find((p) => p.id === initialMe.id) ?? initialMe,
       refresh,
     };

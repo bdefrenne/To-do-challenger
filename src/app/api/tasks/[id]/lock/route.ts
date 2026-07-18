@@ -22,10 +22,10 @@ function workPrompt(code: string, title: string): string {
     `I want you to work on task ${code} — "${title}" using the "todo" MCP.\n\n` +
     `Start with get_task to load full context, and follow the todo workflow ` +
     `contract — it's in the MCP server instructions and the todo://workflow ` +
-    `resource (read it if you haven't). In short: record_decision for each choice ` +
-    `as it happens, reference ${code} in every commit and link_commit each sha, ` +
-    `add_note anything standup-worthy, and run the finish protocol (reconcile the ` +
-    `git diff, write the summary from what shipped, mark done) when we're done.`
+    `resource (read it if you haven't). In short: reference ${code} in every ` +
+    `commit and link_commit each sha, add_note for important decisions or ` +
+    `standup-worthy updates (when I ask), and run the finish protocol (reconcile ` +
+    `the git diff, write the summary from what shipped, mark done) when we're done.`
   );
 }
 
