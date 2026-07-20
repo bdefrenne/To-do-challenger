@@ -44,3 +44,8 @@ instructions when creating or modifying anything.
 - A project's/board's description lives in `DESCRIPTION.md` in its repo and
   mirrors the app; keep the two in sync (see above). This is the *description*
   layer — distinct from this instructions file.
+- **Visual-review notes.** When Ben asks you to flag something for a later
+  visual check, add a `review`-type note to the relevant task
+  (`add_note type:"review"`). Never add review notes on your own initiative —
+  only when Ben explicitly asks. Ben checks them off himself (they clear via
+  `resolve_note`); don't resolve them for him.

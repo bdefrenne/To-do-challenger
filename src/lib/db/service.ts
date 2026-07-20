@@ -8,7 +8,7 @@
   ====================================================================
 */
 
-import { and, asc, desc, eq, gte, ilike, inArray, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, isNull, lte, or, sql, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
 import { db } from "./client";
@@ -41,9 +41,9 @@ import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
 import type {
   Task,
   TaskStatus,
-  TaskPhase,
   Recurrence,
   FibPoints,
+  Importance,
   CustomFieldValue,
   TaskLogEntry,
   Attachment,
@@ -63,6 +63,8 @@ export interface TaskDTO extends Task {
   parentId: string | null;
   position: number;
   statusSince: string;
+  /** When the code was locked (≈ when work started / first handoff), or null. */
+  lockedAt?: string | null;
   createdAt: string;
   subtasks?: TaskDTO[];
 }
@@ -128,16 +130,6 @@ function displayCode(row: TaskRow, ctx?: CodeCtx): string | undefined {
   return formatCode(prefix, row.seq, false);
 }
 
-/** Derive the workflow phase from lifecycle state. Progress ("am I working on
- *  it") lives in the kanban `status`, so phase only tracks the analysis
- *  lifecycle: draft → ready (code locked) → analyzed → done. */
-function derivePhase(row: TaskRow): TaskPhase {
-  if (row.completedAt) return "done";
-  if (row.analyzedAt) return "analyzed";
-  if (row.refLocked) return "ready";
-  return "draft";
-}
-
 function rowToTask(
   row: TaskRow,
   commentCount: number,
@@ -151,8 +143,6 @@ function rowToTask(
     code: displayCode(row, ctx),
     ref: row.ref,
     refLocked: row.refLocked,
-    phase: derivePhase(row),
-    analyzedAt: iso(row.analyzedAt) ?? null,
     analysisSummary: row.analysisSummary,
     plan: row.plan,
     summary: row.summary,
@@ -164,6 +154,7 @@ function rowToTask(
     customFields: (row.customFields as Record<string, CustomFieldValue>) ?? {},
     value: (row.value as FibPoints | null) ?? undefined,
     difficulty: (row.difficulty as FibPoints | null) ?? undefined,
+    importance: (row.importance as Importance | null) ?? 0,
     description: row.description ?? undefined,
     commentCount: commentCount || undefined,
     boardId: row.boardId,
@@ -171,6 +162,7 @@ function rowToTask(
     parentId: row.parentId,
     position: row.position,
     statusSince: iso(row.statusSince)!,
+    lockedAt: iso(row.lockedAt) ?? null,
     completedAt: iso(row.completedAt),
     createdAt: iso(row.createdAt)!,
     updatedAt: iso(row.updatedAt),
@@ -246,12 +238,45 @@ async function uniqueFrom(
 const uniqueCode = (userId: string, name: string) =>
   uniqueFrom(userId, deriveCode(name));
 
+/** Statuses that represent committed work — entering any of them locks the
+ *  code (the first handoff, To Do → Analyzing, and everything after). */
+const LOCKING_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "analyzing",
+  "analyzed",
+  "building",
+  "done",
+]);
+
+/**
+ * Compute the fields that freeze a task's soft code into a locked `ref`
+ * (allocating a seq if it doesn't have one yet). Returns null if it's already
+ * locked. Shared by `mintRef` and the auto-lock in `updateTask`/`moveTask`, so
+ * every path that starts real work funnels through the same freeze.
+ */
+async function computeLockFields(
+  current: TaskRow,
+  userId: string,
+  ctx: CodeCtx,
+): Promise<{ ref: string; refLocked: true; lockedAt: Date; seq: number } | null> {
+  if (current.refLocked && current.ref) return null;
+  const owner = ownerOf(current, userId);
+  let prefix = resolvePrefix(current, ctx);
+  if (!prefix) prefix = await ensureOwnerCode(owner, userId);
+  const seq = current.seq ?? (await allocSeq(owner.scope, owner.id));
+  return { ref: `${prefix}-${seq}`, refLocked: true, lockedAt: new Date(), seq };
+}
+
 /**
  * Lock a task's code (idempotent). Freezes the current soft code into `ref`.
- * Triggered on handoff (work_on_task / Copy prompt) or as a backstop on the
- * first real mutation, so a "real" task never lacks a locked code.
+ * Triggered on handoff (work_on_task / Copy prompt) or automatically when a
+ * task's status enters the working part of the spine (see `updateTask`), so a
+ * "real" task never lacks a locked code.
  */
-export async function mintRef(handle: string, userId: string): Promise<TaskDTO | null> {
+export async function mintRef(
+  handle: string,
+  userId: string,
+  author = "You",
+): Promise<TaskDTO | null> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return null;
   const current = (
@@ -259,20 +284,18 @@ export async function mintRef(handle: string, userId: string): Promise<TaskDTO |
   )[0];
   if (!current) return null;
   const ctx = await codeCtx(userId);
-  if (current.refLocked && current.ref) return rowToTask(current, 0, [], ctx);
+  const lock = await computeLockFields(current, userId, ctx);
+  if (!lock) return rowToTask(current, 0, [], ctx);
 
-  // Ensure the owner has a code (derive + persist if missing).
-  const owner = ownerOf(current, userId);
-  let prefix = resolvePrefix(current, ctx);
-  if (!prefix) {
-    prefix = await ensureOwnerCode(owner, userId);
-  }
-  const seq = current.seq ?? (await allocSeq(owner.scope, owner.id));
-  const refStr = `${prefix}-${seq}`;
-  const now = new Date();
   const [row] = await db
     .update(tasks)
-    .set({ ref: refStr, refLocked: true, lockedAt: now, seq, updatedAt: now })
+    .set({
+      ref: lock.ref,
+      refLocked: true,
+      lockedAt: lock.lockedAt,
+      seq: lock.seq,
+      updatedAt: lock.lockedAt,
+    })
     .where(and(eq(tasks.id, id), eq(tasks.refLocked, false)))
     .returning();
   if (!row) {
@@ -280,6 +303,7 @@ export async function mintRef(handle: string, userId: string): Promise<TaskDTO |
     const fresh = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
     return fresh ? rowToTask(fresh, 0, [], ctx) : null;
   }
+  await log(id, "updated", `🔒 Locked as ${lock.ref}`, author);
   return rowToTask(row, 0, [], ctx);
 }
 
@@ -325,6 +349,7 @@ const rowToNote = (r: TaskNoteRow): Note => ({
   tags: r.tags ?? [],
   author: r.author,
   createdAt: iso(r.createdAt)!,
+  resolvedAt: iso(r.resolvedAt),
 });
 
 const rowToCommit = (r: TaskCommitRow): TaskCommit => ({
@@ -574,7 +599,7 @@ export async function listToday(userId: string): Promise<TaskDTO[]> {
   const ref = Date.now();
   return all.filter((t) => {
     if (t.status === "done") return false;
-    if (t.status === "in-progress" || t.status === "planned") return true;
+    if (t.status !== "backlog") return true;
     return t.dueDate ? daysAgo(t.dueDate, ref) >= 0 : false;
   });
 }
@@ -699,6 +724,7 @@ export interface CreateTaskInput {
   customFields?: Record<string, CustomFieldValue>;
   value?: FibPoints;
   difficulty?: FibPoints;
+  importance?: Importance;
   description?: string;
   parentId?: string | null;
   boardId?: string | null;
@@ -799,6 +825,7 @@ export async function createTask(
       customFields: input.customFields ?? {},
       value: input.value,
       difficulty: input.difficulty,
+      importance: input.importance ?? 0,
       description: input.description,
       parentId,
       boardId,
@@ -824,18 +851,14 @@ export interface UpdateTaskInput {
   customFields?: Record<string, CustomFieldValue>;
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
+  importance?: Importance;
   description?: string | null;
-  /* ---- Workflow: revisable summaries (null clears) ---- */
+  /* ---- Workflow: revisable free-text fields (null clears).
+     UI labels: Analysis / Technical Plan / Summary. ---- */
   analysisSummary?: string | null;
   plan?: string | null;
   summary?: string | null;
-  /* ---- Workflow: lifecycle timestamps (ISO string, or null to clear) ---- */
-  analyzedAt?: string | null;
 }
-
-/** Parse an ISO string (or null) into a Date for a timestamp column. */
-const toDate = (v: string | null | undefined): Date | null | undefined =>
-  v === undefined ? undefined : v === null ? null : new Date(v);
 
 export async function updateTask(
   handle: string,
@@ -873,20 +896,36 @@ export async function updateTask(
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
+  if (patch.importance !== undefined) values.importance = patch.importance;
   if (patch.description !== undefined) values.description = patch.description;
   if (patch.analysisSummary !== undefined) values.analysisSummary = patch.analysisSummary;
   if (patch.plan !== undefined) values.plan = patch.plan;
   if (patch.summary !== undefined) values.summary = patch.summary;
-  if (patch.analyzedAt !== undefined) values.analyzedAt = toDate(patch.analyzedAt);
 
   const statusChanged =
     patch.status !== undefined && patch.status !== current.status;
+  let autoLocked: string | null = null;
   if (statusChanged) {
     values.status = patch.status;
     values.statusSince = now;
     // Track completion: stamp on entering "done", clear on leaving it.
     if (patch.status === "done") values.completedAt = now;
     else if (current.status === "done") values.completedAt = null;
+    // Lock the code the first time the task enters the working part of the
+    // spine (Analyzing+). Folded into THIS update so the If-Match guard below
+    // still holds — no separate mintRef write to trip it. Any entry path (UI
+    // picker, AI update_task, prompt) funnels through here.
+    if (LOCKING_STATUSES.has(patch.status!) && !current.refLocked) {
+      const lockCtx = await codeCtx(userId);
+      const lock = await computeLockFields(current, userId, lockCtx);
+      if (lock) {
+        values.ref = lock.ref;
+        values.refLocked = true;
+        values.lockedAt = lock.lockedAt;
+        values.seq = lock.seq;
+        autoLocked = lock.ref;
+      }
+    }
   }
 
   const [row] = await db
@@ -913,14 +952,24 @@ export async function updateTask(
     throw new ConflictError(fresh ? rowToTask(fresh, 0) : null);
   }
 
-  if (statusChanged) {
+  // One activity row summarizing what changed (mirrors bulkUpdate): the status
+  // transition and/or the field edits, joined with " · ". Kind stays "status"
+  // for a pure status change (preserves its icon), else "updated".
+  const logParts: string[] = [];
+  if (statusChanged)
+    logParts.push(
+      `Status: ${STATUS_LABEL[current.status]} → ${STATUS_LABEL[patch.status!]}`,
+    );
+  if (autoLocked) logParts.push(`🔒 Locked as ${autoLocked}`);
+  const patchMsg = describeBulkPatch(patch);
+  if (patchMsg) logParts.push(patchMsg);
+  if (logParts.length)
     await log(
       id,
-      "status",
-      `Status: ${STATUS_LABEL[current.status]} → ${STATUS_LABEL[patch.status!]}`,
+      statusChanged && !patchMsg ? "status" : "updated",
+      logParts.join(" · "),
       author,
     );
-  }
   const [counts, ctx] = await Promise.all([commentCounts(userId), codeCtx(userId)]);
   return rowToTask(row, counts.get(id) ?? 0, undefined, ctx);
 }
@@ -999,6 +1048,24 @@ export async function moveTask(
     seq = await allocSeq(newOwner.scope, newOwner.id);
   }
 
+  // Entering the working part of the spine (Analyzing+) locks the code — same
+  // rule as updateTask, so dragging a card into an Analyzing/Building column
+  // freezes it. Use the (possibly re-drawn) seq under the new owner's prefix.
+  let ref = current.ref;
+  let refLocked = current.refLocked;
+  let lockedAt = current.lockedAt;
+  let autoLocked: string | null = null;
+  if (statusChanged && LOCKING_STATUSES.has(status) && !current.refLocked) {
+    const ctx = await codeCtx(userId);
+    let prefix = resolvePrefix({ ...current, boardId, projectId }, ctx);
+    if (!prefix) prefix = await ensureOwnerCode(newOwner, userId);
+    if (seq == null) seq = await allocSeq(newOwner.scope, newOwner.id);
+    ref = `${prefix}-${seq}`;
+    refLocked = true;
+    lockedAt = now;
+    autoLocked = ref;
+  }
+
   const [row] = await db
     .update(tasks)
     .set({
@@ -1007,6 +1074,9 @@ export async function moveTask(
       boardId,
       projectId,
       seq,
+      ref,
+      refLocked,
+      lockedAt,
       position,
       statusSince: statusChanged ? now : current.statusSince,
       // Keep completion in sync when a drag crosses the "done" boundary.
@@ -1019,6 +1089,7 @@ export async function moveTask(
     })
     .where(eq(tasks.id, id))
     .returning();
+  if (autoLocked) await log(id, "updated", `🔒 Locked as ${autoLocked}`, author);
 
   if (target.parentId !== undefined && target.parentId !== current.parentId) {
     const parentTitle = target.parentId
@@ -1052,14 +1123,13 @@ export async function moveTask(
     );
   } else if (statusChanged) {
     await log(id, "moved", `Moved to ${STATUS_LABEL[status]}`, author);
-  } else {
-    await log(id, "moved", `Reordered in ${STATUS_LABEL[status]}`, author);
   }
+  // A pure re-sort within the same status/parent/board is noise — no log row.
   const [counts, ctx] = await Promise.all([commentCounts(userId), codeCtx(userId)]);
   return rowToTask(row, counts.get(id) ?? 0, undefined, ctx);
 }
 
-/** Complete or reopen (reopen sends it back to Planned, like the UI). */
+/** Complete or reopen (reopen sends it back to To Do, like the UI). */
 export async function completeTask(
   handle: string,
   done = true,
@@ -1070,7 +1140,7 @@ export async function completeTask(
   if (!id) return null;
   return updateTask(
     id,
-    { status: done ? "done" : "planned" },
+    { status: done ? "done" : "todo" },
     userId,
     author,
   ).then(async (t) => {
@@ -1177,6 +1247,7 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
     parts.push(
       patch.difficulty == null ? "Difficulty cleared" : `Difficulty → ${patch.difficulty}`,
     );
+  if (patch.importance !== undefined) parts.push(`Importance → ${patch.importance}`);
   if (patch.startDate !== undefined)
     parts.push(patch.startDate == null ? "Start date cleared" : `Start → ${patch.startDate}`);
   if (patch.dueDate !== undefined)
@@ -1186,6 +1257,13 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
   if (patch.customFields !== undefined) parts.push("Custom fields updated");
   if (patch.description !== undefined)
     parts.push(patch.description == null ? "Description cleared" : "Description updated");
+  // Workflow fields — carried by the single-task edit path (not bulk).
+  if (patch.plan !== undefined)
+    parts.push(patch.plan == null ? "Plan cleared" : "Plan updated");
+  if (patch.summary !== undefined)
+    parts.push(patch.summary == null ? "Summary cleared" : "Summary written");
+  if (patch.analysisSummary !== undefined)
+    parts.push(patch.analysisSummary == null ? "Analysis cleared" : "Analysis recorded");
   return parts.join(" · ");
 }
 
@@ -1237,6 +1315,7 @@ export async function bulkUpdate(
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
+  if (patch.importance !== undefined) values.importance = patch.importance;
   if (patch.description !== undefined) values.description = patch.description;
   if (patch.status !== undefined) {
     values.status = patch.status;
@@ -1505,9 +1584,13 @@ export interface NoteFilter {
   type?: NoteType;
   from?: string;
   to?: string;
+  /** Include checked-off (resolved) notes. Defaults to false — the live Notes
+   *  view and standup only want open items. */
+  includeResolved?: boolean;
 }
 
-/** Query a user's notes across tasks — powers the Notes page + standup. */
+/** Query a user's notes across tasks — powers the Notes page + standup. By
+ *  default only OPEN (unresolved) notes are returned. */
 export async function listNotes(
   userId: string,
   filter?: NoteFilter,
@@ -1521,12 +1604,30 @@ export async function listNotes(
   if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
   if (filter?.from) conds.push(gte(taskNotes.createdAt, new Date(filter.from)));
   if (filter?.to) conds.push(lte(taskNotes.createdAt, new Date(filter.to)));
+  if (!filter?.includeResolved) conds.push(isNull(taskNotes.resolvedAt));
   const rows = await db
     .select()
     .from(taskNotes)
     .where(and(...conds))
     .orderBy(desc(taskNotes.createdAt));
   return rows.map(rowToNote);
+}
+
+/** Check off (or re-open) a note. Scoped to the owner so you can't resolve
+ *  someone else's. Returns the updated note, or null if not found. */
+export async function resolveNote(
+  noteId: string,
+  resolved: boolean,
+  userId: string,
+): Promise<Note | null> {
+  const [row] = await db
+    .update(taskNotes)
+    .set({ resolvedAt: resolved ? new Date() : null })
+    .where(and(eq(taskNotes.id, noteId), eq(taskNotes.userId, userId)))
+    .returning();
+  if (!row) return null;
+  await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
+  return rowToNote(row);
 }
 
 /* -------------------------------------------------------------------- */
@@ -2222,7 +2323,14 @@ export async function saveCanvasNodes(
  *  `names` maps assignee user ids → display names so assignees render as
  *  `@name`; without it they fall back to the raw id. */
 export function toMarkdown(tree: TaskDTO[], names?: Map<string, string>): string {
-  const order: TaskStatus[] = ["in-progress", "planned", "backlog", "done"];
+  const order: TaskStatus[] = [
+    "building",
+    "analyzing",
+    "analyzed",
+    "todo",
+    "backlog",
+    "done",
+  ];
   const lines: string[] = ["# Tasks", ""];
   for (const status of order) {
     const group = tree.filter((t) => t.status === status);
@@ -2248,7 +2356,9 @@ function taskLines(
   const pad = "  ".repeat(depth);
   const box = t.status === "done" ? "[x]" : "[ ]";
   const meta: string[] = [];
-  if (t.phase && t.phase !== "draft" && t.phase !== "done") meta.push(`phase:${t.phase}`);
+  if (t.status !== "backlog" && t.status !== "todo" && t.status !== "done")
+    meta.push(`status:${t.status}`);
+  if (t.importance) meta.push(`importance:${t.importance}`);
   if (t.value != null) meta.push(`value:${t.value}`);
   if (t.difficulty != null) meta.push(`diff:${t.difficulty}`);
   if (t.assigneeIds?.length)

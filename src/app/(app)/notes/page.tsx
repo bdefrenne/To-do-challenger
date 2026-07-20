@@ -6,6 +6,7 @@ import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import type { Note, NoteType } from "@/lib/types";
 
 const TYPE_ORDER: NoteType[] = [
+  "review",
   "decision",
   "blocker",
   "progress",
@@ -14,6 +15,7 @@ const TYPE_ORDER: NoteType[] = [
   "fyi",
 ];
 const TYPE_LABEL: Record<NoteType, string> = {
+  review: "To review",
   decision: "Decisions",
   blocker: "Blockers",
   progress: "Progress",
@@ -22,6 +24,7 @@ const TYPE_LABEL: Record<NoteType, string> = {
   fyi: "FYI",
 };
 const TYPE_TONE: Record<NoteType, string> = {
+  review: "text-nerf",
   decision: "text-accent",
   blocker: "text-nerf",
   progress: "text-buff",
@@ -29,6 +32,9 @@ const TYPE_TONE: Record<NoteType, string> = {
   question: "text-accent",
   fyi: "text-muted",
 };
+
+/** Transient note types that can be checked off once handled. */
+const RESOLVABLE: ReadonlySet<NoteType> = new Set(["review", "blocker", "question"]);
 
 const WINDOWS = [
   { label: "24h", days: 1 },
@@ -40,12 +46,15 @@ export default function NotesPage() {
   const { taskMap, openTask } = useWorkspace();
   const [notes, setNotes] = useState<Note[]>([]);
   const [days, setDays] = useState(7);
+  const [showResolved, setShowResolved] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     let alive = true;
-    fetch(`/api/notes?from=${encodeURIComponent(from)}`)
+    fetch(
+      `/api/notes?from=${encodeURIComponent(from)}${showResolved ? "&includeResolved=true" : ""}`,
+    )
       .then((r) => r.json())
       .then((data) => {
         if (!alive) return;
@@ -59,7 +68,31 @@ export default function NotesPage() {
     return () => {
       alive = false;
     };
-  }, [days]);
+  }, [days, showResolved]);
+
+  // Check off / re-open a note, then optimistically reflect it locally.
+  async function toggleResolved(note: Note) {
+    const resolved = !note.resolvedAt;
+    setNotes((prev) =>
+      prev
+        .map((n) =>
+          n.id === note.id
+            ? { ...n, resolvedAt: resolved ? new Date().toISOString() : null }
+            : n,
+        )
+        // If we're not showing resolved, a freshly-checked note drops out.
+        .filter((n) => showResolved || !n.resolvedAt),
+    );
+    try {
+      await fetch(`/api/notes/${note.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolved }),
+      });
+    } catch (e) {
+      console.error("[notes] resolve failed", e);
+    }
+  }
 
   // Group by type (untyped notes fall under FYI).
   const byType = new Map<NoteType, Note[]>();
@@ -92,6 +125,17 @@ export default function NotesPage() {
                 {w.label}
               </button>
             ))}
+            <button
+              onClick={() => setShowResolved((v) => !v)}
+              className={[
+                "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                showResolved
+                  ? "border-accent/30 bg-accent-soft text-accent"
+                  : "border-border text-muted hover:bg-surface-2 hover:text-fg",
+              ].join(" ")}
+            >
+              Show resolved
+            </button>
             <span className="ml-auto text-[11px] text-faint">
               Tip: run the <code>standup</code> prompt in your AI for a written digest.
             </span>
@@ -113,11 +157,22 @@ export default function NotesPage() {
                   <ul className="space-y-1.5">
                     {byType.get(t)!.map((n) => {
                       const code = taskMap[n.taskId]?.code ?? taskMap[n.taskId]?.ref;
+                      const resolved = Boolean(n.resolvedAt);
+                      const resolvable = RESOLVABLE.has(t);
                       return (
                         <li
                           key={n.id}
-                          className="flex items-start gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm"
+                          className={`flex items-start gap-2 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm ${resolved ? "opacity-50" : ""}`}
                         >
+                          {resolvable ? (
+                            <input
+                              type="checkbox"
+                              checked={resolved}
+                              onChange={() => toggleResolved(n)}
+                              className="mt-0.5 shrink-0 cursor-pointer accent-accent"
+                              aria-label={resolved ? "Re-open" : "Mark done"}
+                            />
+                          ) : null}
                           {code ? (
                             <button
                               onClick={() => openTask(n.taskId)}
@@ -126,7 +181,9 @@ export default function NotesPage() {
                               {code}
                             </button>
                           ) : null}
-                          <span className="text-fg">{n.note}</span>
+                          <span className={resolved ? "text-fg line-through" : "text-fg"}>
+                            {n.note}
+                          </span>
                           <span className="ml-auto shrink-0 text-[11px] text-faint">
                             {new Date(n.createdAt).toLocaleDateString()}
                           </span>

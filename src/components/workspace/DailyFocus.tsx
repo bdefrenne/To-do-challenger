@@ -6,7 +6,7 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge, PointsChip } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { daysAgo, formatDue } from "@/lib/format";
-import { STATUS_LABEL } from "@/lib/statuses";
+import { STATUS_LABEL, STATUS_ORDER } from "@/lib/statuses";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 
 /**
@@ -21,8 +21,8 @@ export function DailyFocus() {
   const top = (n: TaskNode) => n.parentId === null;
 
   const working = nodes
-    .filter((n) => top(n) && (n.status === "in-progress" || n.status === "planned"))
-    .sort((a, b) => (a.status === "in-progress" ? -1 : b.status === "in-progress" ? 1 : 0));
+    .filter((n) => top(n) && n.status !== "backlog" && n.status !== "done")
+    .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status));
 
   const doneToday = nodes.filter(
     (n) =>
@@ -135,7 +135,7 @@ function FocusRow({
   onDone: () => void;
   onUnselect: () => void;
 }) {
-  const running = node.status === "in-progress";
+  const running = node.status === "building";
   const due = dueDate ? formatDue(dueDate) : null;
   return (
     <li

@@ -1,18 +1,23 @@
 import type { TaskStatus } from "./types";
 
-/** Display order of status groups in the List (top → bottom). */
+/** Display order of status groups in the List (top → bottom): active first,
+ *  down the process spine, Done last. */
 export const STATUS_ORDER: TaskStatus[] = [
-  "in-progress",
-  "planned",
+  "building",
+  "analyzing",
+  "analyzed",
+  "todo",
   "backlog",
   "done",
 ];
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
-  backlog: "To Do",
-  planned: "Planned",
-  "in-progress": "In Progress",
-  done: "Complete",
+  backlog: "Backlog",
+  todo: "To Do",
+  analyzing: "Analyzing",
+  analyzed: "Analyzed",
+  building: "Building",
+  done: "Done",
 };
 
 /** Tone classes for status pills / group headers (light theme). */
@@ -21,25 +26,39 @@ export const STATUS_TONE: Record<
   { text: string; bg: string; border: string; dot: string; icon: string }
 > = {
   backlog: {
+    text: "text-slate-500",
+    bg: "bg-slate-100",
+    border: "border-slate-200",
+    dot: "bg-slate-300",
+    icon: "○",
+  },
+  todo: {
     text: "text-slate-600",
     bg: "bg-slate-100",
     border: "border-slate-200",
     dot: "bg-slate-400",
-    icon: "○",
+    icon: "◔",
   },
-  planned: {
+  analyzing: {
     text: "text-accent",
     bg: "bg-accent-soft",
     border: "border-accent/25",
     dot: "bg-accent",
-    icon: "◔",
+    icon: "◑",
   },
-  "in-progress": {
+  analyzed: {
+    text: "text-accent",
+    bg: "bg-accent-soft",
+    border: "border-accent/25",
+    dot: "bg-accent",
+    icon: "◕",
+  },
+  building: {
     text: "text-new",
     bg: "bg-new-soft",
     border: "border-new/25",
     dot: "bg-new",
-    icon: "◑",
+    icon: "◐",
   },
   done: {
     text: "text-buff",

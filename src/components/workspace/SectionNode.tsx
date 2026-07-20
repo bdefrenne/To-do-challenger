@@ -17,8 +17,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { Markdown } from "@/components/ui/Markdown";
-import { AvatarStack } from "@/components/PersonAvatar";
+import { useMyPresence, useOthers } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT, Task } from "@/lib/types";
 import {
   type OutlineRow,
@@ -29,10 +28,9 @@ import {
   flattenUnits,
   type TaskUnit,
 } from "@/lib/outline";
-import type { TaskStatus } from "@/lib/types";
+import type { TaskStatus, Importance } from "@/lib/types";
 import { useWorkspace, type DropPos } from "./WorkspaceContext";
-import { QuickAssign } from "./QuickAssign";
-import { QuickStatus } from "./QuickStatus";
+import { TaskCardBody } from "./TaskCardBody";
 import { useCardShortcut } from "./useCardShortcut";
 
 export const NEW_SECTION_SIZE = { width: 420, height: 320 };
@@ -74,6 +72,7 @@ function useSectionUnits(sectionId: string): TaskUnit[] {
 export function SectionNode({
   node,
   selected,
+  smooth = true,
   onPointerDown,
   onPatch,
   onResize,
@@ -84,6 +83,9 @@ export function SectionNode({
 }: {
   node: CanvasNodeT;
   selected: boolean;
+  /** Ease position changes (remote moves). Off while YOU drag it, so your own
+   *  drag stays glued to the cursor with no rubber-banding. */
+  smooth?: boolean;
   /** Canvas drag handle — attach to the header only. */
   onPointerDown: (e: ReactPointerEvent) => void;
   /** Persist node fields — the title (content) and data.boardId. */
@@ -107,6 +109,23 @@ export function SectionNode({
   // by its board — so it starts empty and stays separate from sibling sections.
   const sectionId = node.id;
   const units = useSectionUnits(sectionId);
+
+  // Soft field-lock (presence): while a user authors this section's outline they
+  // publish `editing`, and peers show a lock + can't open the outline — so two
+  // people don't batch-save the same section over each other. Presence is
+  // ephemeral, so the lock auto-releases if their tab closes.
+  const [, updateMyPresence] = useMyPresence();
+  const others = useOthers();
+  const editingPeer = others.find((o) => o.presence.editing?.taskId === sectionId);
+  const remoteEditor = editingPeer
+    ? { name: editingPeer.info?.name ?? "Someone", color: editingPeer.info?.color ?? "#888" }
+    : null;
+  const locked = remoteEditor !== null;
+
+  // Task ids this authoring session is allowed to delete = the section's tasks
+  // when authoring began, plus any it creates. Guards against deleting a task a
+  // PEER adds to this section while we're editing a stale local outline.
+  const knownIdsRef = useRef<Set<string>>(new Set());
 
   const [mode, setMode] = useState<Mode>(boardId ? "committed" : "naming");
   const [rows, setRows] = useState<OutlineRow[]>([]);
@@ -161,6 +180,12 @@ export function SectionNode({
     const seeded = unitsToRows(units);
     const next = seeded.length ? seeded : [newRow(0)];
     savedSigRef.current = contentSig(next); // seeded state is already "saved"
+    // Baseline of deletable ids = the tasks this section has right now.
+    knownIdsRef.current = new Set(
+      flattenUnits(units)
+        .map((f) => f.unit.taskId)
+        .filter((id): id is string => !!id),
+    );
     setRows(next);
     setMode("authoring");
     setFocus({ key: next[next.length - 1].key, caret: next[next.length - 1].text.length });
@@ -352,7 +377,12 @@ export function SectionNode({
         (n) => ws.taskMap[n.id]?.customFields?.sectionId === sectionId,
       );
       const surviving = survivingIds(built);
-      const toDelete = sectionNodes.map((n) => n.id).filter((id) => !surviving.has(id));
+      // Only delete tasks THIS session knows about (baseline + ones it created).
+      // A task a peer added to this section meanwhile isn't in knownIds, so our
+      // stale outline can never delete it.
+      const toDelete = sectionNodes
+        .map((n) => n.id)
+        .filter((id) => knownIdsRef.current.has(id) && !surviving.has(id));
 
       const tag = { sectionId };
       const flat = flattenUnits(built);
@@ -437,6 +467,8 @@ export function SectionNode({
       // Only touches taskId, so the content signature is unchanged → no re-save.
       const idByRow = new Map<string, string>();
       for (const n of flat) if (n.unit.rowKey && n.unit.taskId) idByRow.set(n.unit.rowKey, n.unit.taskId);
+      // Tasks we just created become deletable in later saves of this session.
+      flat.forEach((n) => n.unit.taskId && knownIdsRef.current.add(n.unit.taskId));
       setRows((rs) =>
         rs.map((r) => {
           const id = idByRow.get(r.key);
@@ -488,6 +520,38 @@ export function SectionNode({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Publish a soft outline-lock while authoring this section, so peers see it's
+  // being edited and are blocked from opening it. Cleared on leave/unmount
+  // (Liveblocks also drops it automatically if this tab disconnects).
+  useEffect(() => {
+    if (mode !== "authoring") return;
+    updateMyPresence({ editing: { taskId: sectionId, field: "outline" } });
+    return () => updateMyPresence({ editing: null });
+  }, [mode, sectionId, updateMyPresence]);
+
+  // Live re-sync (realtime): while authoring, pull in peers' task edits — but
+  // ONLY when our outline has no unsaved changes AND we aren't focused in it, so
+  // we never clobber in-flight typing or steal the caret. This is why text mode
+  // now reflects other users' updates instead of showing a frozen snapshot.
+  useEffect(() => {
+    if (mode !== "authoring") return;
+    if (contentSig(rowsRef.current) !== savedSigRef.current) return; // dirty
+    const active = document.activeElement;
+    const focusedHere = [...inputRefs.current.values()].some((el) => el === active);
+    if (focusedHere) return;
+    const seeded = unitsToRows(units);
+    const next = seeded.length ? seeded : [newRow(0)];
+    const nextSig = contentSig(next);
+    if (nextSig === savedSigRef.current) return; // nothing new upstream
+    savedSigRef.current = nextSig; // adopt as the new clean baseline (no re-save)
+    knownIdsRef.current = new Set(
+      flattenUnits(units)
+        .map((f) => f.unit.taskId)
+        .filter((id): id is string => !!id),
+    );
+    setRows(next);
+  }, [units, mode]);
+
   /* ---------------- binding (naming) ---------------- */
   const bindBoard = (id: string, name: string) => {
     onPatch({ content: name, data: { ...(node.data ?? {}), boardId: id } });
@@ -496,6 +560,7 @@ export function SectionNode({
     requestAnimationFrame(() => {
       const seed = [newRow(0)];
       savedSigRef.current = contentSig(seed);
+      knownIdsRef.current = new Set(); // brand-new section: nothing to delete
       setRows(seed);
       setMode("authoring");
       setFocus(null);
@@ -588,6 +653,11 @@ export function SectionNode({
         width: node.width,
         height: "auto",
         minHeight: MIN_SECTION_HEIGHT,
+        // Glide to new positions when the move came from someone else.
+        transition: smooth ? "left 90ms linear, top 90ms linear" : undefined,
+        // A peer editing this section's outline gets a ring in their color.
+        outline: remoteEditor ? `2px solid ${remoteEditor.color}` : undefined,
+        outlineOffset: 2,
       }}
       className={[
         "group/section flex flex-col overflow-hidden rounded-xl border-2 bg-surface shadow-sm",
@@ -608,6 +678,15 @@ export function SectionNode({
             aria-label="Saving"
             className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-faint border-t-transparent"
           />
+        ) : null}
+        {remoteEditor ? (
+          <span
+            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+            style={{ backgroundColor: remoteEditor.color }}
+            title={`${remoteEditor.name} is editing this section`}
+          >
+            ✎ {remoteEditor.name}
+          </span>
         ) : null}
         {/* Send-to-master: shown on non-master sections that have a master on
             the same board. Hover-revealed, like the canvas-index card's ✕. */}
@@ -638,8 +717,9 @@ export function SectionNode({
             </ViewToggleBtn>
             <ViewToggleBtn
               active={mode === "authoring"}
-              onClick={() => mode !== "authoring" && enterAuthoring()}
-              title="Outline"
+              disabled={locked}
+              onClick={() => mode !== "authoring" && !locked && enterAuthoring()}
+              title={locked ? `${remoteEditor?.name} is editing this section` : "Outline"}
             >
               ≣
             </ViewToggleBtn>
@@ -688,8 +768,9 @@ export function SectionNode({
             onToggle={ws.toggleDone}
             onStatus={ws.setStatus}
             onAssign={ws.editTask}
+            onImportance={(id, v) => ws.editTask(id, { importance: v })}
             onMove={ws.moveNode}
-            onAdd={enterAuthoring}
+            onAdd={() => !locked && enterAuthoring()}
           />
         )}
       </div>
@@ -702,11 +783,13 @@ function ViewToggleBtn({
   active,
   onClick,
   title,
+  disabled = false,
   children,
 }: {
   active: boolean;
   onClick: () => void;
   title: string;
+  disabled?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -714,12 +797,14 @@ function ViewToggleBtn({
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => {
         e.stopPropagation();
-        onClick();
+        if (!disabled) onClick();
       }}
+      disabled={disabled}
       title={title}
       className={[
         "grid h-5 w-5 place-items-center rounded text-xs transition-colors",
         active ? "bg-accent-soft text-accent" : "text-faint hover:text-fg",
+        disabled ? "cursor-not-allowed opacity-40" : "",
       ].join(" ")}
     >
       {children}
@@ -862,6 +947,7 @@ interface CardHandlers {
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
+  onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   dropHint: { id: string; pos: "before" | "after" } | null;
   setDropHint: (h: { id: string; pos: "before" | "after" } | null) => void;
@@ -874,12 +960,17 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   const t = id ? h.taskMap[id] : undefined;
   const done = t?.status === "done";
   // "D" on the hovered card toggles done: not-done → done (via the checkbox's
-  // old /complete path), done → in-progress (setStatus clears completedAt).
+  // old /complete path), done → building (setStatus clears completedAt).
   useCardShortcut(cardRef, "d", () => {
     if (!id) return;
-    if (done) h.onStatus(id, "in-progress");
+    if (done) h.onStatus(id, "building");
     else h.onToggle(id);
   });
+  // "1" / "2" / "3" on the hovered card set importance directly (Elevated / High
+  // / Critical) — the number shortcuts alongside "I"'s full picker.
+  useCardShortcut(cardRef, "1", () => id && h.onImportance(id, 1));
+  useCardShortcut(cardRef, "2", () => id && h.onImportance(id, 2));
+  useCardShortcut(cardRef, "3", () => id && h.onImportance(id, 3));
   if (!id || !t) return null;
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
   const half = (e: React.DragEvent) => {
@@ -910,36 +1001,20 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
           h.setDropHint(null);
           if (dragId && dragId !== id) h.onMove(dragId, id, pos);
         }}
+        // The whole card is the open target (not just the title). Interactive
+        // children — QuickStatus/QuickAssign triggers, the title button — stop
+        // their own clicks from bubbling here, so they don't also open the task.
+        onClick={() => h.onOpen(id)}
         className={[
-          "group/card rounded-lg border border-border bg-surface px-2 py-1.5",
+          "group/card cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
+          done
+            ? "border-buff/40 bg-buff-soft hover:border-buff/60"
+            : "border-border bg-surface hover:border-border-strong hover:bg-surface-2",
           hint === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
           hint === "after" ? "shadow-[inset_0_-2px_0_0_var(--color-accent)]" : "",
         ].join(" ")}
       >
-        <div className="min-w-0 flex-1">
-          <button
-            onClick={() => h.onOpen(id)}
-            className={[
-              "block w-full truncate text-left text-sm",
-              done ? "text-faint line-through" : "text-fg",
-            ].join(" ")}
-          >
-            {t.title}
-          </button>
-          {t.description ? (
-            <div className="mt-0.5 line-clamp-2 text-xs italic text-muted">
-              <Markdown>{t.description}</Markdown>
-            </div>
-          ) : null}
-          <div className="mt-1 flex items-center gap-2">
-            {t.assigneeIds?.length ? <AvatarStack ids={t.assigneeIds} size={18} /> : null}
-            {/* Hover-only controls: status (S) + assign (A). Done is toggled with D. */}
-            <div className="ml-auto flex items-center gap-1">
-              <QuickStatus status={t.status} onChange={(s) => h.onStatus(id, s)} />
-              <QuickAssign taskId={id} assigneeIds={t.assigneeIds ?? []} onChange={h.onAssign} />
-            </div>
-          </div>
-        </div>
+        <TaskCardBody task={t} h={h} />
       </div>
       {unit.children.length ? (
         <div className="mt-1.5 space-y-1.5">
@@ -959,6 +1034,7 @@ function CommittedList({
   onToggle,
   onStatus,
   onAssign,
+  onImportance,
   onMove,
   onAdd,
 }: {
@@ -968,6 +1044,7 @@ function CommittedList({
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
+  onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   onAdd: () => void;
 }) {
@@ -984,7 +1061,7 @@ function CommittedList({
     );
   }
 
-  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onMove, dropHint, setDropHint };
+  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, dropHint, setDropHint };
   return (
     <div className="space-y-1.5">
       {units.map((u) => (

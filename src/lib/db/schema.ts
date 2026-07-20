@@ -345,8 +345,10 @@ export const projectMembers = pgTable(
 /* ---- Enums (mirror the string unions in types.ts) ---- */
 export const taskStatus = pgEnum("task_status", [
   "backlog",
-  "planned",
-  "in-progress",
+  "todo",
+  "analyzing",
+  "analyzed",
+  "building",
   "done",
 ]);
 
@@ -419,6 +421,9 @@ export const tasks = pgTable(
     value: smallint("value"),
     /** Fibonacci effort points (1/2/3/5/8) — the "difficulty" axis. */
     difficulty: smallint("difficulty"),
+    /** Importance ladder: 3 Critical · 2 High · 1 Elevated · 0 Normal
+     *  (default) · -1 Low · -2 Icebox. Most tasks stay Normal. */
+    importance: smallint("importance").notNull().default(0),
     /** Which board this task lives on (null = unassigned / no board yet). */
     boardId: text("board_id").references(() => boards.id, {
       onDelete: "cascade",
@@ -442,11 +447,9 @@ export const tasks = pgTable(
     refLocked: boolean("ref_locked").notNull().default(false),
     /** When the code was locked. */
     lockedAt: timestamp("locked_at", { withTimezone: true }),
-    /* ---- Lifecycle timestamps (informational, non-gating) ----
-       Just `analyzedAt` (optional — set when analysis is done). Progress lives
-       in the kanban `status`; we don't track when analysis/work "started". */
-    analyzedAt: timestamp("analyzed_at", { withTimezone: true }),
-    /* ---- Revisable summaries (rewritten in place; decisions/notes are logs) ---- */
+    /* ---- Revisable free-text fields (rewritten in place; decisions/notes are
+       logs). Labels in the UI: Analysis / Technical Plan / Summary. The process
+       stage lives in `status` — no separate analyzedAt timestamp. ---- */
     analysisSummary: text("analysis_summary"),
     plan: text("plan"),
     summary: text("summary"),
@@ -533,8 +536,10 @@ export const taskAttachments = pgTable(
    One log for everything worth remembering on a task — from a human or the AI.
    `type` says what kind: a `decision` (a choice made, optionally with a "Why"),
    or a standup-worthy callout (`progress` / `milestone` / `blocker` /
-   `question` / `fyi`). `tags` are free-form labels (e.g. a decision's old
-   category like "technical"). Deliberately NOT graded — no retro/outcome. */
+   `question` / `fyi`), or a `review` (something to visually double-check
+   later). `tags` are free-form labels (e.g. a decision's old category like
+   "technical"). Deliberately NOT graded — no retro/outcome. Transient notes can
+   be checked off via `resolvedAt`. */
 export const noteType = pgEnum("note_type", [
   "decision",
   "progress",
@@ -542,6 +547,7 @@ export const noteType = pgEnum("note_type", [
   "blocker",
   "question",
   "fyi",
+  "review",
 ]);
 
 export const taskNotes = pgTable(
@@ -563,6 +569,10 @@ export const taskNotes = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    // When set, the note has been "checked off" — resolved and dropped from the
+    // live Notes view + standup. Transient notes (review/blocker/question) use
+    // this; permanent ones (decision/milestone) just leave it null.
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   },
   (t) => [
     index("task_notes_task_idx").on(t.taskId),
@@ -611,6 +621,7 @@ export const canvasNodeKind = pgEnum("canvas_node_kind", [
   "text",
   "frame",
   "section",
+  "draw",
 ]);
 
 export const canvases = pgTable(

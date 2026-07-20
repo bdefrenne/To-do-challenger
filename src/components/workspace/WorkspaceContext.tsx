@@ -35,6 +35,9 @@ import type {
 /** Position of a drop relative to the target row. */
 export type DropPos = "before" | "after" | "inside";
 
+/** Which handoff prompt to copy — see `src/lib/prompts.ts`. */
+export type PromptKind = "analyze" | "work" | "analyze-work";
+
 /** Ordered tree node: parentId = nesting, position = order within group. */
 export interface TaskNode {
   id: string;
@@ -69,8 +72,14 @@ interface WorkspaceContextValue {
   toggleDone: (id: string) => void;
   setStatus: (id: string, status: TaskStatus) => void;
   /** Edit content fields (title/description/…); guarded against concurrent
-   *  writes via If-Match — a conflict surfaces `notice` and reloads. */
+   *  writes via If-Match — a conflict surfaces `notice` and reloads. Persists
+   *  immediately; use for discrete edits (assignees, dates, one-shot title). */
   editTask: (id: string, patch: TaskEdit) => void;
+  /** Live edit for high-frequency text (description/title while typing): instant
+   *  to peers, Postgres write batched ~10s (or flushed via `flushEdits`). */
+  editTaskLive: (id: string, patch: TaskEdit) => void;
+  /** Force-write any pending batched edits now (call on blur / before close). */
+  flushEdits: () => Promise<void>;
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
@@ -80,11 +89,16 @@ interface WorkspaceContextValue {
   addComment: (id: string, message: string) => Promise<void>;
   /** Lock the task's code (freeze it) and return a ready-to-paste work prompt. */
   lockTask: (id: string) => Promise<string>;
+  /** Return a ready-to-paste handoff prompt by kind. Every kind locks the code
+   *  first (the analyze handoff is the first commitment). */
+  taskPrompt: (id: string, kind: PromptKind) => Promise<string>;
   /** Add a note to a task (decision or standup callout), then reload its detail. */
   addNote: (
     id: string,
     input: { note: string; type?: NoteType; tags?: string[] },
   ) => Promise<void>;
+  /** Check off (resolve) or re-open a note on a task. */
+  resolveNote: (taskId: string, noteId: string, resolved: boolean) => Promise<void>;
   /** Edit workflow summary fields (analysisSummary / plan / summary). */
   editWorkflow: (
     id: string,
@@ -156,6 +170,15 @@ interface WorkspaceContextValue {
   /** Force-reload tasks + projects now (e.g. after a canvas Section commits a
    *  batch of tasks directly via /api/tasks/bulk, bypassing the mutate layer). */
   refresh: () => Promise<void>;
+  /** Subscribe to LOCAL task-data mutations (the canvas Liveblocks bridge uses
+   *  this to broadcast a "tasks-changed" ping to peers). Returns an unsubscribe. */
+  subscribeLocalChange: (cb: (s: ChangeSignal) => void) => () => void;
+  /** Apply a peer's field delta directly to local state (used by the canvas
+   *  Liveblocks bridge on an incoming `task-patch` room event). */
+  applyRemotePatch: (id: string, patch: TaskEdit) => void;
+  /** Reload task data in response to a PEER's broadcast (debounced; never
+   *  re-emits, so broadcasts don't ping-pong between clients). */
+  refreshFromRemote: () => void;
   /** Transient user-facing message (e.g. a concurrent-edit conflict). */
   notice: string | null;
   clearNotice: () => void;
@@ -169,6 +192,12 @@ interface WorkspaceContextValue {
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
 const POLL_MS = 2000;
+// How long batched text edits sit before being written to Postgres. The canvas
+// stays LIVE meanwhile via delta broadcasts; peers apply them without a DB read.
+const EDIT_FLUSH_MS = 10000;
+// Backstop so a live edit whose author disconnected before flushing doesn't
+// linger in the overlay forever (must exceed EDIT_FLUSH_MS).
+const OVERLAY_TTL_MS = 30000;
 
 /** A partial task edit the client can PATCH. */
 export type TaskEdit = Partial<
@@ -184,10 +213,17 @@ export type TaskEdit = Partial<
     | "customFields"
     | "value"
     | "difficulty"
+    | "importance"
     | "description"
-    | "analyzedAt"
   >
 >;
+
+/** What a local change broadcasts to peers. `refetch` = structural change, peers
+ *  reload from Postgres; `patch` = a batched field delta peers apply directly to
+ *  their taskMap (so the view is live even though the DB write is deferred). */
+export type ChangeSignal =
+  | { kind: "refetch" }
+  | { kind: "patch"; taskId: string; patch: TaskEdit };
 
 /** Human-authored content fields. An edit touching any of these opts into the
  *  If-Match optimistic-concurrency check; positional/status-only writes don't
@@ -297,6 +333,19 @@ export function WorkspaceProvider({
   // cursor against this and only re-fetches the whole list when it moves.
   const lastVersion = useRef<string | null>(null);
 
+  /* ---- Phase 2: batched persistence for high-frequency text edits ---- */
+  // `overlay` = unconfirmed field patches (mine + peers', keyed by task) that are
+  // re-applied after EVERY refetch, so a delayed DB write or an interim poll can
+  // never revert a live edit. Each entry clears once the server value matches it
+  // (or after OVERLAY_TTL_MS, a backstop for a sender that died before flushing).
+  const overlayRef = useRef<Map<string, { patch: TaskEdit; at: number }>>(new Map());
+  // `pendingEdits` = MY edits not yet written to Postgres; flushed on a debounce.
+  const pendingEditsRef = useRef<Map<string, TaskEdit>>(new Map());
+  const editFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latest taskMap for the (possibly delayed) flush's If-Match token.
+  const taskMapRef = useRef<Record<string, Task>>({});
+  useEffect(() => void (taskMapRef.current = taskMap), [taskMap]);
+
   // Mirror of the open-modal stack so the (never re-armed) poll closure can
   // refresh every open task's thread when the cursor moves — no interval re-arm.
   const openTaskIdsRef = useRef<string[]>([]);
@@ -339,6 +388,24 @@ export function WorkspaceProvider({
         })),
       );
       const map = Object.fromEntries(tasks.map((t) => [t.id, t as Task]));
+      // Re-apply unconfirmed live edits (Phase 2) so a deferred DB write or an
+      // interim poll never reverts them; drop each once the server reflects it.
+      const now = Date.now();
+      for (const [id, entry] of overlayRef.current) {
+        const server = map[id];
+        const applied =
+          server &&
+          Object.entries(entry.patch).every(
+            ([k, v]) =>
+              JSON.stringify((server as unknown as Record<string, unknown>)[k]) ===
+              JSON.stringify(v),
+          );
+        if (!server || applied || now - entry.at > OVERLAY_TTL_MS) {
+          overlayRef.current.delete(id);
+        } else {
+          map[id] = { ...server, ...entry.patch };
+        }
+      }
       setTaskMap(map);
       return map;
     } catch (e) {
@@ -376,6 +443,45 @@ export function WorkspaceProvider({
       })
       .catch((e) => console.error("[workspace] failed to load task detail", e));
   }, []);
+
+  /* ---- Cross-client "task data changed" signal (realtime hot path) ---- */
+  // Local mutations notify subscribers; the canvas Liveblocks bridge broadcasts
+  // them to peers in the room so their view updates instantly (vs the ≤2s poll).
+  const localChangeListeners = useRef(new Set<(s: ChangeSignal) => void>());
+  const subscribeLocalChange = useCallback((cb: (s: ChangeSignal) => void) => {
+    localChangeListeners.current.add(cb);
+    return () => void localChangeListeners.current.delete(cb);
+  }, []);
+  const emitLocalChange = useCallback((signal: ChangeSignal = { kind: "refetch" }) => {
+    localChangeListeners.current.forEach((cb) => cb(signal));
+  }, []);
+
+  // Apply a peer's field delta directly to our taskMap (no DB read) and hold it
+  // in the overlay so an interim refetch can't revert it before the peer's write
+  // lands. Never persists — the author owns the eventual Postgres write.
+  const applyRemotePatch = useCallback((id: string, patch: TaskEdit) => {
+    overlayRef.current.set(id, { patch: { ...(overlayRef.current.get(id)?.patch ?? {}), ...patch }, at: Date.now() });
+    setTaskMap((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...patch } } : prev));
+  }, []);
+
+  // Reload triggered by a PEER's broadcast. Mirrors the poll body but is
+  // debounced (coalesce bursts) and NEVER emits — otherwise A→B→A broadcasts
+  // would ping-pong forever. Skips while a local mutation is in flight (its own
+  // finally-refetch reconciles to the latest anyway).
+  const remoteRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshFromRemote = useCallback(() => {
+    if (remoteRefreshTimer.current) clearTimeout(remoteRefreshTimer.current);
+    remoteRefreshTimer.current = setTimeout(() => {
+      remoteRefreshTimer.current = null;
+      if (inflight.current !== 0) return;
+      Promise.all([fetchAll(), fetchProjects()])
+        .then(() => {
+          openTaskIdsRef.current.forEach((id) => loadLogs(id));
+          return refreshVersion();
+        })
+        .catch((e) => console.error("[workspace] remote refresh failed", e));
+    }, 150);
+  }, [fetchAll, fetchProjects, refreshVersion, loadLogs]);
 
   // Initial load, then poll a tiny change-cursor (not the whole list) and
   // only re-fetch when it moves. Plus revalidate-on-focus.
@@ -453,9 +559,11 @@ export function WorkspaceProvider({
         // Our own write moved the cursor; sync it so the next poll tick
         // doesn't see a "change" and re-fetch redundantly.
         await refreshVersion();
+        // Tell peers in the canvas room to refresh now (hot path).
+        emitLocalChange();
       }
     },
-    [fetchAll, refreshVersion],
+    [fetchAll, refreshVersion, emitLocalChange],
   );
 
   /** Like `mutate`, but for project/board changes — reconciles the sidebar. */
@@ -470,9 +578,10 @@ export function WorkspaceProvider({
         inflight.current--;
         await Promise.all([fetchProjects(), fetchAll()]);
         await refreshVersion();
+        emitLocalChange();
       }
     },
-    [fetchProjects, fetchAll, refreshVersion],
+    [fetchProjects, fetchAll, refreshVersion, emitLocalChange],
   );
 
   /* ---- Status changes ---- */
@@ -489,7 +598,9 @@ export function WorkspaceProvider({
    * task first. Status-only patches send no header → last-write-wins.
    */
   function patchTask(id: string, patch: TaskEdit) {
-    const token = taskMap[id]?.updatedAt;
+    // Read the token from the ref, not the render's taskMap — a batched flush can
+    // fire seconds later and must send the LATEST updatedAt to avoid a false 409.
+    const token = taskMapRef.current[id]?.updatedAt;
     const guarded = token && CONTENT_FIELDS.some((f) => f in patch);
     return api(`/api/tasks/${id}`, {
       method: "PATCH",
@@ -509,18 +620,79 @@ export function WorkspaceProvider({
     );
   }
 
+  /** Write all pending batched edits to Postgres now, cancelling the debounce.
+   *  Called on the timer, on blur/close (via context), and when the tab hides. */
+  const flushEdits = useCallback(async () => {
+    if (editFlushTimer.current) {
+      clearTimeout(editFlushTimer.current);
+      editFlushTimer.current = null;
+    }
+    const edits = [...pendingEditsRef.current.entries()];
+    if (!edits.length) return;
+    pendingEditsRef.current.clear();
+    inflight.current++;
+    try {
+      await Promise.all(edits.map(([id, patch]) => patchTask(id, patch)));
+    } catch (e) {
+      console.error("[workspace] edit flush failed", e);
+      if (e instanceof ApiError && e.status === 409)
+        setNotice("This task changed elsewhere — reloaded with the latest version.");
+    } finally {
+      inflight.current--;
+      await fetchAll(); // overlay reconciles: confirmed patches drop out
+      await refreshVersion();
+      emitLocalChange(); // peers refetch the now-persisted state
+    }
+    // patchTask is a stable hoisted declaration reading refs — no dep needed.
+  }, [fetchAll, refreshVersion, emitLocalChange]);
+
+  const scheduleEditFlush = useCallback(() => {
+    if (editFlushTimer.current) clearTimeout(editFlushTimer.current);
+    editFlushTimer.current = setTimeout(() => void flushEdits(), EDIT_FLUSH_MS);
+  }, [flushEdits]);
+
+  /** Live edit for high-frequency text (title/description): apply optimistically,
+   *  broadcast the delta so peers update instantly, and DEFER the Postgres write
+   *  (batched ~10s / flushed on blur/close). Contrast `editTask`, which persists
+   *  immediately — use this only for fields that change on every keystroke. */
+  function editTaskLive(id: string, patch: TaskEdit) {
+    overlayRef.current.set(id, {
+      patch: { ...(overlayRef.current.get(id)?.patch ?? {}), ...patch },
+      at: Date.now(),
+    });
+    setTaskMap((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...patch } } : prev));
+    emitLocalChange({ kind: "patch", taskId: id, patch });
+    pendingEditsRef.current.set(id, { ...(pendingEditsRef.current.get(id) ?? {}), ...patch });
+    scheduleEditFlush();
+  }
+
+  // Durability for batched edits: persist immediately when the tab is hidden
+  // (covers tab-switch / close in most browsers) and best-effort on unload.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState === "hidden") void flushEdits();
+    };
+    const onUnload = () => void flushEdits();
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [flushEdits]);
+
   function start(id: string) {
-    if (nodes.find((n) => n.id === id)?.status === "in-progress") return;
+    if (nodes.find((n) => n.id === id)?.status === "building") return;
     mutate(
-      () => patchStatusLocal(id, "in-progress"),
-      () => patchTask(id, { status: "in-progress" }),
+      () => patchStatusLocal(id, "building"),
+      () => patchTask(id, { status: "building" }),
     );
   }
 
   function toggleDone(id: string) {
     const nowDone = nodes.find((n) => n.id === id)?.status !== "done";
     mutate(
-      () => patchStatusLocal(id, nowDone ? "done" : "planned"),
+      () => patchStatusLocal(id, nowDone ? "done" : "todo"),
       () => api(`/api/tasks/${id}/complete`, { method: "POST", body: JSON.stringify({ done: nowDone }) }),
     );
   }
@@ -817,6 +989,7 @@ export function WorkspaceProvider({
     });
     await fetchAll();
     await refreshVersion();
+    emitLocalChange();
     openTask(task.id);
   }
 
@@ -874,6 +1047,19 @@ export function WorkspaceProvider({
     return res.prompt;
   }
 
+  // Return a handoff prompt by kind. "work"/"analyze-work" lock the code
+  // server-side, so merge the returned task back (its code may have hardened).
+  async function taskPrompt(id: string, kind: PromptKind): Promise<string> {
+    const res = await api<{ task: Task; prompt: string }>(
+      `/api/tasks/${id}/prompt`,
+      { method: "POST", body: JSON.stringify({ kind }) },
+    );
+    setTaskMap((prev) =>
+      prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
+    );
+    return res.prompt;
+  }
+
   // Optimistically append a temp row (rendered with a small "saving" spinner),
   // POST it, then reload so the temp entry is replaced by the server row.
   async function addNote(
@@ -906,6 +1092,26 @@ export function WorkspaceProvider({
         }),
     );
     loadLogs(id);
+  }
+
+  // Optimistically flip a note's resolvedAt, PATCH it, then reconcile.
+  async function resolveNote(taskId: string, noteId: string, resolved: boolean) {
+    const now = new Date().toISOString();
+    await mutate(
+      () =>
+        setNotes((prev) => ({
+          ...prev,
+          [taskId]: (prev[taskId] ?? []).map((n) =>
+            n.id === noteId ? { ...n, resolvedAt: resolved ? now : null } : n,
+          ),
+        })),
+      () =>
+        api(`/api/notes/${noteId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ resolved }),
+        }),
+    );
+    loadLogs(taskId);
   }
 
   async function editWorkflow(
@@ -975,13 +1181,17 @@ export function WorkspaceProvider({
         toggleDone,
         setStatus,
         editTask,
+        editTaskLive,
+        flushEdits,
         moveNode,
         dropToGroup,
         moveToBoard,
         addTask,
         addComment,
         lockTask,
+        taskPrompt,
         addNote,
+        resolveNote,
         editWorkflow,
         addAttachment,
         removeAttachment,
@@ -997,7 +1207,11 @@ export function WorkspaceProvider({
         refresh: async () => {
           await Promise.all([fetchAll(), fetchProjects()]);
           await refreshVersion();
+          emitLocalChange();
         },
+        subscribeLocalChange,
+        applyRemotePatch,
+        refreshFromRemote,
         notice,
         clearNotice: () => setNotice(null),
         projectSettingsId,

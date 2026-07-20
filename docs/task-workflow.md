@@ -5,7 +5,14 @@ analyzed, worked, and finished with a summary that captures **everything** that
 actually shipped — including scope that was added along the way without its own
 task.
 
-This is the design spec. It describes intended behavior, not what's built yet.
+This is the original design spec (the "why"). It describes a richer model than
+what shipped — notably a separate *derived phase* alongside `status`, extra
+lifecycle timestamps (`analysisStartedAt`/`workStartedAt`), and a standalone
+graded decisions table. **What actually shipped is simpler and is the source of
+truth: see [task-flow.md](./task-flow.md).** In short: `status` *is* the process
+spine (`Backlog → To Do → Analyzing → Analyzed → Building → Done`) — there is no
+separate phase — decisions are just `add_note type:"decision"`, and the code
+locks when a task enters Analyzing.
 
 ---
 
@@ -151,19 +158,17 @@ cross-task, filterable table.
 
 ---
 
-## Derived phase (for reference)
+## Process spine (as shipped — supersedes the "derived phase" idea above)
 
-| Phase        | Condition                                             |
-| ------------ | ----------------------------------------------------- |
-| Draft        | code still soft (`*`)                                 |
-| Ready        | locked, no `analysisStartedAt`                        |
-| Analyzing    | `analysisStartedAt` set, `analyzedAt` not             |
-| Analyzed     | `analyzedAt` set, `workStartedAt` not                 |
-| Working      | `workStartedAt` set, `completedAt` not                |
-| Done         | `completedAt` set                                     |
+There is **one axis**: `status`. It *is* the process — no separate derived
+phase.
 
-`status` (backlog / planned / in-progress / done) is independent — a task can
-be, say, `in-progress` status while in the Analyzing phase.
+    Backlog → To Do → Analyzing → Analyzed → Building → Done
+
+The code locks (`GH-20*` → `GH-20`) the moment a task enters **Analyzing** (the
+first handoff), by any path — the picker, an AI `update_task`, or a Copy-prompt.
+Done is reached via `complete_task` (keeps `completedAt` honest); the picker
+itself stops at Building.
 
 ---
 

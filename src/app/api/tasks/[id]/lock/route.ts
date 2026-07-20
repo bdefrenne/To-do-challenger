@@ -7,27 +7,10 @@
 import { NextRequest } from "next/server";
 import { route, json, error, type AuthedCtx } from "@/lib/api";
 import { mintRef } from "@/lib/db/service";
+import { workPrompt } from "@/lib/prompts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/**
- * The clipboard prompt — a slim handoff that points at the canonical workflow
- * contract (MCP server instructions / the todo://workflow resource) rather than
- * restating it, so it can't drift from the source of truth. Kept self-sufficient
- * for a client that has only the todo tools connected.
- */
-function workPrompt(code: string, title: string): string {
-  return (
-    `I want you to work on task ${code} — "${title}" using the "todo" MCP.\n\n` +
-    `Start with get_task to load full context, and follow the todo workflow ` +
-    `contract — it's in the MCP server instructions and the todo://workflow ` +
-    `resource (read it if you haven't). In short: reference ${code} in every ` +
-    `commit and link_commit each sha, add_note for important decisions or ` +
-    `standup-worthy updates (when I ask), and run the finish protocol (reconcile ` +
-    `the git diff, write the summary from what shipped, mark done) when we're done.`
-  );
-}
 
 export const POST = route(async (_req: NextRequest, ctx: AuthedCtx) => {
   const { id } = await ctx.params;

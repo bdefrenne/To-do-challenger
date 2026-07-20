@@ -1,6 +1,7 @@
 /*
   /api/notes
-    GET — team notes across ALL the user's tasks (?type, ?from, ?to, ?taskId).
+    GET — team notes across ALL the user's tasks (?type, ?from, ?to, ?taskId,
+          ?includeResolved). Open notes only unless includeResolved=true.
           Powers the Notes page + standup.
 */
 
@@ -19,6 +20,7 @@ export const GET = route(async (req: NextRequest, { userId }: AuthedCtx) => {
     type: (sp.get("type") as NoteType | null) ?? undefined,
     from: sp.get("from") ?? undefined,
     to: sp.get("to") ?? undefined,
+    includeResolved: sp.get("includeResolved") === "true",
   };
   const notes = await listNotes(userId, filter);
   return json({ count: notes.length, notes });

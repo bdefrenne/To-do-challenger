@@ -55,7 +55,7 @@ export function AvatarStack({
       {shown.map((id, i) => {
         const p = resolveById(id);
         return (
-          <span key={`${id}-${i}`} style={{ marginLeft: i === 0 ? 0 : -size * 0.3 }}>
+          <span key={`${id}-${i}`} style={{ marginLeft: i === 0 ? 0 : -size * 0.2 }}>
             <Avatar
               name={p?.name ?? "?"}
               size={size}
@@ -73,7 +73,7 @@ export function AvatarStack({
             width: size,
             height: size,
             fontSize: size * 0.38,
-            marginLeft: -size * 0.3,
+            marginLeft: -size * 0.2,
             boxShadow: "0 0 0 2px var(--color-surface)",
           }}
         >

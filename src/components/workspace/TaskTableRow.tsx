@@ -62,7 +62,7 @@ export function TaskTableRow({
   const [pos, setPos] = useState<DropPos | null>(null);
   const done = node.status === "done";
   const isDragging = draggingId === node.id;
-  const inProgress = node.status === "in-progress";
+  const inProgress = node.status === "building";
   const due = task.dueDate ? formatDue(task.dueDate) : null;
 
   function zoneFromEvent(e: DragEvent<HTMLDivElement>): DropPos {

@@ -16,7 +16,7 @@ export const TASKS: Task[] = [
   {
     id: "t-1",
     title: "Write the Q3 planning doc",
-    status: "in-progress",
+    status: "building",
     startDate: "2026-07-12",
     dueDate: "2026-07-15",
     value: 8,
@@ -36,7 +36,7 @@ export const TASKS: Task[] = [
       {
         id: "t-1b",
         title: "Pull last quarter's metrics",
-        status: "in-progress",
+        status: "building",
         dueDate: "2026-07-15",
       },
       {
@@ -51,7 +51,7 @@ export const TASKS: Task[] = [
   {
     id: "t-2",
     title: "Review Alex's pull request",
-    status: "planned",
+    status: "todo",
     dueDate: "2026-07-14",
     value: 3,
     difficulty: 2,
@@ -62,14 +62,14 @@ export const TASKS: Task[] = [
   {
     id: "t-3",
     title: "Book the dentist appointment",
-    status: "planned",
+    status: "todo",
     dueDate: "2026-07-14",
     updatedAt: "2026-07-13T18:30:00+02:00",
   },
   {
     id: "t-4",
     title: "Grocery run for the week",
-    status: "planned",
+    status: "todo",
     dueDate: "2026-07-15",
     recurrence: "weekly",
     customFields: { Store: "Whole Foods", Budget: 120 },
@@ -78,14 +78,14 @@ export const TASKS: Task[] = [
       {
         id: "t-4a",
         title: "Make a list from the meal plan",
-        status: "planned",
+        status: "todo",
       },
     ],
   },
   {
     id: "t-5",
     title: "Prep slides for the team demo",
-    status: "planned",
+    status: "todo",
     dueDate: "2026-07-16",
     commentCount: 5,
     updatedAt: "2026-07-13T11:00:00+02:00",

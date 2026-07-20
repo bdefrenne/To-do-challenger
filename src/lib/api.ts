@@ -9,7 +9,14 @@ import { z } from "zod";
 import { AuthError, requireUser } from "./auth";
 
 /* ---- Validation schemas (shared by REST + MCP) ---- */
-export const statusSchema = z.enum(["backlog", "planned", "in-progress", "done"]);
+export const statusSchema = z.enum([
+  "backlog",
+  "todo",
+  "analyzing",
+  "analyzed",
+  "building",
+  "done",
+]);
 export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);
 /** Fibonacci story points used for `value` (payoff) and `difficulty` (effort). */
 export const fibSchema = z.union([
@@ -19,6 +26,12 @@ export const fibSchema = z.union([
   z.literal(5),
   z.literal(8),
 ]);
+/** Importance ladder (priority): 3 Critical … 0 Normal (default) … -2 Icebox. */
+export const importanceSchema = z
+  .number()
+  .int()
+  .min(-2)
+  .max(3) as z.ZodType<-2 | -1 | 0 | 1 | 2 | 3>;
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
 /** Assignee refs — each a user id, email, or display name; the service
  *  resolves them to account ids on write. */
@@ -40,13 +53,11 @@ export const createTaskSchema = z.object({
   customFields: customFieldsSchema.optional(),
   value: fibSchema.optional(),
   difficulty: fibSchema.optional(),
+  importance: importanceSchema.optional(),
   description: z.string().max(10_000).optional(),
   parentId: z.string().nullable().optional(),
   boardId: z.string().nullable().optional(),
 });
-
-/** An ISO datetime (or null to clear). Lenient — the service normalizes it. */
-const isoDateTime = z.string().min(1).max(40);
 
 export const updateTaskSchema = z
   .object({
@@ -60,13 +71,13 @@ export const updateTaskSchema = z
     customFields: customFieldsSchema,
     value: fibSchema.nullable(),
     difficulty: fibSchema.nullable(),
+    importance: importanceSchema,
     description: z.string().max(10_000).nullable(),
-    /* ---- Workflow: revisable summaries (null clears) ---- */
+    /* ---- Workflow: revisable free-text fields (null clears).
+       UI labels: Analysis / Technical Plan / Summary. ---- */
     analysisSummary: z.string().max(20_000).nullable(),
     plan: z.string().max(20_000).nullable(),
     summary: z.string().max(20_000).nullable(),
-    /* ---- Workflow: lifecycle timestamp (ISO, or null to clear) ---- */
-    analyzedAt: isoDateTime.nullable(),
   })
   .partial();
 
@@ -78,12 +89,17 @@ export const noteTypeSchema = z.enum([
   "blocker",
   "question",
   "fyi",
+  "review",
 ]);
 
 export const addNoteSchema = z.object({
   note: z.string().min(1).max(10_000),
   type: noteTypeSchema.nullable().optional(),
   tags: z.array(z.string().min(1).max(60)).max(20).optional(),
+});
+
+export const resolveNoteSchema = z.object({
+  resolved: z.boolean(),
 });
 
 export const linkCommitSchema = z.object({
@@ -256,7 +272,7 @@ export const reorderBoardsSchema = z.object({
 });
 
 /* ---- Canvas / whiteboard ---- */
-const canvasNodeKindSchema = z.enum(["text", "section"]);
+const canvasNodeKindSchema = z.enum(["text", "section", "draw"]);
 const canvasNodeData = z.record(z.string(), z.unknown());
 
 export const createCanvasSchema = z.object({

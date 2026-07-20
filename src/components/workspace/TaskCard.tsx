@@ -1,18 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Task } from "@/lib/types";
-import { PointsChip } from "@/components/ui/Badge";
-import { AvatarStack } from "@/components/PersonAvatar";
-import { formatDue } from "@/lib/format";
+import { TaskCardBody, type TaskCardHandlers } from "./TaskCardBody";
+import { useWorkspace } from "./WorkspaceContext";
+import { useCardShortcut } from "./useCardShortcut";
 
 /** Mime used to carry the dragged task id across kanban columns/boards. */
 export const TASK_DND_MIME = "text/plain";
 
 /**
- * A draggable kanban card. Click opens the task detail modal; drag it onto
- * another column (same or different board) to move it — the drop target reads
- * the id from the drag event.
+ * A draggable kanban card. Renders the SAME body as the canvas Section card
+ * (<TaskCardBody/> — title, description, assignees, hover S/I/A pickers) inside
+ * a kanban-flavored container: click opens the modal, drag onto another column
+ * (same or different board) moves it, and **D** while hovering toggles done.
  */
 export function TaskCard({
   task,
@@ -21,68 +22,48 @@ export function TaskCard({
   task: Task;
   onOpen: () => void;
 }) {
+  const { setStatus, editTask, toggleDone } = useWorkspace();
   const [dragging, setDragging] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const id = task.id;
   const done = task.status === "done";
-  const due = task.dueDate ? formatDue(task.dueDate) : null;
+
+  // "D" on the hovered card toggles done: not-done → done; done → building
+  // (setStatus clears completedAt), mirroring the canvas Section card.
+  useCardShortcut(cardRef, "d", () => {
+    if (done) setStatus(id, "building");
+    else toggleDone(id);
+  });
+
+  const h: TaskCardHandlers = {
+    onOpen: () => onOpen(),
+    onStatus: (tid, s) => setStatus(tid, s),
+    onImportance: (tid, v) => editTask(tid, { importance: v }),
+    onAssign: (tid, patch) => editTask(tid, patch),
+  };
 
   return (
     <div
+      ref={cardRef}
+      data-card
+      data-task-id={id}
       draggable
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData(TASK_DND_MIME, task.id);
+        e.dataTransfer.setData(TASK_DND_MIME, id);
         setDragging(true);
       }}
       onDragEnd={() => setDragging(false)}
       onClick={onOpen}
       className={[
-        "group cursor-pointer rounded-lg border border-border bg-surface p-2.5 text-sm shadow-sm transition-colors hover:border-border-strong",
+        "group/card cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
+        done
+          ? "border-buff/40 bg-buff-soft hover:border-buff/60"
+          : "border-border bg-surface hover:border-border-strong hover:bg-surface-2",
         dragging ? "opacity-40" : "",
       ].join(" ")}
     >
-      <div className="flex items-start gap-2">
-        <span className={`min-w-0 flex-1 ${done ? "text-faint line-through" : "text-fg"}`}>
-          {task.title}
-        </span>
-        <div className="flex shrink-0 items-center gap-1">
-          {task.value != null ? <PointsChip kind="value" points={task.value} /> : null}
-          {task.difficulty != null ? (
-            <PointsChip kind="difficulty" points={task.difficulty} />
-          ) : null}
-        </div>
-      </div>
-
-      <div className="mt-2 flex items-center gap-2 text-xs text-faint">
-        {task.assigneeIds?.length ? (
-          <AvatarStack ids={task.assigneeIds} size={18} />
-        ) : null}
-        {task.recurrence && task.recurrence !== "none" ? (
-          <span title={`Repeats ${task.recurrence}`}>↻</span>
-        ) : null}
-        {task.dependsOn?.length ? (
-          <span title={`${task.dependsOn.length} dependency(ies)`}>⛔ {task.dependsOn.length}</span>
-        ) : null}
-        {due ? (
-          <span
-            className={
-              done
-                ? "text-faint"
-                : due.overdue
-                  ? "font-medium text-nerf"
-                  : due.today
-                    ? "font-medium text-accent"
-                    : "text-muted"
-            }
-          >
-            {due.label}
-          </span>
-        ) : null}
-        {task.commentCount ? (
-          <span className="ml-auto" title={`${task.commentCount} comments`}>
-            💬 {task.commentCount}
-          </span>
-        ) : null}
-      </div>
+      <TaskCardBody task={task} h={h} />
     </div>
   );
 }

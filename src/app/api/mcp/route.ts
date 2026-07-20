@@ -49,6 +49,7 @@ import {
   mintRef,
   addNote,
   listNotes,
+  resolveNote,
   linkCommit,
   standup,
   listCanvases,
@@ -83,7 +84,14 @@ const currentUser = (): string => {
   return uid;
 };
 
-const statusEnum = z.enum(["backlog", "planned", "in-progress", "done"]);
+const statusEnum = z.enum([
+  "backlog",
+  "todo",
+  "analyzing",
+  "analyzed",
+  "building",
+  "done",
+]);
 const recurrenceEnum = z.enum(["none", "daily", "weekly", "monthly"]);
 /** Fibonacci points for value (payoff) and difficulty (effort). */
 const fibEnum = z.union([
@@ -93,6 +101,16 @@ const fibEnum = z.union([
   z.literal(5),
   z.literal(8),
 ]);
+/** Importance/priority ladder: 3 Critical, 2 High, 1 Elevated, 0 Normal
+ *  (default), -1 Low, -2 Icebox. */
+const importanceArg = z
+  .number()
+  .int()
+  .min(-2)
+  .max(3)
+  .describe(
+    "Importance/priority: 3 Critical · 2 High · 1 Elevated · 0 Normal (default) · -1 Low · -2 Icebox. Most tasks stay 0.",
+  ) as z.ZodType<-2 | -1 | 0 | 1 | 2 | 3>;
 const assigneeIdsArg = z
   .array(z.string().max(120))
   .max(20)
@@ -105,7 +123,6 @@ const customFieldsArg = z.record(
   z.union([z.string(), z.number(), z.boolean()]),
 );
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
-const isoDateTime = z.string().min(1).max(40);
 const noteTypeEnum = z.enum([
   "decision",
   "progress",
@@ -113,6 +130,7 @@ const noteTypeEnum = z.enum([
   "blocker",
   "question",
   "fyi",
+  "review",
 ]);
 
 /** MCP-authored changes are attributed to "Claude" in the activity log. */
@@ -228,7 +246,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects).",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects).",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -240,6 +258,7 @@ const handler = createMcpHandler(
         customFields: customFieldsArg.optional(),
         value: fibEnum.optional(),
         difficulty: fibEnum.optional(),
+        importance: importanceArg.optional(),
         description: z.string().max(10_000).optional(),
         parentId: z.string().optional(),
         boardId: z.string().nullable().optional(),
@@ -250,7 +269,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: write the revisable summaries here — `analysisSummary` + `analyzedAt` when analysis is done (analysis is optional; skip it for simple tasks), `plan` when you start building, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, don't just recollect).",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → done); moving to analyzing or beyond locks the code. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, enriched from memory).",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -263,11 +282,11 @@ const handler = createMcpHandler(
         customFields: customFieldsArg.optional(),
         value: fibEnum.nullable().optional(),
         difficulty: fibEnum.nullable().optional(),
+        importance: importanceArg.optional(),
         description: z.string().max(10_000).nullable().optional(),
         analysisSummary: z.string().max(20_000).nullable().optional(),
         plan: z.string().max(20_000).nullable().optional(),
         summary: z.string().max(20_000).nullable().optional(),
-        analyzedAt: isoDateTime.nullable().optional(),
         expectedUpdatedAt: z
           .string()
           .optional()
@@ -381,14 +400,14 @@ const handler = createMcpHandler(
       "Lock (freeze) a task's human code so it's stable to cite in commits — e.g. GH-20* becomes GH-20. Idempotent: locking an already-locked task just returns it. Normally you don't call this directly — the work_on_task prompt locks on handoff — but call it if you're about to commit work referencing a task whose code is still soft (ends with *).",
       { id: z.string() },
       async ({ id }) => {
-        const task = await mintRef(id, currentUser());
+        const task = await mintRef(id, currentUser(), AI_AUTHOR);
         return task ? text({ task }) : text({ error: "Task not found" });
       },
     );
 
     server.tool(
       "add_note",
-      "Add a note to a task — the one log for anything worth remembering. Use it for a `decision` (a choice made — put the 'why' in the note body), or a standup-worthy callout: `progress`, `milestone`, `blocker`, `question`, `fyi`. Don't log reflexively — capture what's actually important, and record decisions when the user asks you to. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
+      "Add a note to a task — the one log for anything worth remembering. Use `decision` ONLY for a SIGNIFICANT choice, and usually only when the user says 'log this…' — never reflexively for small choices (put the 'why' in the note body). Use a standup-worthy callout otherwise: `progress`, `milestone`, `blocker`, `question`, `fyi`. Use `review` ONLY when the user explicitly asks you to flag something for them to visually double-check later — never add review notes on your own initiative. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
       {
         id: z.string(),
         note: z.string().min(1).max(10_000),
@@ -403,16 +422,30 @@ const handler = createMcpHandler(
 
     server.tool(
       "list_notes",
-      "Query notes ACROSS all your tasks — filter by task, type (e.g. decision), or date range. Use for retros ('show our technical decisions'), audits, and the standup digest.",
+      "Query notes ACROSS all your tasks — filter by task, type (e.g. decision), or date range. Returns only OPEN notes unless `includeResolved` is true. Use for retros ('show our technical decisions'), audits, the standup digest, and listing open `review` items to double-check.",
       {
         taskId: z.string().optional(),
         type: noteTypeEnum.optional(),
         from: z.string().max(40).optional(),
         to: z.string().max(40).optional(),
+        includeResolved: z.boolean().optional(),
       },
       async (filter) => {
         const notes = await listNotes(currentUser(), filter);
         return text({ count: notes.length, notes });
+      },
+    );
+
+    server.tool(
+      "resolve_note",
+      "Check off (resolve) or re-open a note by its id — used to clear a transient note (e.g. a `review` item) once it's been handled, so it drops out of the live Notes view and standup. The user owns their review list; only resolve when they ask.",
+      {
+        id: z.string(),
+        resolved: z.boolean().default(true),
+      },
+      async ({ id, resolved }) => {
+        const n = await resolveNote(id, resolved, currentUser());
+        return n ? text({ note: n }) : text({ error: "Note not found" });
       },
     );
 
@@ -1043,7 +1076,7 @@ const handler = createMcpHandler(
       },
       async ({ taskId }) => {
         // Handoff: lock the code so every commit can cite it, then load context.
-        const locked = await mintRef(taskId, currentUser());
+        const locked = await mintRef(taskId, currentUser(), AI_AUTHOR);
         const result = await getTask(taskId, currentUser());
         if (!locked || !result)
           return userMsg(
@@ -1077,7 +1110,7 @@ const handler = createMcpHandler(
             `Task ${taskId} was not found. Please ask me to pick a valid task id or code.`,
           );
         const t = result.task;
-        const since = t.analyzedAt ?? t.createdAt;
+        const since = t.lockedAt ?? t.createdAt;
         const decisionNotes = result.notes.filter((n) => n.type === "decision");
         return userMsg(
           `Let's finish task **${t.code ?? taskId} — ${t.title}** (id: ${taskId}).\n\n` +
@@ -1090,11 +1123,13 @@ const handler = createMcpHandler(
                 : "_(none)_"
             }\n\n` +
             `Run the **Finish** step of the todo workflow contract (in your server ` +
-            `instructions / the \`todo://workflow\` resource): reconcile, don't ` +
-            `recollect. Diff git since${since ? ` (~${since})` : ""} ` +
+            `instructions / the \`todo://workflow\` resource): reconcile against the ` +
+            `repo, enriched from memory. Diff git since${since ? ` (~${since})` : ""} ` +
             `(or the branch point), compare against the plan + decisions above, and ` +
-            `write the \`summary\` from what ACTUALLY shipped. Make sure every commit ` +
-            `referenced **${t.code ?? taskId}**.`,
+            `write the \`summary\` **anchored in what ACTUALLY shipped** (give any ` +
+            `scope added along the way its own line) while adding the context the ` +
+            `diff can't show — the why, key decisions, gotchas, follow-ups. Make ` +
+            `sure every commit referenced **${t.code ?? taskId}**.`,
         );
       },
     );
@@ -1111,7 +1146,7 @@ const handler = createMcpHandler(
         return userMsg(
           `Here's the raw material for a standup covering ${from} → ${to}:\n\n` +
             `${JSON.stringify(data, null, 2)}\n\n` +
-            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, and **Questions**; list what shipped (finished tasks + one-line summaries); and call out any notable decisions. Keep it tight enough to paste into a team channel.`,
+            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, **Questions**, and **To review** (review-type notes still open); list what shipped (finished tasks + one-line summaries); and call out any notable decisions. Keep it tight enough to paste into a team channel.`,
         );
       },
     );

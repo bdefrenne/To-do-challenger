@@ -13,6 +13,7 @@ import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react
 import { Markdown } from "@/components/ui/Markdown";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { SectionNode } from "./SectionNode";
+import { DrawNode } from "./DrawNode";
 export { NEW_SECTION_SIZE } from "./SectionNode";
 
 /** Default geometry for freshly-dropped nodes (canvas units). */
@@ -136,6 +137,7 @@ export function CanvasNode({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const isSection = node.kind === "section";
+  const isDraw = node.kind === "draw";
 
   // Focus + select all the text whenever we enter edit mode, so a double-click
   // re-edit lets you replace the content with the next keystroke (or click once
@@ -199,11 +201,23 @@ export function CanvasNode({
     transition: smooth ? "left 90ms linear, top 90ms linear" : undefined,
   };
 
+  if (isDraw) {
+    return (
+      <DrawNode
+        node={node}
+        selected={selected}
+        smooth={smooth}
+        onPointerDown={onPointerDown}
+      />
+    );
+  }
+
   if (isSection) {
     return (
       <SectionNode
         node={node}
         selected={selected}
+        smooth={smooth}
         onPointerDown={onPointerDown}
         onPatch={onPatch ?? (() => {})}
         onResize={onResize}

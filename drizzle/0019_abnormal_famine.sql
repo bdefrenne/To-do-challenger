@@ -1,0 +1,1 @@
+ALTER TYPE "public"."canvas_node_kind" ADD VALUE 'draw';

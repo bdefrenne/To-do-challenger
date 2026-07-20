@@ -4,8 +4,18 @@
   shape, not a schema lock — swap the mock store for a real API later.
 */
 
-/** ClickUp-style workflow statuses (the List view groups by these). */
-export type TaskStatus = "backlog" | "planned" | "in-progress" | "done";
+/**
+ * The task's single process axis — status *is* the workflow. The List/Kanban
+ * views group by these; the two handoffs are To Do → Analyzing (understand +
+ * plan) and Analyzed → Building (execute). See docs/task-flow.md.
+ */
+export type TaskStatus =
+  | "backlog"
+  | "todo"
+  | "analyzing"
+  | "analyzed"
+  | "building"
+  | "done";
 
 /** How often a task repeats. */
 export type Recurrence = "none" | "daily" | "weekly" | "monthly";
@@ -15,6 +25,13 @@ export type Recurrence = "none" | "daily" | "weekly" | "monthly";
  * `difficulty` (effort) — multiply them for a rough "challenge score".
  */
 export type FibPoints = 1 | 2 | 3 | 5 | 8;
+
+/**
+ * Importance ladder (priority): `3` Critical · `2` High · `1` Elevated ·
+ * `0` Normal (default) · `-1` Low · `-2` Icebox. Higher = more urgent;
+ * negatives deprioritize. See src/lib/importance.ts for labels/tones.
+ */
+export type Importance = -2 | -1 | 0 | 1 | 2 | 3;
 
 /** An open-ended, user-defined field value (the custom-field bag). */
 export type CustomFieldValue = string | number | boolean;
@@ -60,28 +77,19 @@ export interface Project {
   members?: string[];
 }
 
-/**
- * A task's workflow phase, DERIVED from its lifecycle state (never stored).
- * Progress ("am I working on it") lives in the kanban `status`; phase only
- * tracks the analysis lifecycle.
- */
-export type TaskPhase =
-  | "draft" // code still soft (unlocked)
-  | "ready" // locked, not yet analyzed
-  | "analyzed" // analyzedAt set
-  | "done"; // completedAt set
-
 /** A note's type. `decision` = a choice made (optional "Why" in the body);
- *  the rest are standup-worthy callouts. */
+ *  the rest are standup-worthy callouts; `review` = something to visually
+ *  double-check later. */
 export type NoteType =
   | "decision"
   | "progress"
   | "milestone"
   | "blocker"
   | "question"
-  | "fyi";
+  | "fyi"
+  | "review";
 
-/** A note on a task — a decision or a standup-worthy callout. */
+/** A note on a task — a decision, a standup-worthy callout, or a review item. */
 export interface Note {
   id: string;
   taskId: string;
@@ -90,6 +98,8 @@ export interface Note {
   tags: string[];
   author?: string | null;
   createdAt: string; // ISO
+  /** When set, the note has been checked off (resolved). null/undefined = open. */
+  resolvedAt?: string | null; // ISO
 }
 
 /** A git commit linked back to a task. */
@@ -124,13 +134,11 @@ export interface Task {
   code?: string;
   /** The frozen code string once locked (null while soft). */
   ref?: string | null;
-  /** True once the code is locked (frozen) — handoff or first mutation. */
+  /** True once the code is locked (frozen) — locks when status enters
+   *  Analyzing (the first handoff). */
   refLocked?: boolean;
-  /** Derived workflow phase (see TaskPhase) — not the kanban status. */
-  phase?: TaskPhase;
-  /** When analysis was marked done (ISO) — optional, informational. */
-  analyzedAt?: string | null;
-  /** Revisable summaries written across the workflow. */
+  /** Revisable free-text fields written across the workflow (no length limit):
+   *  Analysis (what & why), Technical Plan (how), Summary (what shipped). */
   analysisSummary?: string | null;
   plan?: string | null;
   summary?: string | null;
@@ -156,6 +164,8 @@ export interface Task {
   value?: FibPoints;
   /** Effort points (Fibonacci) — the "difficulty" axis. */
   difficulty?: FibPoints;
+  /** Importance/priority (−2…3, default 0 Normal). See Importance. */
+  importance?: Importance;
   /** Free-text notes shown in the detail modal. */
   description?: string;
   /** Comment count, shown as "💬 N" on the row. */
@@ -172,11 +182,12 @@ export interface Task {
 
 /* ---- Canvas / whiteboard ---- */
 
-/** What a canvas node is: a markdown text block, or a section (a Figma-style
- *  titled board container whose lines are that board's live tasks). The
+/** What a canvas node is: a markdown text block, a section (a Figma-style titled
+ *  board container whose lines are that board's live tasks), or a `draw`
+ *  freehand pen stroke (its sampled points ride in `data`). The
  *  `canvas_node_kind` DB enum still carries a legacy `frame` value (the feature
  *  was removed); nothing writes it, so it never reaches this type. */
-export type CanvasNodeKind = "text" | "section";
+export type CanvasNodeKind = "text" | "section" | "draw";
 
 /** Last-saved pan/zoom of a canvas. Canvas coordinates, not screen pixels. */
 export interface CanvasViewport {

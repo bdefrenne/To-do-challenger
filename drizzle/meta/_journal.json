@@ -127,6 +127,20 @@
       "when": 1784387448489,
       "tag": "0017_backfill_assignee_ids_and_project_owners",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1784462930590,
+      "tag": "0018_romantic_menace",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1784487470999,
+      "tag": "0019_abnormal_famine",
+      "breakpoints": true
     }
   ]
 }

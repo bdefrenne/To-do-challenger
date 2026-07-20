@@ -39,6 +39,10 @@ declare global {
       cursor: { x: number; y: number } | null;
       /** Node ids this user currently has selected. */
       selection: string[];
+      /** The task field this user is currently editing (a soft field-lock), or
+       *  null. Peers highlight it and disable that input so two people don't
+       *  clobber the same field. Ephemeral — auto-released on disconnect. */
+      editing: { taskId: string; field: string } | null;
     };
     Storage: {
       nodes: LiveMap<string, LiveObject<StoredNode>>;
@@ -50,6 +54,14 @@ declare global {
         color: string;
       };
     };
+    /** Fire-and-forget room events so peers update instantly instead of waiting
+     *  for the ≤2s version poll:
+     *   - `tasks-changed`: a structural edit happened — peers refetch from Postgres.
+     *   - `task-patch`: a batched field delta (Phase 2) — peers apply it directly
+     *     to their taskMap without a DB read (the write is deferred ~10s). */
+    RoomEvent:
+      | { type: "tasks-changed" }
+      | { type: "task-patch"; taskId: string; patch: Record<string, Json> };
   }
 }
 

@@ -73,11 +73,11 @@ async function insertTask(
     await db.insert(taskLogs).values({
       taskId: t.id,
       at: new Date(statusSince),
-      kind: t.status === "done" ? "done" : t.status === "in-progress" ? "started" : "moved",
+      kind: t.status === "done" ? "done" : t.status === "building" ? "started" : "moved",
       message:
         t.status === "done"
           ? "Completed"
-          : t.status === "in-progress"
+          : t.status === "building"
             ? "Started"
             : `Moved to ${STATUS_LABEL[t.status]}`,
       author: t.assigneeIds?.[0] ?? "You",

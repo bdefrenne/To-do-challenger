@@ -19,13 +19,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { LiveObject } from "@liveblocks/client";
+import { LiveObject, type Json } from "@liveblocks/client";
 import {
   useStorage,
   useMutation,
   useOthers,
   useUpdateMyPresence,
   useHistory,
+  useBroadcastEvent,
+  useEventListener,
 } from "@liveblocks/react";
 import type { CanvasNode, CanvasNodeKind } from "@/lib/types";
 import type { StoredNode } from "@/liveblocks.config";
@@ -34,8 +36,19 @@ import {
   NEW_TEXT_SIZE,
   NEW_SECTION_SIZE,
 } from "./CanvasNode";
+import {
+  strokePath,
+  DEFAULT_PEN_COLOR,
+  DEFAULT_PEN_WIDTH,
+} from "./DrawNode";
+import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 
-type Tool = "select" | "text" | "section";
+type Tool = "select" | "text" | "section" | "draw" | "erase";
+
+/** Pen palette + widths offered when the pencil is active. */
+const PEN_COLORS = ["#111827", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7"];
+const PEN_WIDTHS = [2, 4, 8];
+
 interface Viewport {
   x: number;
   y: number;
@@ -108,6 +121,24 @@ const loadViewport = (canvasId: string): Viewport => {
   return { x: 0, y: 0, scale: 1 };
 };
 
+interface Pen {
+  color: string;
+  width: number;
+}
+
+const loadPen = (canvasId: string): Pen => {
+  try {
+    const raw = localStorage.getItem(`canvas-pen:${canvasId}`);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (typeof p?.color === "string" && typeof p?.width === "number") return p;
+    }
+  } catch {
+    /* ignore */
+  }
+  return { color: DEFAULT_PEN_COLOR, width: DEFAULT_PEN_WIDTH };
+};
+
 export function CanvasEditor({
   canvasId,
   canvasName,
@@ -119,6 +150,8 @@ export function CanvasEditor({
   const others = useOthers();
   const updateMyPresence = useUpdateMyPresence();
   const history = useHistory();
+  const broadcast = useBroadcastEvent();
+  const { subscribeLocalChange, refreshFromRemote, applyRemotePatch } = useWorkspace();
 
   // useStorage's root is ToJson<Storage>, so `nodes` is a plain readonly
   // record (id → node), not a Map — hence Object.values, not .values().
@@ -144,6 +177,12 @@ export function CanvasEditor({
   // the cursor 1:1 (everyone else sees them glide via the node transition).
   const [draggingIds, setDraggingIds] = useState<Set<string>>(new Set());
 
+  // Freehand pen. `pen` is the current ink (persisted per-user); `drawing` is
+  // the in-flight stroke — a flat [x,y,…] list in canvas coords, shown as a live
+  // preview until pointerup commits it to a `draw` node.
+  const [pen, setPen] = useState<Pen>(() => loadPen(canvasId));
+  const [drawing, setDrawing] = useState<number[] | null>(null);
+
   // Note→task links. `linkDrag` is the in-flight connection (dragging a text
   // note's port toward a task card); `linkLines` are the committed connectors,
   // re-measured each frame from the task cards' live DOM positions.
@@ -167,11 +206,13 @@ export function CanvasEditor({
   const toolRef = useRef(tool);
   const selectedRef = useRef(selected);
   const editingRef = useRef(editingId);
+  const penRef = useRef(pen);
   useEffect(() => void (nodesRef.current = nodes), [nodes]);
   useEffect(() => void (vpRef.current = viewport), [viewport]);
   useEffect(() => void (toolRef.current = tool), [tool]);
   useEffect(() => void (selectedRef.current = selected), [selected]);
   useEffect(() => void (editingRef.current = editingId), [editingId]);
+  useEffect(() => void (penRef.current = pen), [pen]);
 
   // Persist this user's own viewport (per-user, not shared with the room).
   useEffect(() => {
@@ -182,10 +223,41 @@ export function CanvasEditor({
     }
   }, [viewport, canvasId]);
 
+  // Persist the chosen pen (per-user, like the viewport).
+  useEffect(() => {
+    try {
+      localStorage.setItem(`canvas-pen:${canvasId}`, JSON.stringify(pen));
+    } catch {
+      /* ignore */
+    }
+  }, [pen, canvasId]);
+
   // Broadcast our selection so others see what we've grabbed.
   useEffect(() => {
     updateMyPresence({ selection: [...selected] });
   }, [selected, updateMyPresence]);
+
+  // Realtime task-data bridge (hot path). Task content lives in Postgres, not
+  // Liveblocks storage, so a local edit here would otherwise reach peers only
+  // via their ≤2s version poll. Instead: when THIS client mutates task data,
+  // ping the room; when a peer pings, refresh our task data immediately.
+  useEffect(
+    () =>
+      subscribeLocalChange((signal) => {
+        if (signal.kind === "patch")
+          broadcast({
+            type: "task-patch",
+            taskId: signal.taskId,
+            patch: signal.patch as Record<string, Json>,
+          });
+        else broadcast({ type: "tasks-changed" });
+      }),
+    [subscribeLocalChange, broadcast],
+  );
+  useEventListener(({ event }) => {
+    if (event.type === "task-patch") applyRemotePatch(event.taskId, event.patch as TaskEdit);
+    else if (event.type === "tasks-changed") refreshFromRemote();
+  });
 
   /* -------- Liveblocks storage mutations -------- */
   const putNode = useMutation(({ storage }, node: StoredNode) => {
@@ -305,6 +377,53 @@ export function CanvasEditor({
       setTool("select");
       setSelected(new Set([node.id]));
       if (kind === "text") setEditingId(node.id);
+    },
+    [putNode],
+  );
+
+  /** Commit an in-flight freehand stroke as a `draw` node. `pts` is a flat
+   *  [x,y,…] list in CANVAS coords; we derive the bbox, store the points
+   *  relative to it (so dragging only moves x/y), and stamp the current pen.
+   *  Stays in the draw tool afterward so you can keep sketching (Figma-like). */
+  const createDrawNode = useCallback(
+    (pts: number[]) => {
+      const count = pts.length >> 1;
+      if (count === 0) return;
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+      for (let i = 0; i < count; i++) {
+        const x = pts[i * 2];
+        const y = pts[i * 2 + 1];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+      const { color, width } = penRef.current;
+      const pad = width / 2 + 1; // keep the round line cap inside the bbox
+      const originX = Math.round(minX - pad);
+      const originY = Math.round(minY - pad);
+      const rel = new Array<number>(pts.length);
+      for (let i = 0; i < count; i++) {
+        rel[i * 2] = Math.round((pts[i * 2] - originX) * 100) / 100;
+        rel[i * 2 + 1] = Math.round((pts[i * 2 + 1] - originY) * 100) / 100;
+      }
+      const maxPos = nodesRef.current.reduce((m, nd) => Math.max(m, nd.position), 0);
+      const node: StoredNode = {
+        id: uid(),
+        kind: "draw",
+        content: "",
+        x: originX,
+        y: originY,
+        width: Math.round(maxX + pad - originX),
+        height: Math.round(maxY + pad - originY),
+        color,
+        position: maxPos + 1,
+        data: { points: rel, strokeWidth: width },
+      };
+      putNode(node);
     },
     [putNode],
   );
@@ -546,6 +665,14 @@ export function CanvasEditor({
         case "B":
           setTool("section");
           break;
+        case "p":
+        case "P":
+          setTool("draw");
+          break;
+        case "e":
+        case "E":
+          setTool("erase");
+          break;
         case "v":
         case "V":
           setTool("select");
@@ -680,6 +807,56 @@ export function CanvasEditor({
         return;
       }
 
+      // Freehand pen: sample the cursor path, preview it live, commit on release.
+      if (toolRef.current === "draw") {
+        e.preventDefault();
+        const pts: number[] = [];
+        const push = (cx: number, cy: number) => {
+          const p = toCanvas(cx, cy);
+          pts.push(p.x, p.y);
+        };
+        push(e.clientX, e.clientY);
+        setDrawing(pts.slice());
+        const onMove = (ev: PointerEvent) => {
+          // Coalesced events recover the sub-frame samples the browser batched,
+          // so fast strokes stay smooth.
+          const batch = ev.getCoalescedEvents?.() ?? [];
+          if (batch.length) for (const c of batch) push(c.clientX, c.clientY);
+          else push(ev.clientX, ev.clientY);
+          setDrawing(pts.slice());
+        };
+        const onUp = () => {
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          setDrawing(null);
+          createDrawNode(pts);
+        };
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        return;
+      }
+
+      // Eraser: drag across strokes to delete them (whole-stroke). Hit-tests the
+      // ink via the draw node's transparent hit-path, like the link drag above.
+      if (toolRef.current === "erase") {
+        e.preventDefault();
+        const eraseAt = (cx: number, cy: number) => {
+          const id = (document.elementFromPoint(cx, cy) as HTMLElement | null)
+            ?.closest("[data-draw-id]")
+            ?.getAttribute("data-draw-id");
+          if (id) removeMany([id]);
+        };
+        eraseAt(e.clientX, e.clientY);
+        const onMove = (ev: PointerEvent) => eraseAt(ev.clientX, ev.clientY);
+        const onUp = () => {
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+        };
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        return;
+      }
+
       const start = toCanvas(e.clientX, e.clientY);
       let moved = false;
       const onMove = (ev: PointerEvent) => {
@@ -712,7 +889,7 @@ export function CanvasEditor({
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     },
-    [toCanvas, createNode],
+    [toCanvas, createNode, createDrawNode, removeMany],
   );
 
   /* -------- live cursor broadcast -------- */
@@ -754,17 +931,68 @@ export function CanvasEditor({
 
   const cursor = spaceDown
     ? "grab"
-    : tool === "text" || tool === "section"
+    : tool === "text" || tool === "section" || tool === "draw"
       ? "crosshair"
-      : "default";
+      : tool === "erase"
+        ? "cell"
+        : "default";
 
   return (
     <div className="relative h-full w-full overflow-hidden">
       {/* Toolbar */}
-      <div className="absolute left-3 top-3 z-20 flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">
-        <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
-        <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
-        <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (B)">▤</ToolBtn>
+      <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-1">
+        <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">
+          <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
+          <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
+          <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (B)">▤</ToolBtn>
+          <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)">✏️</ToolBtn>
+          <ToolBtn active={tool === "erase"} onClick={() => setTool("erase")} title="Erase strokes (E)">⌫</ToolBtn>
+        </div>
+
+        {/* Pen controls — colour + width, shown only while the pencil is active. */}
+        {tool === "draw" ? (
+          <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-2 py-1.5 shadow-sm">
+            <div className="flex items-center gap-1">
+              {PEN_COLORS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => setPen((p) => ({ ...p, color: c }))}
+                  title={`Ink ${c}`}
+                  aria-label={`Ink ${c}`}
+                  className={[
+                    "h-5 w-5 rounded-full border transition-transform",
+                    pen.color === c
+                      ? "scale-110 border-accent ring-2 ring-accent"
+                      : "border-border hover:scale-110",
+                  ].join(" ")}
+                  style={{ backgroundColor: c }}
+                />
+              ))}
+            </div>
+            <div className="h-4 w-px bg-border" />
+            <div className="flex items-center gap-1">
+              {PEN_WIDTHS.map((w) => (
+                <button
+                  key={w}
+                  type="button"
+                  onClick={() => setPen((p) => ({ ...p, width: w }))}
+                  title={`${w}px`}
+                  aria-label={`Stroke width ${w}px`}
+                  className={[
+                    "grid h-6 w-6 place-items-center rounded-md transition-colors",
+                    pen.width === w ? "bg-accent-soft" : "hover:bg-surface-2",
+                  ].join(" ")}
+                >
+                  <span
+                    className="rounded-full bg-fg"
+                    style={{ width: w + 2, height: w + 2 }}
+                  />
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Presence: who's here */}
@@ -786,7 +1014,11 @@ export function CanvasEditor({
           ? "Click to drop a text block"
           : tool === "section"
             ? "Click to drop a board — name it, then outline your tasks"
-            : "T text · B board · space-drag to pan · ⌘-scroll to zoom"}
+            : tool === "draw"
+              ? "Drag to draw · pick colour & width on the left"
+              : tool === "erase"
+                ? "Drag across a stroke to erase it"
+                : "T text · B board · P draw · E erase · space-drag to pan · ⌘-scroll to zoom"}
       </div>
 
       {/* Zoom controls */}
@@ -950,6 +1182,29 @@ export function CanvasEditor({
             ) : null}
           </svg>
 
+          {/* Live freehand stroke — the in-flight pen line, before pointerup
+              commits it to a `draw` node. Coords are canvas-space (this sits in
+              the transformed inner div), so no conversion is needed. */}
+          {drawing ? (
+            <svg
+              className="pointer-events-none absolute left-0 top-0 overflow-visible"
+              style={{ width: 1, height: 1 }}
+            >
+              {drawing.length >= 4 ? (
+                <path
+                  d={strokePath(drawing)}
+                  fill="none"
+                  stroke={pen.color}
+                  strokeWidth={pen.width}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              ) : (
+                <circle cx={drawing[0]} cy={drawing[1]} r={pen.width / 2} fill={pen.color} />
+              )}
+            </svg>
+          ) : null}
+
           {/* Remote selection rings */}
           {ordered.map((node) => {
             const color = remoteSelection.get(node.id);
@@ -965,7 +1220,10 @@ export function CanvasEditor({
                   height: node.height,
                   outline: `2px solid ${color}`,
                   outlineOffset: 2,
-                  transition: "left 90ms linear, top 90ms linear",
+                  // Glide the ring's box too, so it stays glued to a remote
+                  // node whose height changes as its text reflows.
+                  transition:
+                    "left 90ms linear, top 90ms linear, width 90ms linear, height 90ms linear",
                 }}
               />
             );
@@ -1025,9 +1283,9 @@ export function CanvasEditor({
       ) : nodes.length === 0 ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <p className="text-sm text-faint">
-            Press <kbd className="rounded bg-surface-3 px-1">T</kbd> for text, or{" "}
-            <kbd className="rounded bg-surface-3 px-1">B</kbd> for a section of tasks —
-            then click.
+            Press <kbd className="rounded bg-surface-3 px-1">T</kbd> for text,{" "}
+            <kbd className="rounded bg-surface-3 px-1">B</kbd> for a section of tasks, or{" "}
+            <kbd className="rounded bg-surface-3 px-1">P</kbd> to draw — then use the canvas.
           </p>
         </div>
       ) : null}

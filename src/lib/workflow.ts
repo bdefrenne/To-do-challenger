@@ -18,28 +18,44 @@ export const WORKFLOW = `# Working with the todo system
 Follow this whenever you start, modify, or finish work through the todo MCP.
 Keep it lightweight — don't log for the sake of logging.
 
+**Status is the process spine** (set it with \`update_task\`):
+
+    Backlog → To Do → Analyzing → Analyzed → Building → Done
+
+Moving a task to **Analyzing or beyond locks its code** (\`GH-20*\` → \`GH-20\`,
+frozen for good) so every commit can cite a stable ref. There are two handoffs:
+To Do → Analyzing (understand + plan) and Analyzed → Building (execute) — they
+can be done by different people/AIs, or by you end to end.
+
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. If the task is on a
 project/board, read that container's \`description\` and \`gitFolder\`
 (\`list_projects\`). Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)
 
-1. **Analyze (optional)** — for anything non-trivial, think it through first.
-   When the analysis is settled, you may write \`analysisSummary\` and set
-   \`analyzedAt\` via \`update_task\`. Simple tasks can skip this entirely.
-2. **Decide + note** — capture the choices and callouts that actually matter with
-   \`add_note\`: use \`type: "decision"\` for a real decision (put the "why" in the
-   body; \`tags\` like "technical"/"product" for filtering), or
+1. **Analyze** (optional for simple tasks) — think the non-trivial parts
+   through. Set \`status: "analyzing"\`, then write two free-text fields via
+   \`update_task\`: \`analysisSummary\` (the **Analysis** — what & why, the
+   approach, trade-offs) and \`plan\` (the **Technical Plan** — the order of
+   attack). No length limit. When they're settled, set \`status: "analyzed"\`
+   (a valid resting state — understood, not yet built).
+2. **Decide + note** — with \`add_note\`. Log a \`type: "decision"\` ONLY for a
+   *significant* choice, and usually only when the user says "log this…" — never
+   reflexively for small choices (put the "why" in the body; \`tags\` like
+   "technical"/"product" for filtering). Use
    \`progress\`/\`milestone\`/\`blocker\`/\`question\`/\`fyi\` for standup-worthy
-   updates. Don't log reflexively — record decisions when they're significant or
-   when the user asks you to.
-3. **Work** — write a short \`plan\` (\`update_task\`) if it helps, then build. Lock
-   the code first if it's still soft (\`lock_task\`; \`work_on_task\` already did
-   this) so commits can cite it — reference it in every commit message and
-   \`link_commit\` each sha.
-4. **Finish** — reconcile, don't recollect: run \`git log\`/\`git diff\`, compare
-   against the plan + notes, write the final \`summary\` from the DIFF — not from
-   memory — then mark the task done (\`complete_task\`).
+   updates. Use \`type: "review"\` ONLY when the user explicitly asks you to flag
+   something for them to visually double-check later — never on your own
+   initiative; they check these off themselves (\`resolve_note\`).
+3. **Build** — set \`status: "building"\` and execute the plan. Reference the
+   code in every commit message (e.g. \`[GH-20] …\`); optionally \`link_commit\`
+   a sha to surface it on the task page.
+4. **Finish** — reconcile against the repo, enriched by memory: run
+   \`git log\`/\`git diff\`, compare against the plan + decisions, and write the
+   final \`summary\` **anchored in the DIFF** (what actually shipped, including
+   scope added along the way — give added scope its own line) while adding the
+   context the diff can't show (the why, key decisions, gotchas, follow-ups).
+   Then mark the task done (\`complete_task\`).
 
 When creating tasks/projects/boards, always write a \`description\` so AIs without
 code access can understand them.

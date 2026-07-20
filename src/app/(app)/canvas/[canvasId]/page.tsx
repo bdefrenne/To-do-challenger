@@ -118,7 +118,7 @@ export default function CanvasPage() {
           <LiveblocksProvider authEndpoint="/api/liveblocks-auth">
             <RoomProvider
               id={`canvas:${canvasId}`}
-              initialPresence={{ cursor: null, selection: [] }}
+              initialPresence={{ cursor: null, selection: [], editing: null }}
               initialStorage={initialStorage}
             >
               <CanvasEditor canvasId={canvasId} canvasName={name} />
