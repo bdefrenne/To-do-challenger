@@ -32,6 +32,8 @@
   --color-adjust-soft: #fdf1df;
   --color-new: #4f8bff; /* blue — In Progress */
   --color-new-soft: #e9f0ff;
+  --color-orange: #ef6c1a; /* importance: Elevated */
+  --color-orange-soft: #fdeee2;
 
   /* Priority flags */
   --color-prio-urgent: #e5484d;

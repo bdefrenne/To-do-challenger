@@ -6,7 +6,7 @@
  *
  *   • Pan   — space-drag, middle-drag, or two-finger scroll.
  *   • Zoom  — ⌘/ctrl + wheel, toward the cursor.
- *   • Tools — V select · T text · B section. Place-then-revert-to-select.
+ *   • Tools — V select · T text · S section. Place-then-revert-to-select.
  *   • Text  — markdown blocks; '- '/'1. ' lists auto-continue.
  *   • Section — a titled container bound to a real board, showing its tasks.
  *
@@ -661,8 +661,8 @@ export function CanvasEditor({
         case "T":
           setTool("text");
           break;
-        case "b":
-        case "B":
+        case "s":
+        case "S":
           setTool("section");
           break;
         case "p":
@@ -944,7 +944,7 @@ export function CanvasEditor({
         <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">
           <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
           <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
-          <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (B)">▤</ToolBtn>
+          <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (S)">▤</ToolBtn>
           <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)">✏️</ToolBtn>
           <ToolBtn active={tool === "erase"} onClick={() => setTool("erase")} title="Erase strokes (E)">⌫</ToolBtn>
         </div>
@@ -1284,7 +1284,7 @@ export function CanvasEditor({
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <p className="text-sm text-faint">
             Press <kbd className="rounded bg-surface-3 px-1">T</kbd> for text,{" "}
-            <kbd className="rounded bg-surface-3 px-1">B</kbd> for a section of tasks, or{" "}
+            <kbd className="rounded bg-surface-3 px-1">S</kbd> for a section of tasks, or{" "}
             <kbd className="rounded bg-surface-3 px-1">P</kbd> to draw — then use the canvas.
           </p>
         </div>

@@ -15,7 +15,7 @@
  * through useWorkspace(); the commit is one-to-three /api/tasks/bulk batches.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useMyPresence, useOthers } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT, Task } from "@/lib/types";
@@ -32,6 +32,7 @@ import type { TaskStatus, Importance } from "@/lib/types";
 import { useWorkspace, type DropPos } from "./WorkspaceContext";
 import { TaskCardBody } from "./TaskCardBody";
 import { useCardShortcut } from "./useCardShortcut";
+import { IMPORTANCE_CARD } from "@/lib/importance";
 
 export const NEW_SECTION_SIZE = { width: 420, height: 320 };
 
@@ -128,6 +129,9 @@ export function SectionNode({
   const knownIdsRef = useRef<Set<string>>(new Set());
 
   const [mode, setMode] = useState<Mode>(boardId ? "committed" : "naming");
+  // Text-mode display preference (session-only): descriptions grow up to 6 rows
+  // by default; toggled to unbounded via the header button. Not persisted.
+  const [descExpanded, setDescExpanded] = useState(false);
   const [rows, setRows] = useState<OutlineRow[]>([]);
   const [saving, setSaving] = useState(false);
   const [focus, setFocus] = useState<{ key: string; caret: number } | null>(null);
@@ -703,6 +707,25 @@ export function SectionNode({
             ↥ Send to {masterSection.name}
           </button>
         ) : null}
+        {/* Description height: text-mode-only. Caps descriptions at 6 rows or
+            lets them grow unbounded (session-only preference). */}
+        {boardId && mode === "authoring" ? (
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setDescExpanded((v) => !v);
+            }}
+            title={
+              descExpanded
+                ? "Descriptions: showing all — click to cap at 6 rows"
+                : "Descriptions: capped at 6 rows — click to show all"
+            }
+            className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-[11px] font-medium text-faint hover:border-accent hover:text-accent"
+          >
+            {descExpanded ? "↕ All" : "↕ 6"}
+          </button>
+        ) : null}
         {boardId ? (
           <div
             onPointerDown={(e) => e.stopPropagation()}
@@ -753,12 +776,9 @@ export function SectionNode({
           <OutlineEditor
             rows={rows}
             inputRefs={inputRefs}
+            descCapped={!descExpanded}
             onText={setText}
             onKeyDown={onRowKeyDown}
-            onDone={() => {
-              void flush();
-              setMode("committed");
-            }}
           />
         ) : (
           <CommittedList
@@ -821,6 +841,8 @@ function NameBinder({
 }) {
   const ws = useWorkspace();
   const [q, setQ] = useState("");
+  const [active, setActive] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
 
   // Pick an EXISTING board — the section attaches to it (that's where its tasks
   // live and how they show up in the board view). It does NOT pull in the
@@ -835,32 +857,61 @@ function NameBinder({
     return all.filter((b) => b.name.toLowerCase().includes(needle)).slice(0, 8);
   }, [q, ws.projects]);
 
+  // Keep the highlighted row scrolled into view during arrow navigation.
+  useEffect(() => {
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-idx="${active}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
   return (
     <div className="space-y-2">
       <input
         autoFocus
         value={q}
-        onChange={(e) => setQ(e.target.value)}
+        onChange={(e) => {
+          setQ(e.target.value);
+          setActive(0); // filtering reflows the list — re-highlight the top
+        }}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && matches.length) {
+          if (e.key === "ArrowDown") {
             e.preventDefault();
-            onBind(matches[0].id, matches[0].name);
+            setActive((a) => Math.min(a + 1, matches.length - 1));
+            return;
+          }
+          if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActive((a) => Math.max(a - 1, 0));
+            return;
+          }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            const b = matches[active];
+            if (b) onBind(b.id, b.name);
           }
         }}
         placeholder="Which board is this section on?"
         className="w-full rounded-md border border-accent bg-surface px-2 py-1 text-sm text-fg outline-none"
       />
-      <div className="overflow-hidden rounded-md border border-border">
+      <div
+        ref={listRef}
+        className="max-h-48 overflow-y-auto rounded-md border border-border"
+      >
         {matches.length === 0 ? (
           <p className="px-2 py-2 text-xs text-faint">
             No boards match. Create the board first, then attach a section to it.
           </p>
         ) : (
-          matches.map((b) => (
+          matches.map((b, i) => (
             <button
               key={b.id}
+              data-idx={i}
+              onMouseEnter={() => setActive(i)}
               onClick={() => onBind(b.id, b.name)}
-              className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-sm hover:bg-surface-2"
+              className={[
+                "flex w-full items-center gap-2 px-2 py-1.5 text-left text-sm",
+                i === active ? "bg-surface-2" : "",
+              ].join(" ")}
             >
               <span className="truncate text-fg">{b.name}</span>
               <span className="ml-auto shrink-0 truncate text-[11px] text-faint">{b.project}</span>
@@ -874,22 +925,83 @@ function NameBinder({
 
 /* ---------------- authoring ---------------- */
 
+/** A textarea that auto-sizes to its content. When `capped`, it grows to at
+ *  most 6 rows and scrolls the overflow; otherwise it grows unbounded. Used for
+ *  both title rows (never capped — they just wrap) and description rows. Its
+ *  inner textarea is forwarded to `registerRef` so the outline's inputRefs map
+ *  and caret-restore effect keep working. */
+function AutoGrowTextarea({
+  value,
+  capped,
+  registerRef,
+  onChange,
+  onKeyDown,
+  placeholder,
+  className,
+}: {
+  value: string;
+  capped: boolean;
+  registerRef: (el: HTMLTextAreaElement | null) => void;
+  onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  placeholder: string;
+  className: string;
+}) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+  const MAX_ROWS = 6;
+  const resize = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    if (capped) {
+      const lh = parseFloat(getComputedStyle(el).lineHeight) || 20;
+      const max = lh * MAX_ROWS;
+      el.style.maxHeight = `${max}px`;
+      el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+      el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+    } else {
+      el.style.maxHeight = "none";
+      el.style.height = `${el.scrollHeight}px`;
+      el.style.overflowY = "hidden";
+    }
+  }, [capped]);
+  useLayoutEffect(resize, [value, capped, resize]);
+  return (
+    <textarea
+      ref={(el) => {
+        ref.current = el;
+        registerRef(el);
+      }}
+      value={value}
+      rows={1}
+      onChange={(e) => {
+        onChange(e);
+        resize();
+      }}
+      onKeyDown={onKeyDown}
+      placeholder={placeholder}
+      className={className}
+    />
+  );
+}
+
 function OutlineEditor({
   rows,
   inputRefs,
+  descCapped,
   onText,
   onKeyDown,
-  onDone,
 }: {
   rows: OutlineRow[];
   inputRefs: React.MutableRefObject<Map<string, HTMLInputElement | HTMLTextAreaElement>>;
+  /** Cap description rows at 6 visible rows (then scroll); false = grow unbounded. */
+  descCapped: boolean;
   onText: (key: string, text: string) => void;
   onKeyDown: (
     e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
     row: OutlineRow,
     index: number,
   ) => void;
-  onDone: () => void;
 }) {
   return (
     <div className="space-y-0.5">
@@ -905,36 +1017,36 @@ function OutlineEditor({
               <span className="mt-0.5 shrink-0 select-none text-xs text-muted">–</span>
             )}
             {row.desc ? (
-              // A description is a plain multiline block — italic, no label.
-              // Enter = newline, Shift+Tab pops a line out (see onRowKeyDown).
-              <textarea
-                ref={setRef}
+              // A description is a plain multiline block — italic, no label. It
+              // grows to fit its (wrapped) content, capped at 6 rows unless the
+              // section header toggles "show all". Enter = newline, Shift+Tab
+              // pops a line out (see onRowKeyDown).
+              <AutoGrowTextarea
+                registerRef={setRef}
                 value={row.text}
-                rows={Math.max(1, row.text.split("\n").length)}
+                capped={descCapped}
                 onChange={(e) => onText(row.key, e.target.value)}
                 onKeyDown={(e) => onKeyDown(e, row, i)}
                 className="w-full resize-none bg-transparent text-sm italic leading-snug text-muted outline-none"
                 placeholder="description…"
               />
             ) : (
-              <input
-                ref={setRef}
+              // A title wraps onto multiple lines when long, but stays single-
+              // value: the task-row branch of onRowKeyDown preventDefaults Enter
+              // (→ new task row), so no literal newline is ever inserted.
+              <AutoGrowTextarea
+                registerRef={setRef}
                 value={row.text}
+                capped={false}
                 onChange={(e) => onText(row.key, e.target.value)}
                 onKeyDown={(e) => onKeyDown(e, row, i)}
-                className="w-full bg-transparent text-sm text-fg outline-none"
+                className="w-full resize-none bg-transparent text-sm leading-snug text-fg outline-none"
                 placeholder="task…"
               />
             )}
           </div>
         );
       })}
-      <div className="pt-2 text-[11px] text-faint">
-        Tab: nest deeper → description · Shift+Tab: back out · autosaves ·{" "}
-        <button onClick={onDone} className="underline hover:text-accent">
-          done
-        </button>
-      </div>
     </div>
   );
 }
@@ -966,12 +1078,12 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
     if (done) h.onStatus(id, "building");
     else h.onToggle(id);
   });
-  // "1" / "2" / "3" on the hovered card set importance directly (Elevated / High
-  // / Critical) — the number shortcuts alongside "I"'s full picker.
+  // "1" / "2" on the hovered card set importance directly (Elevated / High) —
+  // the number shortcuts alongside "I"'s full picker.
   useCardShortcut(cardRef, "1", () => id && h.onImportance(id, 1));
   useCardShortcut(cardRef, "2", () => id && h.onImportance(id, 2));
-  useCardShortcut(cardRef, "3", () => id && h.onImportance(id, 3));
   if (!id || !t) return null;
+  const ic = IMPORTANCE_CARD[t.importance ?? 0];
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
   const half = (e: React.DragEvent) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1009,7 +1121,7 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
           "group/card cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
           done
             ? "border-buff/40 bg-buff-soft hover:border-buff/60"
-            : "border-border bg-surface hover:border-border-strong hover:bg-surface-2",
+            : `${ic.border} ${ic.bg} ${ic.hover}`,
           hint === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
           hint === "after" ? "shadow-[inset_0_-2px_0_0_var(--color-accent)]" : "",
         ].join(" ")}

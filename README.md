@@ -111,7 +111,7 @@ ready-made command it shows you:
 
 ```bash
 claude mcp add --transport http todo \
-  http://localhost:3000/api/mcp \
+  https://to-do-challenger.vercel.app/api/mcp \
   --header "Authorization: Bearer <your-personal-token>"
 ```
 

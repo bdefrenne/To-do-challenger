@@ -27,11 +27,11 @@ export type Recurrence = "none" | "daily" | "weekly" | "monthly";
 export type FibPoints = 1 | 2 | 3 | 5 | 8;
 
 /**
- * Importance ladder (priority): `3` Critical · `2` High · `1` Elevated ·
- * `0` Normal (default) · `-1` Low · `-2` Icebox. Higher = more urgent;
- * negatives deprioritize. See src/lib/importance.ts for labels/tones.
+ * Importance ladder (priority): `2` High · `1` Elevated · `0` Normal (default) ·
+ * `-1` Low. Higher = more urgent; negatives deprioritize. See
+ * src/lib/importance.ts for labels/tones.
  */
-export type Importance = -2 | -1 | 0 | 1 | 2 | 3;
+export type Importance = -1 | 0 | 1 | 2;
 
 /** An open-ended, user-defined field value (the custom-field bag). */
 export type CustomFieldValue = string | number | boolean;

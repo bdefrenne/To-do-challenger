@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/Button";
 import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip } from "@/components/ui/Badge";
 import { PersonAvatar } from "@/components/PersonAvatar";
-import { formatTime, formatShortDate, formatAge, formatDue } from "@/lib/format";
+import { formatTime, formatShortDate, formatDue } from "@/lib/format";
 import { STATUS_LABEL, RECURRENCE_LABEL } from "@/lib/statuses";
 import { IMPORTANCE_ORDER, IMPORTANCE_LABEL } from "@/lib/importance";
 import { StatusPill } from "./StatusPill";
@@ -363,6 +363,13 @@ function TaskDetailLevel({
                 busy={busyKey === "analyze"}
                 copied={copiedKey === "analyze"}
                 onClick={() => runCopy("analyze", () => taskPrompt(taskId, "analyze"))}
+              />
+              <CopyButton
+                label="📋 Plan"
+                title="Copy a prompt to write the technical plan (needs an analysis first)"
+                busy={busyKey === "plan"}
+                copied={copiedKey === "plan"}
+                onClick={() => runCopy("plan", () => taskPrompt(taskId, "plan"))}
               />
               <CopyButton
                 label="🔨 Work"
@@ -753,10 +760,6 @@ function TaskDetailLevel({
                 </span>
               </Meta>
             ) : null}
-            <Meta label="In status">
-              <span className="nums">{formatAge(node.statusSince)}</span> in{" "}
-              {STATUS_LABEL[node.status]}
-            </Meta>
             {task.recurrence && task.recurrence !== "none" ? (
               <Meta label="Repeats">
                 <span>↻ {RECURRENCE_LABEL[task.recurrence]}</span>
@@ -941,9 +944,9 @@ function WorkflowSection({
             val ? (
               <div key={label}>
                 <SectionLabel>{label}</SectionLabel>
-                <p className="mt-1 whitespace-pre-wrap rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-fg">
-                  {val}
-                </p>
+                <div className="mt-1 rounded-lg border border-border bg-surface-2 px-3 py-2">
+                  <Markdown>{val}</Markdown>
+                </div>
               </div>
             ) : null,
           )}

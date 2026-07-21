@@ -72,6 +72,11 @@ export interface TaskDTO extends Task {
 const iso = (d: Date | string | null) =>
   d == null ? undefined : (d instanceof Date ? d.toISOString() : d);
 
+/** Keep importance inside the -1…2 ladder — guards legacy rows and any stray
+ *  out-of-range write (validation already enforces this at the API edge). */
+const clampImportance = (v: number): Importance =>
+  Math.max(-1, Math.min(2, v)) as Importance;
+
 const rowToAttachment = (r: TaskAttachmentRow): Attachment => ({
   id: r.id,
   filename: r.filename,
@@ -154,7 +159,7 @@ function rowToTask(
     customFields: (row.customFields as Record<string, CustomFieldValue>) ?? {},
     value: (row.value as FibPoints | null) ?? undefined,
     difficulty: (row.difficulty as FibPoints | null) ?? undefined,
-    importance: (row.importance as Importance | null) ?? 0,
+    importance: clampImportance(row.importance ?? 0),
     description: row.description ?? undefined,
     commentCount: commentCount || undefined,
     boardId: row.boardId,
@@ -825,7 +830,7 @@ export async function createTask(
       customFields: input.customFields ?? {},
       value: input.value,
       difficulty: input.difficulty,
-      importance: input.importance ?? 0,
+      importance: clampImportance(input.importance ?? 0),
       description: input.description,
       parentId,
       boardId,
@@ -896,7 +901,7 @@ export async function updateTask(
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
-  if (patch.importance !== undefined) values.importance = patch.importance;
+  if (patch.importance !== undefined) values.importance = clampImportance(patch.importance);
   if (patch.description !== undefined) values.description = patch.description;
   if (patch.analysisSummary !== undefined) values.analysisSummary = patch.analysisSummary;
   if (patch.plan !== undefined) values.plan = patch.plan;
@@ -1315,7 +1320,7 @@ export async function bulkUpdate(
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
-  if (patch.importance !== undefined) values.importance = patch.importance;
+  if (patch.importance !== undefined) values.importance = clampImportance(patch.importance);
   if (patch.description !== undefined) values.description = patch.description;
   if (patch.status !== undefined) {
     values.status = patch.status;

@@ -9,7 +9,7 @@
   web app). The token identifies the user, so a user's Claude only ever
   sees and edits THAT user's tasks. Add it in Claude Code:
     claude mcp add --transport http todo \
-      https://<your-app>.vercel.app/api/mcp \
+      https://to-do-challenger.vercel.app/api/mcp \
       --header "Authorization: Bearer <your-personal-token>"
   ====================================================================
 */
@@ -101,16 +101,15 @@ const fibEnum = z.union([
   z.literal(5),
   z.literal(8),
 ]);
-/** Importance/priority ladder: 3 Critical, 2 High, 1 Elevated, 0 Normal
- *  (default), -1 Low, -2 Icebox. */
+/** Importance/priority ladder: 2 High, 1 Elevated, 0 Normal (default), -1 Low. */
 const importanceArg = z
   .number()
   .int()
-  .min(-2)
-  .max(3)
+  .min(-1)
+  .max(2)
   .describe(
-    "Importance/priority: 3 Critical · 2 High · 1 Elevated · 0 Normal (default) · -1 Low · -2 Icebox. Most tasks stay 0.",
-  ) as z.ZodType<-2 | -1 | 0 | 1 | 2 | 3>;
+    "Importance/priority: 2 High · 1 Elevated · 0 Normal (default) · -1 Low. Most tasks stay 0.",
+  ) as z.ZodType<-1 | 0 | 1 | 2>;
 const assigneeIdsArg = z
   .array(z.string().max(120))
   .max(20)
@@ -269,7 +268,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → done); moving to analyzing or beyond locks the code. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (see the finish_task prompt: reconcile against the git diff, enriched from memory).",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → done); moving to analyzing or beyond locks the code. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call.",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -1088,9 +1087,8 @@ const handler = createMcpHandler(
             `Here it is:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
             `Follow the todo workflow contract (in your server instructions / the ` +
             `\`todo://workflow\` resource) using the todo MCP tools — read it if you ` +
-            `haven't. Its code is locked, so reference **${code}** in every commit ` +
-            `and \`link_commit\` each sha. Start by understanding the task and the ` +
-            `relevant code, and ask me anything unclear before deciding.`,
+            `haven't. Start by understanding the task and the relevant code, and ask ` +
+            `me anything unclear before deciding.`,
         );
       },
     );
@@ -1100,7 +1098,7 @@ const handler = createMcpHandler(
       {
         title: "Finish a task",
         description:
-          "Reconcile what actually shipped against the git diff (not memory), write the summary, mark done.",
+          "Write a short summary of what actually shipped (you can diff git to help), mark done.",
         argsSchema: { taskId: z.string() },
       },
       async ({ taskId }) => {
@@ -1123,13 +1121,13 @@ const handler = createMcpHandler(
                 : "_(none)_"
             }\n\n` +
             `Run the **Finish** step of the todo workflow contract (in your server ` +
-            `instructions / the \`todo://workflow\` resource): reconcile against the ` +
-            `repo, enriched from memory. Diff git since${since ? ` (~${since})` : ""} ` +
-            `(or the branch point), compare against the plan + decisions above, and ` +
-            `write the \`summary\` **anchored in what ACTUALLY shipped** (give any ` +
-            `scope added along the way its own line) while adding the context the ` +
-            `diff can't show — the why, key decisions, gotchas, follow-ups. Make ` +
-            `sure every commit referenced **${t.code ?? taskId}**.`,
+            `instructions / the \`todo://workflow\` resource): write a short ` +
+            `\`summary\` of what actually shipped — you can diff git since${
+              since ? ` (~${since})` : ""
+            } (or the branch point) and compare against the plan + decisions above ` +
+            `to help. Add the context the diff can't show — the why, key decisions, ` +
+            `gotchas, follow-ups — and give any scope added along the way its own ` +
+            `line. Keep it concise.`,
         );
       },
     );

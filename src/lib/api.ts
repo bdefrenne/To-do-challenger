@@ -26,12 +26,12 @@ export const fibSchema = z.union([
   z.literal(5),
   z.literal(8),
 ]);
-/** Importance ladder (priority): 3 Critical … 0 Normal (default) … -2 Icebox. */
+/** Importance ladder (priority): 2 High · 1 Elevated · 0 Normal (default) · -1 Low. */
 export const importanceSchema = z
   .number()
   .int()
-  .min(-2)
-  .max(3) as z.ZodType<-2 | -1 | 0 | 1 | 2 | 3>;
+  .min(-1)
+  .max(2) as z.ZodType<-1 | 0 | 1 | 2>;
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
 /** Assignee refs — each a user id, email, or display name; the service
  *  resolves them to account ids on write. */

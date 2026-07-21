@@ -70,7 +70,7 @@ export default function SettingsPage() {
   }
 
   const command = (plaintext: string) =>
-    `claude mcp add --transport http todo ${origin || "https://<your-app>"}/api/mcp --header "Authorization: Bearer ${plaintext}"`;
+    `claude mcp add --transport http todo https://to-do-challenger.vercel.app/api/mcp --header "Authorization: Bearer ${plaintext}"`;
 
   return (
     <div className="min-h-screen">

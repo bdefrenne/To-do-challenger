@@ -141,6 +141,13 @@
       "when": 1784487470999,
       "tag": "0019_abnormal_famine",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785000000000,
+      "tag": "0020_clamp_importance_levels",
+      "breakpoints": true
     }
   ]
 }

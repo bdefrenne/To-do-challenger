@@ -421,8 +421,8 @@ export const tasks = pgTable(
     value: smallint("value"),
     /** Fibonacci effort points (1/2/3/5/8) — the "difficulty" axis. */
     difficulty: smallint("difficulty"),
-    /** Importance ladder: 3 Critical · 2 High · 1 Elevated · 0 Normal
-     *  (default) · -1 Low · -2 Icebox. Most tasks stay Normal. */
+    /** Importance ladder: 2 High · 1 Elevated · 0 Normal (default) · -1 Low.
+     *  Most tasks stay Normal. */
     importance: smallint("importance").notNull().default(0),
     /** Which board this task lives on (null = unassigned / no board yet). */
     boardId: text("board_id").references(() => boards.id, {

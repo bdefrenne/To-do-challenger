@@ -9,13 +9,13 @@ import { NextRequest } from "next/server";
 import { z } from "zod";
 import { route, json, error, body, type AuthedCtx } from "@/lib/api";
 import { mintRef } from "@/lib/db/service";
-import { analyzePrompt, workPrompt, analyzeThenWorkPrompt } from "@/lib/prompts";
+import { analyzePrompt, planPrompt, workPrompt, analyzeThenWorkPrompt } from "@/lib/prompts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const schema = z.object({
-  kind: z.enum(["analyze", "work", "analyze-work"]),
+  kind: z.enum(["analyze", "plan", "work", "analyze-work"]),
 });
 
 export const POST = route(async (req: NextRequest, ctx: AuthedCtx) => {
@@ -31,9 +31,11 @@ export const POST = route(async (req: NextRequest, ctx: AuthedCtx) => {
   const prompt =
     kind === "analyze"
       ? analyzePrompt(code, task.title)
-      : kind === "work"
-        ? workPrompt(code, task.title)
-        : analyzeThenWorkPrompt(code, task.title);
+      : kind === "plan"
+        ? planPrompt(code, task.title)
+        : kind === "work"
+          ? workPrompt(code, task.title)
+          : analyzeThenWorkPrompt(code, task.title);
 
   return json({ task, prompt });
 });

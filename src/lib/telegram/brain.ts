@@ -155,6 +155,11 @@ export async function runBrain(opts: {
     const stream = client.beta.messages.stream({
       model: MODEL,
       max_tokens: 4096,
+      // Sonnet 5 runs adaptive thinking by DEFAULT when `thinking` is unset,
+      // which adds seconds of reasoning to what is just phone-side tool routing
+      // — enough to tip a cold turn (cold Vercel funcs + cold prompt cache) past
+      // the 55s budget below. This bot doesn't need chain-of-thought; turn it off.
+      thinking: { type: "disabled" },
       betas: [MCP_BETA],
       // Cache the (static) system prompt too — cheap win on top of the tools.
       system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],

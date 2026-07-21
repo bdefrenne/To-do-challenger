@@ -22,24 +22,35 @@ Keep it lightweight — don't log for the sake of logging.
 
     Backlog → To Do → Analyzing → Analyzed → Building → Done
 
-Moving a task to **Analyzing or beyond locks its code** (\`GH-20*\` → \`GH-20\`,
-frozen for good) so every commit can cite a stable ref. There are two handoffs:
-To Do → Analyzing (understand + plan) and Analyzed → Building (execute) — they
-can be done by different people/AIs, or by you end to end.
+Moving a task to **Analyzing or beyond locks its code** (\`GH-20*\` → \`GH-20\`) —
+a stable, permanent ref for the task. There are two handoffs: To Do → Analyzing
+(understand + analysis) and Analyzed → Building (tech plan + execute) — they can be done by
+different people/AIs, or by you end to end.
 
 **To start**, call \`get_task\` to load the full context (description, notes,
-commits, activity, subtasks) and read the relevant code. If the task is on a
-project/board, read that container's \`description\` and \`gitFolder\`
-(\`list_projects\`). Ask about anything unclear before deciding. (The
+commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)
 
-1. **Analyze** (optional for simple tasks) — think the non-trivial parts
-   through. Set \`status: "analyzing"\`, then write two free-text fields via
-   \`update_task\`: \`analysisSummary\` (the **Analysis** — what & why, the
-   approach, trade-offs) and \`plan\` (the **Technical Plan** — the order of
-   attack). No length limit. When they're settled, set \`status: "analyzed"\`
+The steps below are **composable** — not every task needs every one. Depending
+on what's asked, you might do just the analysis, just the technical plan
+(analysis first), build directly, or the whole chain end to end. Whichever
+artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
+\`summary\`).
+
+1. **Analyze** — think the non-trivial parts
+   through. Set \`status: "analyzing"\`, then write the free-text field
+   \`analysisSummary\` via \`update_task\` (the **Analysis** — what & why, the
+   approach, trade-offs). Keep it concise, a short write-up that scales with the work;
+   length is the driver's call. When this is settled, set \`status: "analyzed"\`
    (a valid resting state — understood, not yet built).
-2. **Decide + note** — with \`add_note\`. Log a \`type: "decision"\` ONLY for a
+2. **Technical Plan** (optional) — the concrete plan that will be implemented.
+   Not every task needs one, but whenever a plan is produced (e.g. you ask
+   Claude to plan the task), it belongs here: paste the actual step-by-step plan
+   Claude will execute into the free-text field \`plan\` via \`update_task\` — the
+   plan itself, not a summary of it. An analysis normally precedes it. A task
+   can validly **stop here** — plan written, not yet built. This is the
+   **Analyzed → Building** handoff and doesn't change status on its own.
+3. **Decide + note** — with \`add_note\`. Log a \`type: "decision"\` ONLY for a
    *significant* choice, and usually only when the user says "log this…" — never
    reflexively for small choices (put the "why" in the body; \`tags\` like
    "technical"/"product" for filtering). Use
@@ -47,16 +58,10 @@ project/board, read that container's \`description\` and \`gitFolder\`
    updates. Use \`type: "review"\` ONLY when the user explicitly asks you to flag
    something for them to visually double-check later — never on your own
    initiative; they check these off themselves (\`resolve_note\`).
-3. **Build** — set \`status: "building"\` and execute the plan. Reference the
-   code in every commit message (e.g. \`[GH-20] …\`); optionally \`link_commit\`
-   a sha to surface it on the task page.
-4. **Finish** — reconcile against the repo, enriched by memory: run
-   \`git log\`/\`git diff\`, compare against the plan + decisions, and write the
-   final \`summary\` **anchored in the DIFF** (what actually shipped, including
-   scope added along the way — give added scope its own line) while adding the
-   context the diff can't show (the why, key decisions, gotchas, follow-ups).
-   Then mark the task done (\`complete_task\`).
-
-When creating tasks/projects/boards, always write a \`description\` so AIs without
-code access can understand them.
+4. **Build** — set \`status: "building"\` and execute the plan.
+5. **Finish** — write a short \`summary\` of what was done (you can use
+   \`git log\`/\`git diff\` to help), plus the context the diff can't show (the
+   why, key decisions, gotchas, follow-ups) — give any scope added along the way
+   its own line. Keep it concise; length is the driver's call. Then mark the
+   task done (\`complete_task\`).
 `;

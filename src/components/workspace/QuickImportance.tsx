@@ -10,8 +10,8 @@
  *   • Enter  — pick the highlighted importance (and close)
  *   • Esc    — close
  *
- * The ladder is 3 Critical … 0 Normal (default) … -2 Icebox. Most tasks stay
- * Normal, so the trigger only draws attention once a non-Normal value is set.
+ * The ladder is 2 High · 1 Elevated · 0 Normal (default) · -1 Low. Most tasks
+ * stay Normal, so the trigger only draws attention once a non-Normal value is set.
  */
 
 import { useEffect, useRef, useState } from "react";

@@ -105,8 +105,12 @@ export function AnchoredPopover({
       ref={panelRef}
       // The card is HTML5-draggable and the canvas pans on pointerdown; stop both
       // from starting when interacting with the panel (harmless now that it's
-      // portaled out of the canvas, but keeps intent clear).
+      // portaled out of the canvas, but keeps intent clear). The click stop
+      // matters because the panel is portaled: React clicks bubble along the
+      // component tree, so without it a click inside would reach the parent
+      // card's onClick and open the detail modal.
       onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
       style={{
         position: "fixed",
         top: pos?.top ?? -9999,

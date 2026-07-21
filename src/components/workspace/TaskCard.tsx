@@ -5,6 +5,7 @@ import type { Task } from "@/lib/types";
 import { TaskCardBody, type TaskCardHandlers } from "./TaskCardBody";
 import { useWorkspace } from "./WorkspaceContext";
 import { useCardShortcut } from "./useCardShortcut";
+import { IMPORTANCE_CARD } from "@/lib/importance";
 
 /** Mime used to carry the dragged task id across kanban columns/boards. */
 export const TASK_DND_MIME = "text/plain";
@@ -27,6 +28,7 @@ export function TaskCard({
   const cardRef = useRef<HTMLDivElement>(null);
   const id = task.id;
   const done = task.status === "done";
+  const c = IMPORTANCE_CARD[task.importance ?? 0];
 
   // "D" on the hovered card toggles done: not-done → done; done → building
   // (setStatus clears completedAt), mirroring the canvas Section card.
@@ -59,7 +61,7 @@ export function TaskCard({
         "group/card cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
         done
           ? "border-buff/40 bg-buff-soft hover:border-buff/60"
-          : "border-border bg-surface hover:border-border-strong hover:bg-surface-2",
+          : `${c.border} ${c.bg} ${c.hover}`,
         dragging ? "opacity-40" : "",
       ].join(" ")}
     >

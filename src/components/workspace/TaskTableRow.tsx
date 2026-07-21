@@ -3,15 +3,15 @@
 import { useState, type DragEvent } from "react";
 import type { Task, TaskStatus } from "@/lib/types";
 import type { DropPos, TaskNode } from "./WorkspaceContext";
-import { PointsChip } from "@/components/ui/Badge";
 import { AvatarStack } from "@/components/PersonAvatar";
 import { StatusPill } from "./StatusPill";
 import { BoardPill, type BoardGroup } from "./BoardPill";
 import { formatRelative, formatDue } from "@/lib/format";
+import { IMPORTANCE_CARD } from "@/lib/importance";
 
 /** Shared grid template so header and rows line up. */
 export const GRID =
-  "grid grid-cols-[minmax(240px,1fr)_64px_96px_140px_150px_104px_92px] items-center";
+  "grid grid-cols-[minmax(240px,1fr)_64px_140px_150px_104px_92px] items-center";
 
 /**
  * One draggable table row. Click the name to open the task; drag onto the
@@ -62,7 +62,8 @@ export function TaskTableRow({
   const [pos, setPos] = useState<DropPos | null>(null);
   const done = node.status === "done";
   const isDragging = draggingId === node.id;
-  const inProgress = node.status === "building";
+  const importance = task.importance ?? 0;
+  const ic = IMPORTANCE_CARD[importance];
   const due = task.dueDate ? formatDue(task.dueDate) : null;
 
   function zoneFromEvent(e: DragEvent<HTMLDivElement>): DropPos {
@@ -95,7 +96,9 @@ export function TaskTableRow({
       className={[
         GRID,
         "group relative border-b border-border px-3 py-2 text-sm transition-colors",
-        inProgress ? "bg-new-soft/40" : "hover:bg-surface-2",
+        // Importance tint — background only here (the row border stays neutral),
+        // warm→cold. Normal stays plain.
+        importance !== 0 ? ic.bg : "hover:bg-surface-2",
         isDragging ? "opacity-40" : "",
         pos === "inside" ? "ring-1 ring-inset ring-accent" : "",
         pos === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
@@ -157,17 +160,6 @@ export function TaskTableRow({
             +
           </span>
         )}
-      </div>
-
-      {/* Points (value / difficulty) */}
-      <div className="flex justify-center gap-1">
-        {task.value != null ? <PointsChip kind="value" points={task.value} /> : null}
-        {task.difficulty != null ? (
-          <PointsChip kind="difficulty" points={task.difficulty} />
-        ) : null}
-        {task.value == null && task.difficulty == null ? (
-          <span className="text-faint">—</span>
-        ) : null}
       </div>
 
       {/* Board picker */}

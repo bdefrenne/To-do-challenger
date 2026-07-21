@@ -36,7 +36,7 @@ import type {
 export type DropPos = "before" | "after" | "inside";
 
 /** Which handoff prompt to copy — see `src/lib/prompts.ts`. */
-export type PromptKind = "analyze" | "work" | "analyze-work";
+export type PromptKind = "analyze" | "plan" | "work" | "analyze-work";
 
 /** Ordered tree node: parentId = nesting, position = order within group. */
 export interface TaskNode {
