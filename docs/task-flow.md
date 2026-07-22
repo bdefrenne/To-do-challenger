@@ -5,7 +5,7 @@ finishing it — as plain `[Actor]` bullets showing who does what.
 
 The process is a single spine (the task's `status`):
 
-**Backlog → To Do → Analyzing → Analyzed → Building → Done**
+**Backlog → To Do → Analyzing → Analyzed → Building → Review → Done**
 
 There are **two handoff points** — analysis and building can be done by
 different people/AIs, or by the same one end to end:

@@ -10,7 +10,7 @@ what shipped — notably a separate *derived phase* alongside `status`, extra
 lifecycle timestamps (`analysisStartedAt`/`workStartedAt`), and a standalone
 graded decisions table. **What actually shipped is simpler and is the source of
 truth: see [task-flow.md](./task-flow.md).** In short: `status` *is* the process
-spine (`Backlog → To Do → Analyzing → Analyzed → Building → Done`) — there is no
+spine (`Backlog → To Do → Analyzing → Analyzed → Building → Review → Done`) — there is no
 separate phase — decisions are just `add_note type:"decision"`, and the code
 locks when a task enters Analyzing.
 
@@ -166,7 +166,7 @@ cross-task, filterable table.
 There is **one axis**: `status`. It *is* the process — no separate derived
 phase.
 
-    Backlog → To Do → Analyzing → Analyzed → Building → Done
+    Backlog → To Do → Analyzing → Analyzed → Building → Review → Done
 
 The code locks (`GH-20*` → `GH-20`) the moment a task enters **Analyzing** (the
 first handoff), by any path — the picker, an AI `update_task`, or a Copy-prompt.

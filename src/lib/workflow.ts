@@ -20,7 +20,7 @@ Keep it lightweight — don't log for the sake of logging.
 
 **Status is the process spine** (set it with \`update_task\`):
 
-    Backlog → To Do → Analyzing → Analyzed → Building → Done
+    Backlog → To Do → Analyzing → Analyzed → Building → Review → Done
 
 Moving a task to **Analyzing or beyond locks its code** (\`GH-20*\` → \`GH-20\`) —
 a stable, permanent ref for the task. There are two handoffs: To Do → Analyzing
@@ -30,6 +30,13 @@ different people/AIs, or by you end to end.
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)
+
+**Read the code, don't infer it from other tasks.** A task's
+\`analysisSummary\`/\`plan\`/\`summary\` describe how *that* task was worked — they
+are context, never a map of the current codebase. Never use another task's
+notes to guess where code lives or how it's shaped; open the actual files and
+read them directly. (That's why \`list_tasks\`/\`search_tasks\` omit those
+fields — they're only on the task you \`get_task\` directly.)
 
 The steps below are **composable** — not every task needs every one. Depending
 on what's asked, you might do just the analysis, just the technical plan
@@ -68,7 +75,9 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    updates. Use \`type: "review"\` ONLY when the user explicitly asks you to flag
    something for them to visually double-check later — never on your own
    initiative; they check these off themselves (\`resolve_note\`).
-4. **Build** — set \`status: "building"\` and execute the plan.
+4. **Build** — set \`status: "building"\` and execute the plan. When the code is
+   written but not yet signed off, set \`status: "review"\` — a resting state
+   meaning "built, awaiting a look" (a valid place to stop).
 5. **Finish** — write a short \`summary\` of what was done (you can use
    \`git log\`/\`git diff\` to help), plus the context the diff can't show (the
    why, key decisions, gotchas, follow-ups) — give any scope added along the way
@@ -76,4 +85,6 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    "Can I mark this as done?" — and only mark the task done (\`complete_task\`)
    once the user confirms**. Never mark it done just because the code is
    written; the user may want to view or visually check something first.
+   \`update_task\` will refuse \`status: "done"\` for this reason — completion goes
+   through \`complete_task\`.
 `;

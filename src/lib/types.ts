@@ -15,6 +15,7 @@ export type TaskStatus =
   | "analyzing"
   | "analyzed"
   | "building"
+  | "review"
   | "done";
 
 /** How often a task repeats. */

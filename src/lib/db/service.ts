@@ -249,6 +249,7 @@ const LOCKING_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "analyzing",
   "analyzed",
   "building",
+  "review",
   "done",
 ]);
 
@@ -2340,6 +2341,7 @@ export async function saveCanvasNodes(
  *  `@name`; without it they fall back to the raw id. */
 export function toMarkdown(tree: TaskDTO[], names?: Map<string, string>): string {
   const order: TaskStatus[] = [
+    "review",
     "building",
     "analyzing",
     "analyzed",

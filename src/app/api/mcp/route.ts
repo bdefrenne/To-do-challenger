@@ -55,6 +55,7 @@ import {
   listCanvases,
   getCanvas,
   createCanvas,
+  type TaskDTO,
 } from "@/lib/db/service";
 import {
   listEvents,
@@ -91,6 +92,7 @@ const statusEnum = z.enum([
   "analyzing",
   "analyzed",
   "building",
+  "review",
   "done",
 ]);
 const recurrenceEnum = z.enum(["none", "daily", "weekly", "monthly"]);
@@ -179,6 +181,20 @@ const text = (data: unknown) => ({
   ],
 });
 
+/** Strip the free-text working fields (analysisSummary, plan, summary) from a
+ *  task and, recursively, its subtasks. These carry file paths and code detail,
+ *  so multi-task listings omit them — an AI must NOT infer where code lives from
+ *  another task's notes; read the code directly (or `get_task` /
+ *  `list_tasks_full_details` when it genuinely needs one task's own detail). */
+function slimTask(t: TaskDTO): TaskDTO {
+  const rest: TaskDTO = { ...t };
+  delete rest.analysisSummary;
+  delete rest.plan;
+  delete rest.summary;
+  if (rest.subtasks) rest.subtasks = rest.subtasks.map(slimTask);
+  return rest;
+}
+
 /** An image content block (base64) — how an AI actually "sees" an attachment. */
 const image = (data: string, mimeType: string) => ({
   content: [{ type: "image" as const, data, mimeType }],
@@ -211,16 +227,23 @@ const handler = createMcpHandler(
   (server) => {
     server.tool(
       "list_tasks",
-      "List every task on the board. Returns the full nested tree with stable ids, statuses, assignees, start/due dates, value/difficulty points, recurrence, dependencies and subtasks. Use format:'markdown' for a compact, skimmable view.",
+      "List every task on the board — the nested tree with stable ids, statuses, assignees, start/due dates, value/difficulty points, recurrence, dependencies and subtasks. Deliberately OMITS the free-text working fields (analysisSummary, plan, summary): those describe how another task was built and must NOT be used to infer where code lives — read the code directly, or `get_task` a specific task for its own detail. (Use `list_tasks_full_details` only if you truly need every task's analysis/plan/summary at once.) Use format:'markdown' for a compact, skimmable view.",
       { format: z.enum(["json", "markdown"]).optional().default("json") },
       async ({ format }) => {
         const tree = await listTasks(currentUser());
         return text(
           format === "markdown"
             ? toMarkdown(tree, await userNameMap())
-            : { tasks: tree },
+            : { tasks: tree.map(slimTask) },
         );
       },
+    );
+
+    server.tool(
+      "list_tasks_full_details",
+      "Like list_tasks, but INCLUDES every task's free-text working fields (analysisSummary, plan, summary) in the nested tree. Rarely needed — prefer list_tasks. Even here, treat another task's analysis/plan as background only: never infer file paths or code layout from it; read the actual code (or the specific task via get_task) before acting.",
+      {},
+      async () => text({ tasks: await listTasks(currentUser()) }),
     );
 
     server.tool(
@@ -276,7 +299,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → done); moving to analyzing or beyond locks the code. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call.",
       {
         id: z.string(),
         title: z.string().min(1).max(500).optional(),
@@ -302,6 +325,11 @@ const handler = createMcpHandler(
           ),
       },
       async ({ id, expectedUpdatedAt, ...patch }) => {
+        if (patch.status === "done") {
+          throw new Error(
+            "update_task cannot set status 'done'. Use complete_task — it requires human confirmation.",
+          );
+        }
         try {
           const task = await updateTask(
             id,
@@ -364,7 +392,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "search_tasks",
-      "Query your tasks by any combination of filters — PREFER this over list_tasks for targeted questions like 'what's overdue?', 'urgent work tasks', or 'what's assigned to Simon?'. All filters are optional and AND together. Returns a flat list.",
+      "Query your tasks by any combination of filters — PREFER this over list_tasks for targeted questions like 'what's overdue?', 'urgent work tasks', or 'what's assigned to Simon?'. All filters are optional and AND together. Returns a flat list. Like list_tasks, it OMITS the free-text working fields (analysisSummary, plan, summary) — get_task a specific task for those, and never infer code locations from another task's notes.",
       {
         status: z.array(statusEnum).optional(),
         assignee: z
@@ -391,7 +419,7 @@ const handler = createMcpHandler(
         return text(
           format === "markdown"
             ? toMarkdown(result, await userNameMap())
-            : { count: result.length, tasks: result },
+            : { count: result.length, tasks: result.map(slimTask) },
         );
       },
     );
@@ -923,10 +951,13 @@ const handler = createMcpHandler(
       {
         title: "My board (JSON)",
         description:
-          "Full nested task tree with ids, statuses, dates, points, subtasks.",
+          "Nested task tree with ids, statuses, dates, points, subtasks. Omits the free-text working fields (analysisSummary, plan, summary) — get_task a task for those; don't infer code locations from another task's notes.",
         mimeType: "application/json",
       },
-      async (uri) => json(uri.href, { tasks: await listTasks(currentUser()) }),
+      async (uri) =>
+        json(uri.href, {
+          tasks: (await listTasks(currentUser())).map(slimTask),
+        }),
     );
 
     server.registerResource(

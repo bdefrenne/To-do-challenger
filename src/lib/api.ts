@@ -15,6 +15,7 @@ export const statusSchema = z.enum([
   "analyzing",
   "analyzed",
   "building",
+  "review",
   "done",
 ]);
 export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);

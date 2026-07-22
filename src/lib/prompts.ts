@@ -28,7 +28,8 @@ export function analyzePrompt(code: string, title: string, lang?: Language | nul
     `We'll brainstorm it, do not build it yet.\n\n` +
     `First, right now, set status to "analyzing" via update_task — we're starting ` +
     `on this together, so do this before anything else. Then get_task to load full ` +
-    `context and read the relevant code in any relevant repo. ` +
+    `context and read the relevant code in any relevant repo — read the code ` +
+    `directly; don't infer where it lives from other tasks' notes. ` +
     `Follow the **Analyze** step of the todo workflow contract — it's in the MCP ` +
     `server instructions and the todo://workflow resource (read it if you haven't). ` +
     `Ask me anything unclear, then when it's settled ` +
@@ -49,7 +50,8 @@ export function planPrompt(code: string, title: string, lang?: Language | null):
     `the "todo" MCP. An analysis already exists — do not re-analyze, and do not ` +
     `build it yet.\n\n` +
     `Start with get_task to load full context (read the existing \`analysisSummary\`) ` +
-    `and read the relevant code in any relevant repo. ` +
+    `and read the relevant code in any relevant repo — read the code directly; ` +
+    `don't infer where it lives from other tasks' notes. ` +
     `Follow the **Technical Plan** step of the todo workflow contract — it's in ` +
     `the MCP server instructions and the todo://workflow resource (read it if you ` +
     `haven't). Ask me anything unclear, then write the \`plan\` via update_task — ` +
@@ -65,7 +67,8 @@ export function workPrompt(code: string, title: string, lang?: Language | null):
     `Build "${title}": I want you to build task ${code} — "${title}" using the "todo" MCP.\n\n` +
     `First, right now, set status to "building" via update_task — we're starting ` +
     `on this, so do this before anything else. Then get_task to load full context ` +
-    `and read the relevant code in any relevant repo, and follow the todo workflow ` +
+    `and read the relevant code in any relevant repo — read the code directly; ` +
+    `don't infer where it lives from other tasks' notes — and follow the todo workflow ` +
     `contract — it's in the MCP server ` +
     `instructions and the todo://workflow resource (read it if you haven't). In ` +
     `short: add_note only for significant decisions or ` +
@@ -85,7 +88,8 @@ export function analyzeThenWorkPrompt(code: string, title: string, lang?: Langua
     `using the "todo" MCP.\n\n` +
     `First, right now, set status to "analyzing" via update_task — we're starting ` +
     `on this, so do this before anything else. Then get_task to load full context ` +
-    `and read the relevant code. Follow ` +
+    `and read the relevant code — read the code directly; don't infer where it ` +
+    `lives from other tasks' notes. Follow ` +
     `the todo workflow contract (MCP server instructions / todo://workflow ` +
     `resource — read it if you haven't). Move it along the status spine as you go:\n` +
     `1. **Analyze** (already at status "analyzing") — think it through, ask me anything ` +

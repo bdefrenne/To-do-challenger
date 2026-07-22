@@ -3,6 +3,7 @@ import type { TaskStatus } from "./types";
 /** Display order of status groups in the List (top → bottom): active first,
  *  down the process spine, Done last. */
 export const STATUS_ORDER: TaskStatus[] = [
+  "review",
   "building",
   "analyzing",
   "analyzed",
@@ -17,12 +18,14 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   analyzing: "Analyzing",
   analyzed: "Analyzed",
   building: "Building",
+  review: "Review",
   done: "Done",
 };
 
 /** Tone classes for status pills / group headers (light theme). The process
  *  spine runs on a cool cyan→blue ramp: analyzing light cyan, analyzed a darker
- *  cyan, building blue — so a task visibly "cools" toward blue as it advances.
+ *  cyan, building blue, review violet — so a task visibly "cools" toward blue
+ *  then violet as it advances, before Done's warm buff.
  *  `outline` is the canvas ring color (see STATUS_CANVAS_BADGE). */
 export const STATUS_TONE: Record<
   TaskStatus,
@@ -67,6 +70,14 @@ export const STATUS_TONE: Record<
     dot: "bg-blue-600",
     icon: "◐",
     outline: "outline-blue-600",
+  },
+  review: {
+    text: "text-violet-700",
+    bg: "bg-violet-50",
+    border: "border-violet-600/30",
+    dot: "bg-violet-600",
+    icon: "◕",
+    outline: "outline-violet-600",
   },
   done: {
     text: "text-buff",
