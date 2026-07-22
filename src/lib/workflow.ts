@@ -49,8 +49,10 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    **out of scope**, and any **risk** — just say it in words a non-coder can act
    on. Save the file-level, step-by-step detail for the Technical Plan. Keep it
    concise, a short write-up that scales with the work; length is the driver's
-   call. When this is settled, set \`status: "analyzed"\` (a valid resting state
-   — understood, not yet built).
+   call. When this is settled, **ask first — "Can I mark this as analyzed?" —
+   and only set \`status: "analyzed"\` once the user confirms** (a valid resting
+   state — understood, not yet built). Never flip it to analyzed on your own; the
+   user may want to review or check something first.
 2. **Technical Plan** (optional) — the concrete plan that will be implemented.
    Not every task needs one, but whenever a plan is produced (e.g. you ask
    Claude to plan the task), it belongs here: paste the actual step-by-step plan
@@ -70,6 +72,8 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
 5. **Finish** — write a short \`summary\` of what was done (you can use
    \`git log\`/\`git diff\` to help), plus the context the diff can't show (the
    why, key decisions, gotchas, follow-ups) — give any scope added along the way
-   its own line. Keep it concise; length is the driver's call. Then mark the
-   task done (\`complete_task\`).
+   its own line. Keep it concise; length is the driver's call. Then **ask first —
+   "Can I mark this as done?" — and only mark the task done (\`complete_task\`)
+   once the user confirms**. Never mark it done just because the code is
+   written; the user may want to view or visually check something first.
 `;

@@ -139,14 +139,13 @@ export function TaskTable({
       className="overflow-x-auto rounded-xl border border-border bg-surface shadow-sm"
       onDragEnd={() => setDraggingId(null)}
     >
-      <div className="min-w-[844px]">
+      <div className="min-w-[704px]">
         {/* column header */}
         <div
           className={`${GRID} border-b border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-faint`}
         >
           <div>Name</div>
           <div className="text-center">Assignees</div>
-          <div>Board</div>
           <div>Status</div>
           <div>Due</div>
           <div>Updated</div>

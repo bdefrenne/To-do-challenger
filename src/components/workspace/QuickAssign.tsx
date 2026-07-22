@@ -30,6 +30,7 @@ export function QuickAssign({
   memberIds,
   onEditMembers,
   revealOnHover = true,
+  renderTrigger,
 }: {
   taskId: string;
   assigneeIds: string[];
@@ -39,6 +40,13 @@ export function QuickAssign({
   /** When true (canvas/kanban default), the trigger is hidden until card-hover.
    *  Set false on always-scannable surfaces like the list table. */
   revealOnHover?: boolean;
+  /** Replace the default "Assign" trigger button with a caller-supplied one
+   *  (e.g. the list's avatar stack). The popover + keyboard shortcut are
+   *  unchanged; `toggle` opens/closes the same picker. */
+  renderTrigger?: (state: {
+    open: boolean;
+    toggle: (e: React.MouseEvent) => void;
+  }) => React.ReactNode;
   /** Restrict the pickable people to these roster user ids (the task's project
    *  members). Empty/undefined ⇒ the whole roster (fallback). */
   memberIds?: string[];
@@ -104,6 +112,13 @@ export function QuickAssign({
     onChange(taskId, { assigneeIds: next });
   };
 
+  // Open/close the picker (distinct from `toggle`, which toggles a person).
+  const toggleOpen = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (open) setOpen(false);
+    else openFresh();
+  };
+
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -142,27 +157,27 @@ export function QuickAssign({
       // The card is HTML5-draggable; don't let interactions here start a drag.
       onDragStart={(e) => e.stopPropagation()}
     >
-      <button
-        type="button"
-        title="Assign (press A while hovering the card)"
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => {
-          e.stopPropagation();
-          if (open) setOpen(false);
-          else openFresh();
-        }}
-        className={[
-          "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
-          open
-            ? "border-accent bg-accent-soft text-accent"
-            : "border-border bg-surface-2 text-muted hover:border-accent hover:text-accent",
-        ].join(" ")}
-      >
-        Assign
-        <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
-          A
-        </kbd>
-      </button>
+      {renderTrigger ? (
+        renderTrigger({ open, toggle: toggleOpen })
+      ) : (
+        <button
+          type="button"
+          title="Assign (press A while hovering the card)"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={toggleOpen}
+          className={[
+            "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
+            open
+              ? "border-accent bg-accent-soft text-accent"
+              : "border-border bg-surface-2 text-muted hover:border-accent hover:text-accent",
+          ].join(" ")}
+        >
+          Assign
+          <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
+            A
+          </kbd>
+        </button>
+      )}
 
       <AnchoredPopover
         open={open}

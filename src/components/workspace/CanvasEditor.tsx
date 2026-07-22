@@ -1072,7 +1072,10 @@ export function CanvasEditor({
         : "default";
 
   return (
-    <div className="relative h-full w-full overflow-hidden">
+    // Fill the positioned parent via absolute inset-0 rather than h-full: Safari
+    // doesn't treat a flex item's height as "definite", so a percentage height
+    // here collapses to 0 and (with overflow-hidden) blanks the whole canvas.
+    <div className="absolute inset-0 overflow-hidden">
       {/* Toolbar */}
       <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-1">
         <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">

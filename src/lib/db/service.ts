@@ -1989,12 +1989,22 @@ export async function setProjectMembers(
 ): Promise<string[] | null> {
   if (!(await ownsProject(projectId, userId))) return null;
   const validIds = await validUserIds([...new Set(memberIds)]);
-  await db.transaction(async (tx) => {
-    await tx.delete(projectMembers).where(eq(projectMembers.projectId, projectId));
-    await tx
-      .insert(projectMembers)
-      .values(validIds.map((uid) => ({ projectId, userId: uid })));
-  });
+  // The neon-http driver has no interactive transactions — use `db.batch`,
+  // which runs the statements in a single atomic HTTP transaction. Skip the
+  // insert entirely when the set is empty (Drizzle rejects `.values([])`).
+  const clear = db
+    .delete(projectMembers)
+    .where(eq(projectMembers.projectId, projectId));
+  if (validIds.length === 0) {
+    await clear;
+  } else {
+    await db.batch([
+      clear,
+      db
+        .insert(projectMembers)
+        .values(validIds.map((uid) => ({ projectId, userId: uid }))),
+    ]);
+  }
   return validIds;
 }
 

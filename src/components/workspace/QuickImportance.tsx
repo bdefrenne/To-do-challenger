@@ -25,6 +25,7 @@ export function QuickImportance({
   onChange,
   className = "",
   revealOnHover = true,
+  renderTrigger,
 }: {
   importance: Importance;
   onChange: (v: Importance) => void;
@@ -33,6 +34,12 @@ export function QuickImportance({
   /** When true (canvas/kanban default), a Normal importance is hidden until
    *  card-hover. Set false on always-scannable surfaces like the list table. */
   revealOnHover?: boolean;
+  /** Replace the default canvas-style trigger button with a caller-supplied one.
+   *  The popover + keyboard shortcut are unchanged; `toggle` opens/closes it. */
+  renderTrigger?: (state: {
+    open: boolean;
+    toggle: (e: React.MouseEvent) => void;
+  }) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -87,6 +94,12 @@ export function QuickImportance({
   const tone = IMPORTANCE_TONE[importance];
   const notable = importance !== 0;
 
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (open) setOpen(false);
+    else openFresh();
+  };
+
   return (
     <div
       ref={rootRef}
@@ -102,27 +115,27 @@ export function QuickImportance({
         .join(" ")}
       onDragStart={(e) => e.stopPropagation()}
     >
-      <button
-        type="button"
-        title="Importance (press I while hovering the card)"
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => {
-          e.stopPropagation();
-          if (open) setOpen(false);
-          else openFresh();
-        }}
-        className={[
-          "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
-          open
-            ? "border-accent bg-accent-soft text-accent"
-            : `${tone.border} ${tone.bg} ${tone.text} hover:border-accent hover:text-accent`,
-        ].join(" ")}
-      >
-        {IMPORTANCE_LABEL[importance]}
-        <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
-          I
-        </kbd>
-      </button>
+      {renderTrigger ? (
+        renderTrigger({ open, toggle })
+      ) : (
+        <button
+          type="button"
+          title="Importance (press I while hovering the card)"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={toggle}
+          className={[
+            "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
+            open
+              ? "border-accent bg-accent-soft text-accent"
+              : `${tone.border} ${tone.bg} ${tone.text} hover:border-accent hover:text-accent`,
+          ].join(" ")}
+        >
+          {IMPORTANCE_LABEL[importance]}
+          <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
+            I
+          </kbd>
+        </button>
+      )}
 
       <AnchoredPopover
         open={open}

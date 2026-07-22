@@ -28,6 +28,7 @@ export function QuickStatus({
   onChange,
   className = "",
   revealOnHover = true,
+  renderTrigger,
 }: {
   status: TaskStatus;
   onChange: (s: TaskStatus) => void;
@@ -36,6 +37,13 @@ export function QuickStatus({
   /** When true (canvas/kanban default), the trigger is hidden until card-hover.
    *  Set false on always-scannable surfaces like the list table. */
   revealOnHover?: boolean;
+  /** Replace the default canvas-style trigger button with a caller-supplied one
+   *  (e.g. the list's own status pill). The popover + keyboard shortcut are
+   *  unchanged; `toggle` opens/closes the same picker. */
+  renderTrigger?: (state: {
+    open: boolean;
+    toggle: (e: React.MouseEvent) => void;
+  }) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -89,6 +97,12 @@ export function QuickStatus({
 
   const tone = STATUS_TONE[status];
 
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (open) setOpen(false);
+    else openFresh();
+  };
+
   return (
     <div
       ref={rootRef}
@@ -101,28 +115,28 @@ export function QuickStatus({
         .join(" ")}
       onDragStart={(e) => e.stopPropagation()}
     >
-      <button
-        type="button"
-        title="Status (press S while hovering the card)"
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => {
-          e.stopPropagation();
-          if (open) setOpen(false);
-          else openFresh();
-        }}
-        className={[
-          "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
-          open
-            ? "border-accent bg-accent-soft text-accent"
-            : "border-border bg-surface-2 text-muted hover:border-accent hover:text-accent",
-        ].join(" ")}
-      >
-        <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} aria-hidden />
-        {STATUS_LABEL[status]}
-        <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
-          S
-        </kbd>
-      </button>
+      {renderTrigger ? (
+        renderTrigger({ open, toggle })
+      ) : (
+        <button
+          type="button"
+          title="Status (press S while hovering the card)"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={toggle}
+          className={[
+            "flex h-5 items-center gap-1 rounded border px-1.5 text-[11px] font-medium transition-colors",
+            open
+              ? "border-accent bg-accent-soft text-accent"
+              : "border-border bg-surface-2 text-muted hover:border-accent hover:text-accent",
+          ].join(" ")}
+        >
+          <span className={`h-2 w-2 shrink-0 rounded-full ${tone.dot}`} aria-hidden />
+          {STATUS_LABEL[status]}
+          <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
+            S
+          </kbd>
+        </button>
+      )}
 
       <AnchoredPopover
         open={open}

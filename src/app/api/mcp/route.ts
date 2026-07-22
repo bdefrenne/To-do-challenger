@@ -1098,7 +1098,7 @@ const handler = createMcpHandler(
       {
         title: "Finish a task",
         description:
-          "Write a short summary of what actually shipped (you can diff git to help), mark done.",
+          "Write a short summary of what actually shipped (you can diff git to help), then ask before marking done.",
         argsSchema: { taskId: z.string() },
       },
       async ({ taskId }) => {
@@ -1127,7 +1127,9 @@ const handler = createMcpHandler(
             } (or the branch point) and compare against the plan + decisions above ` +
             `to help. Add the context the diff can't show — the why, key decisions, ` +
             `gotchas, follow-ups — and give any scope added along the way its own ` +
-            `line. Keep it concise.`,
+            `line. Keep it concise. Then ask me "Can I mark this as done?" and ` +
+            `only complete_task once I confirm — never just because the code is ` +
+            `written; I may want to view or visually check something first.`,
         );
       },
     );
