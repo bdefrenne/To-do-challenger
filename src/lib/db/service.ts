@@ -1972,12 +1972,13 @@ export async function listProjectMembers(
       name: users.name,
       color: users.color,
       avatarUrl: users.avatarUrl,
+      language: users.language,
     })
     .from(projectMembers)
     .innerJoin(users, eq(projectMembers.userId, users.id))
     .where(eq(projectMembers.projectId, projectId))
     .orderBy(asc(users.name));
-  return rows;
+  return rows as PublicUser[];
 }
 
 /** Replace a project's whole member set (exactly the ids given). Returns the

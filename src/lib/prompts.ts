@@ -13,8 +13,16 @@
   - `analyzeThenWorkPrompt` — analyze → work → finish, end to end.
 */
 
+/** The two working languages a user can pick in their profile. */
+export type Language = "en" | "fr";
+
+/** Appended to every prompt for non-French users so the AI works in English. */
+export function langSuffix(lang: Language | null | undefined): string {
+  return lang === "fr" ? "" : "\n\nWork and talk in ENGLISH.";
+}
+
 /** Analyze only: load context, think it through, record the analysis — no build. */
-export function analyzePrompt(code: string, title: string): string {
+export function analyzePrompt(code: string, title: string, lang?: Language | null): string {
   return (
     `Analyze "${title}": I want to ANALYZE with you the task ${code} — "${title}" using the "todo" MCP. ` +
     `We'll brainstorm it, do not build it yet.\n\n` +
@@ -29,12 +37,13 @@ export function analyzePrompt(code: string, title: string): string {
     `via update_task — keep it concise. Then ask me "Can I mark this as ` +
     `analyzed?" and only set status to "analyzed" once I confirm — I may want to ` +
     `review or check something first. Stop ` +
-    `there — don't start building until I hand it to you.`
+    `there — don't start building until I hand it to you.` +
+    langSuffix(lang)
   );
 }
 
 /** Technical Plan only: an analysis already exists, write the plan — no build. */
-export function planPrompt(code: string, title: string): string {
+export function planPrompt(code: string, title: string, lang?: Language | null): string {
   return (
     `Tech Analysis "${title}": I want you to write the TECHNICAL PLAN for task ${code} — "${title}" using ` +
     `the "todo" MCP. An analysis already exists — do not re-analyze, and do not ` +
@@ -45,12 +54,13 @@ export function planPrompt(code: string, title: string): string {
     `the MCP server instructions and the todo://workflow resource (read it if you ` +
     `haven't). Ask me anything unclear, then write the \`plan\` via update_task — ` +
     `the actual step-by-step plan you'll execute, not a summary of it. Stop there ` +
-    `— don't start building until I hand it to you.`
+    `— don't start building until I hand it to you.` +
+    langSuffix(lang)
   );
 }
 
 /** Work handoff: build it (assumes the code is locked). */
-export function workPrompt(code: string, title: string): string {
+export function workPrompt(code: string, title: string, lang?: Language | null): string {
   return (
     `Build "${title}": I want you to build task ${code} — "${title}" using the "todo" MCP.\n\n` +
     `First, right now, set status to "building" via update_task — we're starting ` +
@@ -63,12 +73,13 @@ export function workPrompt(code: string, title: string): string {
     `short summary of what shipped — you can diff git to help) when we're done. ` +
     `Then ask me "Can I mark this as done?" and only mark it done once I confirm — ` +
     `never mark it done just because the code is written; I may want to view or ` +
-    `visually check something first.`
+    `visually check something first.` +
+    langSuffix(lang)
   );
 }
 
 /** Full run: analyze first, then work through to done. */
-export function analyzeThenWorkPrompt(code: string, title: string): string {
+export function analyzeThenWorkPrompt(code: string, title: string, lang?: Language | null): string {
   return (
     `Analyze & Build "${title}": I want you to take task ${code} — "${title}" from analysis through to done, ` +
     `using the "todo" MCP.\n\n` +
@@ -89,6 +100,7 @@ export function analyzeThenWorkPrompt(code: string, title: string): string {
     `4. **Finish** — write a short \`summary\` of what actually shipped (you can ` +
     `diff git to help; call out any added scope). Then ask me "Can I mark this as ` +
     `done?" and only mark it done once I confirm — never just because the code is ` +
-    `written; I may want to view or visually check something first.`
+    `written; I may want to view or visually check something first.` +
+    langSuffix(lang)
   );
 }

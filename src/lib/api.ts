@@ -203,6 +203,7 @@ export const profileSchema = z
     name: z.string().min(1, "name can't be empty").max(120),
     color: z.string().regex(/^#[0-9a-fA-F]{6}$/, "use a #rrggbb hex color"),
     avatarUrl: z.string().url().max(2048).nullable(),
+    language: z.enum(["en", "fr"]),
   })
   .partial()
   .refine((v) => Object.keys(v).length > 0, { message: "provide a field to update" });

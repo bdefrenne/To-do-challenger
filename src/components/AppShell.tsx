@@ -19,6 +19,8 @@ export interface SessionUser {
   color: string;
   /** Profile picture URL, or null (initials fallback). */
   avatarUrl: string | null;
+  /** Working language ("en" | "fr"). */
+  language: "en" | "fr";
 }
 
 const NAV = [

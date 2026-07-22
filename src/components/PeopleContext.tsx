@@ -23,6 +23,8 @@ export interface Person {
   name: string;
   color: string;
   avatarUrl: string | null;
+  /** Working language ("en" | "fr"). */
+  language: "en" | "fr";
 }
 
 interface PeopleContextValue {

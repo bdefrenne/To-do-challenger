@@ -856,10 +856,11 @@ export function CanvasEditor({
   const onNodePointerDown = useCallback(
     (e: ReactPointerEvent, node: CanvasNode) => {
       if (e.button !== 0 || spaceRef.current) return;
-      // Pen strokes aren't selectable or draggable. Let the event bubble to the
-      // background so you can keep drawing (or marquee) straight over the ink;
-      // the eraser hit-tests strokes separately via `data-draw-id`.
-      if (node.kind === "draw") return;
+      // Pen strokes bubble to the background while the draw/erase tools are
+      // active, so you can keep drawing straight over the ink and the eraser can
+      // hit-test strokes via `data-draw-id`. With the Select tool they behave
+      // like any other node — click to select, drag to move.
+      if (node.kind === "draw" && toolRef.current !== "select") return;
       e.stopPropagation();
       if (editingRef.current === node.id) return;
 
@@ -1004,7 +1005,6 @@ export function CanvasEditor({
         const hit = nodesRef.current
           .filter(
             (n) =>
-              n.kind !== "draw" && // strokes aren't selectable/movable
               n.x < rect.x1 && n.x + n.width > rect.x0 && n.y < rect.y1 && n.y + n.height > rect.y0,
           )
           .map((n) => n.id);

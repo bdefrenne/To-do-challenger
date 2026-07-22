@@ -63,10 +63,11 @@ import {
   deleteEvent,
   CalendarError,
 } from "@/lib/google/calendar";
-import { listUsers, type PublicUser } from "@/lib/db/users";
+import { listUsers, getUserById, type PublicUser } from "@/lib/db/users";
 import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
 import { WORKFLOW } from "@/lib/workflow";
+import { langSuffix } from "@/lib/prompts";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -198,6 +199,13 @@ const userMsg = (body: string) => ({
     { role: "user" as const, content: { type: "text" as const, text: body } },
   ],
 });
+
+/** Like `userMsg`, but appends the English directive for non-French users so
+ *  every slash-command prompt respects the caller's language setting. */
+const promptMsg = async (body: string) => {
+  const u = await getUserById(currentUser());
+  return userMsg(body + langSuffix(u?.language));
+};
 
 const handler = createMcpHandler(
   (server) => {
@@ -982,7 +990,7 @@ const handler = createMcpHandler(
       },
       async () => {
         const today = toMarkdown(await listToday(currentUser()), await userNameMap());
-        return userMsg(
+        return await promptMsg(
           `Here is my board for today (in-progress, planned, and anything due or overdue):\n\n${today}\n\n` +
             `Please propose a prioritized plan for today: what to do first and why, what to defer, and any risks or blockers. ` +
             `If I approve, you can reorder or restage tasks with the move_task and update_task tools.`,
@@ -1003,7 +1011,7 @@ const handler = createMcpHandler(
         const body = backlog.length
           ? toMarkdown(backlog, await userNameMap())
           : "_(backlog is empty)_";
-        return userMsg(
+        return await promptMsg(
           `Here is my backlog:\n\n${body}\n\n` +
             `Please triage it: for each task suggest a value/difficulty and a due date where it makes sense, ` +
             `and flag anything that should be dropped or promoted to Planned. ` +
@@ -1030,7 +1038,7 @@ const handler = createMcpHandler(
         );
         const section = (label: string, tasks: typeof all) =>
           `## ${label}\n\n${tasks.length ? toMarkdown(tasks, names) : "_(none)_"}`;
-        return userMsg(
+        return await promptMsg(
           `${section("Completed in the last 7 days", done)}\n\n` +
             `${section("Stale backlog (untouched 14+ days)", stale)}\n\n` +
             `Please write a short weekly review: what I accomplished, what's stalled and why it might be, ` +
@@ -1049,10 +1057,10 @@ const handler = createMcpHandler(
       async ({ taskId }) => {
         const result = await getTask(taskId, currentUser());
         if (!result)
-          return userMsg(
+          return await promptMsg(
             `Task ${taskId} was not found on my board. Please ask me to pick a valid task id.`,
           );
-        return userMsg(
+        return await promptMsg(
           `Here is a task I'd like to break down:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
             `Please propose a set of concrete subtasks that would complete it, in a sensible order. ` +
             `If I approve, create them with the create_task tool using parentId: "${taskId}".`,
@@ -1078,11 +1086,11 @@ const handler = createMcpHandler(
         const locked = await mintRef(taskId, currentUser(), AI_AUTHOR);
         const result = await getTask(taskId, currentUser());
         if (!locked || !result)
-          return userMsg(
+          return await promptMsg(
             `Task ${taskId} was not found on my board. Please ask me to pick a valid task id or code.`,
           );
         const code = result.task.code ?? taskId;
-        return userMsg(
+        return await promptMsg(
           `I want you to work on task **${code} — ${result.task.title}** (id: ${taskId}).\n\n` +
             `Here it is:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
             `Follow the todo workflow contract (in your server instructions / the ` +
@@ -1104,13 +1112,13 @@ const handler = createMcpHandler(
       async ({ taskId }) => {
         const result = await getTask(taskId, currentUser());
         if (!result)
-          return userMsg(
+          return await promptMsg(
             `Task ${taskId} was not found. Please ask me to pick a valid task id or code.`,
           );
         const t = result.task;
         const since = t.lockedAt ?? t.createdAt;
         const decisionNotes = result.notes.filter((n) => n.type === "decision");
-        return userMsg(
+        return await promptMsg(
           `Let's finish task **${t.code ?? taskId} — ${t.title}** (id: ${taskId}).\n\n` +
             `Recorded plan:\n${t.plan ?? "_(none)_"}\n\n` +
             `Recorded decisions:\n${
@@ -1143,7 +1151,7 @@ const handler = createMcpHandler(
       },
       async ({ from, to }) => {
         const data = await standup(currentUser(), from, to);
-        return userMsg(
+        return await promptMsg(
           `Here's the raw material for a standup covering ${from} → ${to}:\n\n` +
             `${JSON.stringify(data, null, 2)}\n\n` +
             `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, **Questions**, and **To review** (review-type notes still open); list what shipped (finished tasks + one-line summaries); and call out any notable decisions. Keep it tight enough to paste into a team channel.`,

@@ -43,6 +43,9 @@ export const users = pgTable(
     color: text("color").notNull().default("#7b68ee"),
     /** Vercel Blob public URL of the profile picture, or null (initials fallback). */
     avatarUrl: text("avatar_url"),
+    /** Working language ("en" | "fr"). Non-French users get an English directive
+     *  appended to every prompt the app produces. */
+    language: text("language").notNull().default("en"),
     /** ≤4-char ref prefix used as the LAST fallback for a task's code (board →
      *  project → user). Nullable in the DB (backfilled + set on demand); the
      *  service always resolves a usable prefix. */

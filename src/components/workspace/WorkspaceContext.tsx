@@ -96,6 +96,14 @@ interface WorkspaceContextValue {
   /** Move a task onto a board (optionally also set its status). */
   moveToBoard: (id: string, boardId: string, status?: TaskStatus) => void;
   addTask: (status: TaskStatus, title: string, boardId?: string | null) => void;
+  /** Create a task inside a canvas Section (tagged by `customFields.sectionId`),
+   *  optionally nested under `parentId`. Optimistic, like `addTask`. */
+  addSectionTask: (input: {
+    title: string;
+    sectionId: string;
+    boardId: string | null;
+    parentId?: string | null;
+  }) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
   /** Lock the task's code (freeze it) and return a ready-to-paste work prompt. */
@@ -1114,6 +1122,81 @@ export function WorkspaceProvider({
     );
   }
 
+  // Create a task inside a canvas Section. A section's tasks are scoped by the
+  // hidden `customFields.sectionId` tag (not by board), so that tag — and the
+  // section's boardId — MUST ride along or the card won't show. Mirrors addTask's
+  // optimistic temp-id → real-id swap; `parentId` set makes it a subtask.
+  function addSectionTask(input: {
+    title: string;
+    sectionId: string;
+    boardId: string | null;
+    parentId?: string | null;
+  }) {
+    const { title, sectionId, boardId } = input;
+    const parentId = input.parentId ?? null;
+    const tempId = `temp-${Date.now()}`;
+    const now = new Date().toISOString();
+    // End of this section's sibling group (same parent), not the global status
+    // group — the section list sorts by position within a parent regardless of
+    // status.
+    const maxPos = Math.max(
+      0,
+      ...nodes
+        .filter(
+          (n) =>
+            n.parentId === parentId &&
+            taskMap[n.id]?.customFields?.sectionId === sectionId,
+        )
+        .map((n) => n.position),
+    );
+    mutate(
+      () => {
+        setTaskMap((prev) => ({
+          ...prev,
+          [tempId]: {
+            id: tempId,
+            title,
+            status: "backlog",
+            assigneeIds: meId ? [meId] : [],
+            boardId,
+            customFields: { sectionId },
+            updatedAt: now,
+          },
+        }));
+        setNodes((prev) => [
+          ...prev,
+          { id: tempId, parentId, boardId, status: "backlog", statusSince: now, position: maxPos + 1 },
+        ]);
+      },
+      () =>
+        api("/api/tasks", {
+          method: "POST",
+          body: JSON.stringify({
+            title,
+            status: "backlog",
+            assigneeIds: meId ? [meId] : [],
+            boardId,
+            parentId,
+            customFields: { sectionId },
+          }),
+        }),
+      {
+        onSuccess: (result) => {
+          const real = (result as { task?: Task }).task;
+          if (!real?.id) return;
+          setTaskMap((prev) => {
+            if (!prev[tempId]) return prev;
+            const next = { ...prev };
+            delete next[tempId];
+            next[real.id] = real;
+            return next;
+          });
+          setNodes((prev) => prev.map((n) => (n.id === tempId ? { ...n, id: real.id } : n)));
+        },
+      },
+    );
+  }
+
   /* ---- Open detail (lazily loads the activity log) ---- */
   // Push a new modal onto the stack. If the task is already open somewhere in
   // the stack, pop back to it (prevents duplicate levels and navigation cycles).
@@ -1347,6 +1430,7 @@ export function WorkspaceProvider({
         dropToGroup,
         moveToBoard,
         addTask,
+        addSectionTask,
         addComment,
         lockTask,
         taskPrompt,

@@ -230,6 +230,7 @@ function ProfileSection() {
 
   const [name, setName] = useState(me?.name ?? "");
   const [color, setColor] = useState(me?.color ?? "#7b68ee");
+  const [language, setLanguage] = useState<"en" | "fr">(me?.language ?? "en");
   const [urlDraft, setUrlDraft] = useState("");
   const [cropFile, setCropFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
@@ -242,6 +243,7 @@ function ProfileSection() {
     setSeededFor(me.id);
     setName(me.name);
     setColor(me.color);
+    setLanguage(me.language);
   }
 
   const flash = useCallback(() => {
@@ -375,9 +377,24 @@ function ProfileSection() {
             </div>
           </div>
 
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-muted">Language</span>
+            <select
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as "en" | "fr")}
+              className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+            >
+              <option value="en">English</option>
+              <option value="fr">Français</option>
+            </select>
+            <span className="mt-1 block text-xs text-muted">
+              Non-French users get “Work and talk in ENGLISH” appended to prompts.
+            </span>
+          </label>
+
           <div className="flex items-center gap-2">
             <button
-              onClick={() => patchProfile({ name: name.trim(), color })}
+              onClick={() => patchProfile({ name: name.trim(), color, language })}
               disabled={busy || !name.trim() || !/^#[0-9a-fA-F]{6}$/.test(color)}
               className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
             >

@@ -155,6 +155,13 @@
       "when": 1784705856243,
       "tag": "0021_add_canvas_image_kind",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1784734071369,
+      "tag": "0022_add_user_language",
+      "breakpoints": true
     }
   ]
 }

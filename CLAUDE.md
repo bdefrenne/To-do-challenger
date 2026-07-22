@@ -33,6 +33,10 @@ Answer those against the MCP, not the source. Useful tools: `list_projects`,
 `complete_task`, `record_decision`, …). Follow the todo MCP's own usage
 instructions when creating or modifying anything.
 
+**Todo mapping.** When creating a task here (per the global "always work from
+the todo" rule), file it under the **To Do Challenger** project → **To Do**
+board (`TD`).
+
 ## Commands
 
 - `npm run dev` — dev server

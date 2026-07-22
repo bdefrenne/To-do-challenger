@@ -14,6 +14,7 @@ import {
   generateToken,
   hashToken,
 } from "@/lib/session";
+import type { Language } from "@/lib/prompts";
 
 /** Public view of a user — never includes the password hash. */
 export interface PublicUser {
@@ -24,6 +25,8 @@ export interface PublicUser {
   color: string;
   /** Profile picture URL, or null (fall back to initials). */
   avatarUrl: string | null;
+  /** Working language — drives the English directive on prompts. */
+  language: Language;
 }
 
 const toPublic = (u: UserRow): PublicUser => ({
@@ -32,6 +35,7 @@ const toPublic = (u: UserRow): PublicUser => ({
   name: u.name,
   color: u.color,
   avatarUrl: u.avatarUrl,
+  language: (u.language as Language) ?? "en",
 });
 
 /* -------------------------------------------------------------------- */
@@ -87,6 +91,7 @@ export interface ProfilePatch {
   color?: string;
   /** null clears the picture (back to initials). */
   avatarUrl?: string | null;
+  language?: Language;
 }
 
 /** Update the given user's profile. Returns the fresh public view. */
@@ -98,6 +103,7 @@ export async function updateUserProfile(
   if (patch.name !== undefined) set.name = patch.name.trim();
   if (patch.color !== undefined) set.color = patch.color;
   if (patch.avatarUrl !== undefined) set.avatarUrl = patch.avatarUrl;
+  if (patch.language !== undefined) set.language = patch.language;
   if (Object.keys(set).length === 0) return getUserById(userId);
   const [row] = await db
     .update(users)

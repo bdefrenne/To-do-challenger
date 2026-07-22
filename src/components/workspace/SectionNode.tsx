@@ -811,7 +811,10 @@ export function SectionNode({
             onMove={ws.moveNode}
             onAssignSelf={ws.toggleSelfAssignee}
             onDelete={ws.deleteTask}
-            onAdd={() => !locked && enterAuthoring()}
+            onAddTask={(title) => ws.addSectionTask({ title, sectionId, boardId, parentId: null })}
+            onAddSubtask={(parentId, title) =>
+              ws.addSectionTask({ title, sectionId, boardId, parentId })
+            }
           />
         )}
       </div>
@@ -1097,6 +1100,8 @@ interface CardHandlers {
   onAssignSelf: (id: string) => void;
   /** Delete the task with an undo window (DELETE hover shortcut). */
   onDelete: (id: string) => void;
+  /** Create a subtask under this task (from the hover "+ Subtask" button). */
+  onAddSubtask: (parentId: string, title: string) => void;
   dropHint: { id: string; pos: "before" | "after" } | null;
   setDropHint: (h: { id: string; pos: "before" | "after" } | null) => void;
 }
@@ -1104,6 +1109,7 @@ interface CardHandlers {
 /** One task card + its children, rendered recursively (arbitrary depth). */
 function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHandlers }) {
   const cardRef = useRef<HTMLDivElement>(null);
+  const [addingSub, setAddingSub] = useState(false);
   const id = unit.taskId;
   const t = id ? h.taskMap[id] : undefined;
   const done = t?.status === "done";
@@ -1185,16 +1191,112 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
             {badge}
           </span>
         ) : null}
+        {/* Hover-revealed "+ Subtask" — top-right, below any status badge. Opens
+            the nested composer under this card. */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            setAddingSub(true);
+          }}
+          title="Add subtask"
+          className={[
+            "absolute right-1.5 z-20 hidden items-center gap-0.5 rounded border border-border bg-surface px-1.5 py-0.5 text-[11px] text-muted shadow-sm hover:border-accent hover:text-accent group-hover/card:flex",
+            badge ? "top-3" : "top-1.5",
+          ].join(" ")}
+        >
+          <span className="leading-none">+</span> Subtask
+        </button>
         <TaskCardBody task={t} h={h} />
       </div>
-      {unit.children.length ? (
+      {unit.children.length || addingSub ? (
         <div className="mt-1.5 space-y-1.5">
           {unit.children.map((c) => (
             <TaskCard key={c.taskId ?? c.title} unit={c} depth={depth + 1} h={h} />
           ))}
+          {addingSub ? (
+            <div style={{ marginLeft: 12 }}>
+              <InlineTaskComposer
+                label="Subtask"
+                onSubmit={(title) => h.onAddSubtask(id, title)}
+                onClose={() => setAddingSub(false)}
+              />
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Inline task/subtask composer — the "+ Add task" / "+ Subtask" input. Mirrors
+ * the kanban AddCard UX: Enter creates and CLEARS but keeps the input open for
+ * rapid entry; Esc or an empty blur closes it.
+ *
+ * Two modes: self-managed (no `onClose`) toggles its own button ↔ input, used
+ * for the always-present bottom composer; controlled-open (`onClose` given) is
+ * mounted already editing by its parent, and closing calls `onClose` to unmount
+ * — used for the per-card subtask composer.
+ */
+function InlineTaskComposer({
+  label,
+  onSubmit,
+  onClose,
+}: {
+  label: string;
+  onSubmit: (title: string) => void;
+  onClose?: () => void;
+}) {
+  const controlled = !!onClose;
+  const [editing, setEditing] = useState(controlled);
+  const [text, setText] = useState("");
+
+  const close = () => {
+    setText("");
+    if (controlled) onClose?.();
+    else setEditing(false);
+  };
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          setEditing(true);
+        }}
+        className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-xs text-faint hover:bg-surface-3 hover:text-muted"
+      >
+        <span className="text-sm leading-none">+</span> {label}
+      </button>
+    );
+  }
+
+  return (
+    <input
+      autoFocus
+      value={text}
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setText(e.target.value)}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter" && text.trim()) {
+          onSubmit(text.trim());
+          setText(""); // keep open for rapid entry
+        } else if (e.key === "Escape") {
+          close();
+        }
+      }}
+      onBlur={() => {
+        if (!text.trim()) close();
+      }}
+      placeholder={`${label} name, then Enter…`}
+      className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
+    />
   );
 }
 
@@ -1209,7 +1311,8 @@ function CommittedList({
   onMove,
   onAssignSelf,
   onDelete,
-  onAdd,
+  onAddTask,
+  onAddSubtask,
 }: {
   units: TaskUnit[];
   taskMap: Record<string, Task>;
@@ -1221,27 +1324,19 @@ function CommittedList({
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   onAssignSelf: (id: string) => void;
   onDelete: (id: string) => void;
-  onAdd: () => void;
+  onAddTask: (title: string) => void;
+  onAddSubtask: (parentId: string, title: string) => void;
 }) {
   const [dropHint, setDropHint] = useState<{ id: string; pos: "before" | "after" } | null>(null);
 
-  if (!units.length) {
-    return (
-      <button
-        onClick={onAdd}
-        className="grid h-full w-full place-items-center text-sm text-faint hover:text-accent"
-      >
-        No tasks yet — click to add.
-      </button>
-    );
-  }
-
-  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, dropHint, setDropHint };
+  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onAddSubtask, dropHint, setDropHint };
   return (
     <div className="space-y-1.5">
       {units.map((u) => (
         <TaskCard key={u.taskId ?? u.title} unit={u} depth={0} h={h} />
       ))}
+      {/* Always-present "+ Add task" composer at the bottom of the list. */}
+      <InlineTaskComposer label="Add task" onSubmit={onAddTask} />
     </div>
   );
 }
