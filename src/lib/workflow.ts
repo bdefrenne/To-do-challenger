@@ -40,9 +40,17 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
 1. **Analyze** — think the non-trivial parts
    through. Set \`status: "analyzing"\`, then write the free-text field
    \`analysisSummary\` via \`update_task\` (the **Analysis** — what & why, the
-   approach, trade-offs). Keep it concise, a short write-up that scales with the work;
-   length is the driver's call. When this is settled, set \`status: "analyzed"\`
-   (a valid resting state — understood, not yet built).
+   approach, trade-offs). **Write it for a reader who won't open the code** —
+   whoever picks the task up may not be technical. Stay as no-code as you can:
+   lead with what changes for the user, and describe the code in plain words
+   rather than file paths, symbol names, or jargon. You must still convey the
+   code reality — what already exists and is **reused**, what's genuinely
+   **new**, what's a **duplicate** or merely **relocated**, what's deliberately
+   **out of scope**, and any **risk** — just say it in words a non-coder can act
+   on. Save the file-level, step-by-step detail for the Technical Plan. Keep it
+   concise, a short write-up that scales with the work; length is the driver's
+   call. When this is settled, set \`status: "analyzed"\` (a valid resting state
+   — understood, not yet built).
 2. **Technical Plan** (optional) — the concrete plan that will be implemented.
    Not every task needs one, but whenever a plan is produced (e.g. you ask
    Claude to plan the task), it belongs here: paste the actual step-by-step plan

@@ -38,8 +38,12 @@ different people/AIs, or by the same one end to end:
   and asks anything unclear **before** deciding.
 - `[AI]` produces two things (as long as they need to be — no length limit):
   - **Analysis** — the *what & why*: the understanding, the approach, the
-    trade-offs.
-  - **Technical Plan** — the *how*: the order of attack for building it.
+    trade-offs. This is the **human-readable** layer, written for a reader who
+    won't open the code (whoever picks it up may not be technical) — no-code
+    where it can be, but still saying in plain words what's reused, what's new,
+    what's a duplicate or relocated, what's out of scope, and any risk.
+  - **Technical Plan** — the *how*: the order of attack for building it. This is
+    where the file-level, step-by-step detail lives.
 - `[AI]` logs only the *significant* decisions — and usually because you said
   *"log this…"*, never reflexively (`add_note type:"decision"`, the *why* in
   the body).
@@ -82,8 +86,8 @@ different people/AIs, or by the same one end to end:
 
 | Field | The question it answers | Written during |
 | ----- | ----------------------- | -------------- |
-| **Analysis** | *What & why* — understanding, approach, trade-offs | Analyzing |
-| **Technical Plan** | *How* — the order of attack | Analyzing |
+| **Analysis** | *What & why* — understanding, approach, trade-offs (human-readable, no-code where it can be) | Analyzing |
+| **Technical Plan** | *How* — the order of attack (where the code detail lives) | Analyzing |
 | **Summary** | *What actually shipped* | Done |
 
 ---

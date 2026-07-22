@@ -404,7 +404,7 @@ function TaskDetailLevel({
 
         <div className="grid grid-cols-1 gap-5 p-5 md:grid-cols-[1fr_390px]">
           {/* Left: details */}
-          <div className="space-y-5">
+          <div className="min-w-0 space-y-5">
             <input
               ref={fileInputRef}
               type="file"

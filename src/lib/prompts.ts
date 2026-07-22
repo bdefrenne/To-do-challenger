@@ -22,7 +22,8 @@ export function analyzePrompt(code: string, title: string): string {
     `Follow the **Analyze** step of the todo workflow contract — it's in the MCP ` +
     `server instructions and the todo://workflow resource (read it if you haven't). ` +
     `Set status to "analyzing", ask me anything unclear, then when it's settled ` +
-    `write the \`analysisSummary\` (what & why) ` +
+    `write the \`analysisSummary\` (what & why — written so a non-coder can ` +
+    `follow it; no-code where it can be) ` +
     `via update_task — keep it concise — and set status to "analyzed". Stop ` +
     `there — don't start building until I hand it to you.`
   );
@@ -66,7 +67,8 @@ export function analyzeThenWorkPrompt(code: string, title: string): string {
     `the todo workflow contract (MCP server instructions / todo://workflow ` +
     `resource — read it if you haven't). Move it along the status spine as you go:\n` +
     `1. **Analyze** (status "analyzing") — think it through, ask me anything ` +
-    `unclear, then write \`analysisSummary\` (what & why) via update_task — keep it ` +
+    `unclear, then write \`analysisSummary\` (what & why — written so a non-coder ` +
+    `can follow it; no-code where it can be) via update_task — keep it ` +
     `concise — and set status "analyzed".\n` +
     `2. **Technical Plan** — write \`plan\` via update_task: the actual step-by-step ` +
     `plan you'll execute, not a summary of it.\n` +

@@ -100,7 +100,10 @@ by hand, so the timeline reflects what actually happened:
   - `ux`: "Send to email only, no SMS in v1" — rationale…
   - `technical`: "Reuse existing session token hashing, don't add a new lib"
 - When analysis is done: `analyzedAt` is set and `analysisSummary` is written
-  (a short paragraph of what was decided and why).
+  (a short paragraph of what was decided and why) — written for a reader who
+  won't open the code, so no-code where it can be: plain words for what's
+  reused, new, duplicated/relocated, out of scope, and any risk. File-level,
+  step-by-step detail belongs in the `plan`, not here.
 
 The task may **stop here** — analyzed but not started. That's a valid resting
 state (the phase is just "analyzed").

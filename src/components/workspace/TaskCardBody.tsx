@@ -43,7 +43,7 @@ export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
           h.onOpen(id);
         }}
         className={[
-          "block w-full truncate text-left text-sm font-semibold",
+          "block w-full whitespace-normal break-words text-left text-sm font-semibold",
           done ? "text-buff line-through" : "text-fg",
         ].join(" ")}
       >

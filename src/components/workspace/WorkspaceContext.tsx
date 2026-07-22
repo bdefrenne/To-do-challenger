@@ -343,6 +343,14 @@ export function WorkspaceProvider({
   // refetch can't clobber an optimistic update mid-op.
   const inflight = useRef(0);
 
+  // Monotonic counter bumped when any mutation STARTS. `fetchAll` snapshots it
+  // before its request and discards the result if it changed meanwhile — a
+  // mutation raced the fetch, so the fetched snapshot may predate that write.
+  // Makes reconciliation timing-independent (an in-flight fetch can never clobber
+  // newer optimistic state); `inflight` alone can't catch an op that starts AND
+  // finishes during one fetch.
+  const reconcileSeq = useRef(0);
+
   // Last change-cursor we've reconciled to. The poll compares the server's
   // cursor against this and only re-fetches the whole list when it moves.
   const lastVersion = useRef<string | null>(null);
@@ -402,12 +410,23 @@ export function WorkspaceProvider({
   }, []);
 
   const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
+    // Snapshot the reconcile generation; if a mutation starts before this fetch
+    // resolves, the snapshot may predate that write — skip applying it (a later
+    // reconcile / the poll will apply clean state). Still return the fetched map
+    // so return-value callers (e.g. `hydrate`) keep working.
+    const seq = reconcileSeq.current;
     try {
       const { tasks: fetched } = await api<{ tasks: TaskDTO[] }>("/api/tasks?flat=1");
       // Hide tasks still inside their delete undo window (see `deleteTask`), so
       // an interim poll doesn't flash the card back before the DELETE commits.
       const pend = pendingDeleteRef.current;
       const tasks = pend.size ? fetched.filter((t) => !pend.has(t.id)) : fetched;
+      const map = Object.fromEntries(tasks.map((t) => [t.id, t as Task]));
+      // A mutation started while this fetch was in flight — its snapshot may
+      // predate that write. Don't apply it (nor touch the overlay); return the
+      // raw map for callers that only need existence checks. A later reconcile
+      // (the mutation's own finally, or the poll) applies clean state.
+      if (reconcileSeq.current !== seq) return map;
       setNodes(
         tasks.map((t) => ({
           id: t.id,
@@ -418,7 +437,6 @@ export function WorkspaceProvider({
           position: t.position,
         })),
       );
-      const map = Object.fromEntries(tasks.map((t) => [t.id, t as Task]));
       // Re-apply unconfirmed live edits (Phase 2) so a deferred DB write or an
       // interim poll never reverts them; drop each once the server reflects it.
       const now = Date.now();
@@ -571,13 +589,23 @@ export function WorkspaceProvider({
     };
   }, [fetchAll, fetchProjects, refreshVersion, loadLogs]);
 
-  /** Optimistic update now, server call, then reconcile from the source. */
+  /** Optimistic update now, server call, then reconcile from the source.
+   *  `onSuccess` runs with the server call's result after it resolves (e.g. to
+   *  swap an optimistic temp row for the real one). Reconcile is deferred until
+   *  no mutation is in flight; the `reconcileSeq` guard in `fetchAll` protects
+   *  against a fetch that a later op raced. */
   const mutate = useCallback(
-    async (optimistic: (() => void) | null, serverCall: () => Promise<unknown>) => {
+    async (
+      optimistic: (() => void) | null,
+      serverCall: () => Promise<unknown>,
+      opts?: { onSuccess?: (result: unknown) => void },
+    ) => {
       inflight.current++;
+      reconcileSeq.current++;
       optimistic?.();
       try {
-        await serverCall();
+        const result = await serverCall();
+        opts?.onSuccess?.(result);
       } catch (e) {
         console.error("[workspace] mutation failed", e);
         // Optimistic-concurrency conflict: another writer changed the task
@@ -586,12 +614,16 @@ export function WorkspaceProvider({
           setNotice("This task changed elsewhere — reloaded with the latest version.");
       } finally {
         inflight.current--;
-        await fetchAll();
-        // Our own write moved the cursor; sync it so the next poll tick
-        // doesn't see a "change" and re-fetch redundantly.
-        await refreshVersion();
-        // Tell peers in the canvas room to refresh now (hot path).
-        emitLocalChange();
+        // Only the last op in a burst reconciles (fewer fetches); the guard in
+        // `fetchAll` keeps that safe even if a new op starts mid-fetch.
+        if (inflight.current === 0) {
+          await fetchAll();
+          // Our own write moved the cursor; sync it so the next poll tick
+          // doesn't see a "change" and re-fetch redundantly.
+          await refreshVersion();
+          // Tell peers in the canvas room to refresh now (hot path).
+          emitLocalChange();
+        }
       }
     },
     [fetchAll, refreshVersion, emitLocalChange],
@@ -601,15 +633,18 @@ export function WorkspaceProvider({
   const mutateProjects = useCallback(
     async (serverCall: () => Promise<unknown>) => {
       inflight.current++;
+      reconcileSeq.current++;
       try {
         await serverCall();
       } catch (e) {
         console.error("[workspace] project mutation failed", e);
       } finally {
         inflight.current--;
-        await Promise.all([fetchProjects(), fetchAll()]);
-        await refreshVersion();
-        emitLocalChange();
+        if (inflight.current === 0) {
+          await Promise.all([fetchProjects(), fetchAll()]);
+          await refreshVersion();
+          emitLocalChange();
+        }
       }
     },
     [fetchProjects, fetchAll, refreshVersion, emitLocalChange],
@@ -1058,6 +1093,24 @@ export function WorkspaceProvider({
           method: "POST",
           body: JSON.stringify({ title, status, assigneeIds: meId ? [meId] : [], boardId }),
         }),
+      {
+        // Swap the optimistic temp row for the real one in a single commit — no
+        // disappear/remount window (the deferred reconcile would otherwise drop
+        // the temp id before/until the real row is fetched). Position et al. are
+        // corrected by the next reconcile.
+        onSuccess: (result) => {
+          const real = (result as { task?: Task }).task;
+          if (!real?.id) return;
+          setTaskMap((prev) => {
+            if (!prev[tempId]) return prev;
+            const next = { ...prev };
+            delete next[tempId];
+            next[real.id] = real;
+            return next;
+          });
+          setNodes((prev) => prev.map((n) => (n.id === tempId ? { ...n, id: real.id } : n)));
+        },
+      },
     );
   }
 
