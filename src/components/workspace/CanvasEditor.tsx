@@ -24,6 +24,7 @@ import {
   useStorage,
   useMutation,
   useOthers,
+  useSelf,
   useUpdateMyPresence,
   useHistory,
   useBroadcastEvent,
@@ -151,6 +152,9 @@ export function CanvasEditor({
 }) {
   const nodesMap = useStorage((root) => root.nodes);
   const others = useOthers();
+  // My auth user id (from liveblocks-auth prepareSession) — stamps who created
+  // a section so its board-picker stays private to that user.
+  const myId = useSelf((me) => me.id);
   const updateMyPresence = useUpdateMyPresence();
   const history = useHistory();
   const broadcast = useBroadcastEvent();
@@ -379,14 +383,16 @@ export function CanvasEditor({
         height: size.height,
         color: null,
         position: maxPos + 1,
-        data: {},
+        // Stamp the creator on sections so only they see the board-picker while
+        // it's unbound; peers see a placeholder until a board is chosen.
+        data: kind === "section" && myId ? { createdBy: myId } : {},
       };
       putNode(node);
       setTool("select");
       setSelected(new Set([node.id]));
       if (kind === "text") setEditingId(node.id);
     },
-    [putNode],
+    [putNode, myId],
   );
 
   /** Commit an in-flight freehand stroke as a `draw` node. `pts` is a flat

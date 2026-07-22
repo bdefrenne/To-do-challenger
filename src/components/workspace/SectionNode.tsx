@@ -17,7 +17,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useMyPresence, useOthers } from "@liveblocks/react";
+import { useMyPresence, useOthers, useSelf } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT, Task } from "@/lib/types";
 import {
   type OutlineRow,
@@ -107,6 +107,12 @@ export function SectionNode({
 }) {
   const ws = useWorkspace();
   const boardId = (node.data?.boardId as string | undefined) ?? null;
+  // Who created this section. The board-picker (naming mode) is private to the
+  // creator — peers see a placeholder until a board is bound. Legacy sections
+  // with no `createdBy` stay bindable by anyone (the `!createdBy` fallback).
+  const createdBy = node.data?.createdBy as string | undefined;
+  const myId = useSelf((me) => me.id);
+  const isCreator = !createdBy || createdBy === myId;
   // A section's tasks are scoped by this stable id (the canvas node's id), not
   // by its board — so it starts empty and stays separate from sibling sections.
   const sectionId = node.id;
@@ -130,6 +136,12 @@ export function SectionNode({
   const knownIdsRef = useRef<Set<string>>(new Set());
 
   const [mode, setMode] = useState<Mode>(boardId ? "committed" : "naming");
+  // `mode` is seeded from `boardId` only once, so a peer sitting in naming (the
+  // placeholder) when the author picks a board would stay stuck on the pre-bind
+  // view. Derive the DISPLAYED mode from the live `boardId` instead of mutating
+  // state in an effect: once bound, everyone renders committed. The state
+  // machine (authoring transitions, saves) still keys off the real `mode`.
+  const viewMode: Mode = boardId && mode === "naming" ? "committed" : mode;
   // Text-mode display preference (session-only): descriptions grow up to 6 rows
   // by default; toggled to unbounded via the header button. Not persisted.
   const [descExpanded, setDescExpanded] = useState(false);
@@ -748,7 +760,7 @@ export function SectionNode({
               ≣
             </ViewToggleBtn>
             <ViewToggleBtn
-              active={mode === "committed"}
+              active={viewMode === "committed"}
               onClick={() => {
                 if (mode === "committed") return;
                 void flush();
@@ -771,9 +783,15 @@ export function SectionNode({
         onPointerDown={(e) => e.stopPropagation()}
         className="min-h-0 flex-1 overflow-hidden p-2"
       >
-        {mode === "naming" ? (
-          <NameBinder onBind={bindBoard} />
-        ) : mode === "authoring" ? (
+        {viewMode === "naming" ? (
+          isCreator ? (
+            <NameBinder onBind={bindBoard} />
+          ) : (
+            <PendingSetup
+              who={others.find((o) => o.id === createdBy)?.info?.name ?? "Someone"}
+            />
+          )
+        ) : viewMode === "authoring" ? (
           <OutlineEditor
             rows={rows}
             inputRefs={inputRefs}
@@ -836,6 +854,17 @@ function ViewToggleBtn({
 }
 
 /* ---------------- naming ---------------- */
+
+/** What peers see while the section's creator is still choosing its board. The
+ *  board-picker is private to the creator; this flips to the committed section
+ *  automatically once the creator binds a board (see the boardId effect). */
+function PendingSetup({ who }: { who: string }) {
+  return (
+    <div className="flex h-full items-center justify-center px-3 text-center text-xs text-faint">
+      {who} is setting up this section…
+    </div>
+  );
+}
 
 function NameBinder({
   onBind,
