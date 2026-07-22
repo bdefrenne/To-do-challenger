@@ -27,11 +27,15 @@ export function QuickStatus({
   status,
   onChange,
   className = "",
+  revealOnHover = true,
 }: {
   status: TaskStatus;
   onChange: (s: TaskStatus) => void;
   /** Extra classes for the root. */
   className?: string;
+  /** When true (canvas/kanban default), the trigger is hidden until card-hover.
+   *  Set false on always-scannable surfaces like the list table. */
+  revealOnHover?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -90,7 +94,7 @@ export function QuickStatus({
       ref={rootRef}
       className={[
         "relative shrink-0 transition-opacity",
-        open ? "opacity-100" : "opacity-0 group-hover/card:opacity-100",
+        open || !revealOnHover ? "opacity-100" : "opacity-0 group-hover/card:opacity-100",
         className,
       ]
         .filter(Boolean)

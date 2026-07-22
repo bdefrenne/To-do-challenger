@@ -29,12 +29,16 @@ export function QuickAssign({
   className = "",
   memberIds,
   onEditMembers,
+  revealOnHover = true,
 }: {
   taskId: string;
   assigneeIds: string[];
   onChange: (id: string, patch: { assigneeIds: string[] }) => void;
   /** Extra classes for the root (e.g. `ml-auto` to push it to the card edge). */
   className?: string;
+  /** When true (canvas/kanban default), the trigger is hidden until card-hover.
+   *  Set false on always-scannable surfaces like the list table. */
+  revealOnHover?: boolean;
   /** Restrict the pickable people to these roster user ids (the task's project
    *  members). Empty/undefined ⇒ the whole roster (fallback). */
   memberIds?: string[];
@@ -130,7 +134,7 @@ export function QuickAssign({
       // it doesn't vanish when the cursor leaves the card mid-assign.
       className={[
         "relative shrink-0 transition-opacity",
-        open ? "opacity-100" : "opacity-0 group-hover/card:opacity-100",
+        open || !revealOnHover ? "opacity-100" : "opacity-0 group-hover/card:opacity-100",
         className,
       ]
         .filter(Boolean)

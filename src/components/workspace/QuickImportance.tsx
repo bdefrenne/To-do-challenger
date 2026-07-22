@@ -24,11 +24,15 @@ export function QuickImportance({
   importance,
   onChange,
   className = "",
+  revealOnHover = true,
 }: {
   importance: Importance;
   onChange: (v: Importance) => void;
   /** Extra classes for the root. */
   className?: string;
+  /** When true (canvas/kanban default), a Normal importance is hidden until
+   *  card-hover. Set false on always-scannable surfaces like the list table. */
+  revealOnHover?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -89,7 +93,9 @@ export function QuickImportance({
       className={[
         "relative shrink-0 transition-opacity",
         // A set importance stays visible; Normal only shows on hover/open.
-        open || notable ? "opacity-100" : "opacity-0 group-hover/card:opacity-100",
+        open || notable || !revealOnHover
+          ? "opacity-100"
+          : "opacity-0 group-hover/card:opacity-100",
         className,
       ]
         .filter(Boolean)

@@ -31,6 +31,10 @@ export function TaskTable({
     openTask,
     toggleDone,
     setStatus,
+    editTask,
+    toggleSelfAssignee,
+    deleteTask,
+    openProjectSettings,
     moveNode,
     dropToGroup,
     moveToBoard,
@@ -85,6 +89,10 @@ export function TaskTable({
     const kids = childrenOf(node.id);
     const hasChildren = kids.length > 0;
     const expanded = !collapsedRows[node.id];
+    // Scope the assign picker to the task's project members (mirrors the card).
+    const taskProject = task.projectId
+      ? projects.find((p) => p.id === task.projectId)
+      : undefined;
     return (
       <div key={node.id}>
         <TaskTableRow
@@ -105,6 +113,14 @@ export function TaskTable({
           onOpen={() => openTask(node.id)}
           onToggleDone={() => toggleDone(node.id)}
           onSetStatus={(s) => setStatus(node.id, s)}
+          onImportance={(v) => editTask(node.id, { importance: v })}
+          onAssign={(id, patch) => editTask(id, patch)}
+          onAssignSelf={() => toggleSelfAssignee(node.id)}
+          onDelete={() => deleteTask(node.id)}
+          memberIds={taskProject?.members}
+          onEditMembers={
+            taskProject ? () => openProjectSettings(taskProject.id) : undefined
+          }
           onDragStartRow={setDraggingId}
           onDropRow={(targetId, pos) => {
             if (draggingId) moveNode(draggingId, targetId, pos);
