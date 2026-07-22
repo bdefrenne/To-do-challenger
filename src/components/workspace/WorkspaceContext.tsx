@@ -80,6 +80,17 @@ interface WorkspaceContextValue {
   editTaskLive: (id: string, patch: TaskEdit) => void;
   /** Force-write any pending batched edits now (call on blur / before close). */
   flushEdits: () => Promise<void>;
+  /** Toggle the current user in/out of a task's assignees — the canvas SPACE
+   *  hover shortcut. No-op when the viewer isn't a known user. */
+  toggleSelfAssignee: (id: string) => void;
+  /** Delete a task with a ~5s undo window — the canvas DELETE hover shortcut.
+   *  See `undoDelete` (cancel) and `pendingDeletes` (the toast). */
+  deleteTask: (id: string) => void;
+  /** Cancel a pending delete and restore the task; no id ⇒ most recent (LIFO).
+   *  Returns whether anything was undone (canvas Ctrl+Z tries this first). */
+  undoDelete: (id?: string) => boolean;
+  /** Tasks inside their delete undo window (oldest → newest), for the toast. */
+  pendingDeletes: { id: string; title: string }[];
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
@@ -198,6 +209,9 @@ const EDIT_FLUSH_MS = 10000;
 // Backstop so a live edit whose author disconnected before flushing doesn't
 // linger in the overlay forever (must exceed EDIT_FLUSH_MS).
 const OVERLAY_TTL_MS = 30000;
+// Grace period between a canvas DELETE and the real Postgres delete — the window
+// in which the "Deleted · Undo" toast (or Ctrl+Z) can bring the task back.
+const UNDO_WINDOW_MS = 5000;
 
 /** A partial task edit the client can PATCH. */
 export type TaskEdit = Partial<
@@ -346,6 +360,19 @@ export function WorkspaceProvider({
   const taskMapRef = useRef<Record<string, Task>>({});
   useEffect(() => void (taskMapRef.current = taskMap), [taskMap]);
 
+  // Latest nodes list, so a delete can snapshot the removed node for undo.
+  const nodesRef = useRef<TaskNode[]>([]);
+  useEffect(() => void (nodesRef.current = nodes), [nodes]);
+
+  // Tasks removed on the canvas but not yet committed to Postgres — kept alive
+  // for the ~5s undo window (Gmail-style). `fetchAll` filters these ids so a
+  // background poll can't resurrect the card; each timer fires the real DELETE
+  // when its window lapses. `pendingDeletes` mirrors it for the toast.
+  const pendingDeleteRef = useRef<
+    Map<string, { task: Task; node: TaskNode | undefined; timer: ReturnType<typeof setTimeout> }>
+  >(new Map());
+  const [pendingDeletes, setPendingDeletes] = useState<{ id: string; title: string }[]>([]);
+
   // Mirror of the open-modal stack so the (never re-armed) poll closure can
   // refresh every open task's thread when the cursor moves — no interval re-arm.
   const openTaskIdsRef = useRef<string[]>([]);
@@ -376,7 +403,11 @@ export function WorkspaceProvider({
 
   const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
     try {
-      const { tasks } = await api<{ tasks: TaskDTO[] }>("/api/tasks?flat=1");
+      const { tasks: fetched } = await api<{ tasks: TaskDTO[] }>("/api/tasks?flat=1");
+      // Hide tasks still inside their delete undo window (see `deleteTask`), so
+      // an interim poll doesn't flash the card back before the DELETE commits.
+      const pend = pendingDeleteRef.current;
+      const tasks = pend.size ? fetched.filter((t) => !pend.has(t.id)) : fetched;
       setNodes(
         tasks.map((t) => ({
           id: t.id,
@@ -619,6 +650,78 @@ export function WorkspaceProvider({
       () => patchTask(id, patch),
     );
   }
+
+  /** Toggle the current user in/out of a task's assignees — the SPACE hover
+   *  shortcut on canvas task cards. No-op if we don't know who "me" is. */
+  function toggleSelfAssignee(id: string) {
+    if (!meId) return;
+    const cur = taskMapRef.current[id]?.assigneeIds ?? [];
+    const next = cur.includes(meId) ? cur.filter((a) => a !== meId) : [...cur, meId];
+    editTask(id, { assigneeIds: next });
+  }
+
+  /** Fire the deferred DELETE once a task's undo window has lapsed. */
+  const commitDelete = useCallback(
+    (id: string) => {
+      const entry = pendingDeleteRef.current.get(id);
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      pendingDeleteRef.current.delete(id);
+      setPendingDeletes((s) => s.filter((d) => d.id !== id));
+      mutate(null, () => api(`/api/tasks/${id}`, { method: "DELETE" }));
+    },
+    [mutate],
+  );
+
+  /** Delete a task with an undo window: drop it from view immediately, then
+   *  commit the DELETE to Postgres after UNDO_WINDOW_MS unless `undoDelete`
+   *  cancels first. The removed node is snapshotted so undo can restore it. */
+  function deleteTask(id: string) {
+    const task = taskMapRef.current[id];
+    if (!task || pendingDeleteRef.current.has(id)) return;
+    const node = nodesRef.current.find((n) => n.id === id);
+    setTaskMap((prev) => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setNodes((prev) => prev.filter((n) => n.id !== id));
+    const timer = setTimeout(() => commitDelete(id), UNDO_WINDOW_MS);
+    pendingDeleteRef.current.set(id, { task, node, timer });
+    setPendingDeletes((s) => [...s.filter((d) => d.id !== id), { id, title: task.title }]);
+  }
+
+  /** Cancel a pending delete and restore the task. With no id, undoes the most
+   *  recent (LIFO) — the canvas Ctrl+Z path. Returns whether it undid anything. */
+  const undoDelete = useCallback((id?: string): boolean => {
+    const pend = pendingDeleteRef.current;
+    const target = id ?? [...pend.keys()].pop();
+    if (!target) return false;
+    const entry = pend.get(target);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    pend.delete(target);
+    setPendingDeletes((s) => s.filter((d) => d.id !== target));
+    setTaskMap((prev) => ({ ...prev, [target]: entry.task }));
+    if (entry.node) {
+      const restored = entry.node;
+      setNodes((prev) => (prev.some((x) => x.id === target) ? prev : [...prev, restored]));
+    }
+    return true;
+  }, []);
+
+  // Flush any still-pending deletes on unmount (best-effort), so navigating away
+  // inside the undo window doesn't silently drop the delete.
+  useEffect(
+    () => () => {
+      for (const [id, { timer }] of pendingDeleteRef.current) {
+        clearTimeout(timer);
+        void api(`/api/tasks/${id}`, { method: "DELETE" }).catch(() => {});
+      }
+    },
+    [],
+  );
 
   /** Write all pending batched edits to Postgres now, cancelling the debounce.
    *  Called on the timer, on blur/close (via context), and when the tab hides. */
@@ -1183,6 +1286,10 @@ export function WorkspaceProvider({
         editTask,
         editTaskLive,
         flushEdits,
+        toggleSelfAssignee,
+        deleteTask,
+        undoDelete,
+        pendingDeletes,
         moveNode,
         dropToGroup,
         moveToBoard,

@@ -183,11 +183,12 @@ export interface Task {
 /* ---- Canvas / whiteboard ---- */
 
 /** What a canvas node is: a markdown text block, a section (a Figma-style titled
- *  board container whose lines are that board's live tasks), or a `draw`
- *  freehand pen stroke (its sampled points ride in `data`). The
- *  `canvas_node_kind` DB enum still carries a legacy `frame` value (the feature
- *  was removed); nothing writes it, so it never reaches this type. */
-export type CanvasNodeKind = "text" | "section" | "draw";
+ *  board container whose lines are that board's live tasks), a `draw` freehand
+ *  pen stroke (its sampled points ride in `data`), or an `image` (a pasted or
+ *  dropped picture whose blob URL rides in `data.url`). The `canvas_node_kind`
+ *  DB enum still carries a legacy `frame` value (the feature was removed);
+ *  nothing writes it, so it never reaches this type. */
+export type CanvasNodeKind = "text" | "section" | "draw" | "image";
 
 /** Last-saved pan/zoom of a canvas. Canvas coordinates, not screen pixels. */
 export interface CanvasViewport {

@@ -14,6 +14,7 @@ import { Markdown } from "@/components/ui/Markdown";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { SectionNode } from "./SectionNode";
 import { DrawNode } from "./DrawNode";
+import { ImageNode } from "./ImageNode";
 export { NEW_SECTION_SIZE } from "./SectionNode";
 
 /** Default geometry for freshly-dropped nodes (canvas units). */
@@ -100,6 +101,9 @@ export function CanvasNode({
   onPatch,
   onResize,
   onLinkStart,
+  scale = 1,
+  onResizeStart,
+  onResizeEnd,
   canvasName = "",
   isMaster = false,
   masterSection = null,
@@ -116,10 +120,21 @@ export function CanvasNode({
   onStartEditing: () => void;
   onChange: (content: string) => void;
   onStopEditing: () => void;
-  /** Patch arbitrary node fields (used by section nodes for data.boardId). */
-  onPatch?: (patch: { content?: string; data?: Record<string, unknown> }) => void;
+  /** Patch arbitrary node fields (data.boardId for sections; width/height for
+   *  an image resize). */
+  onPatch?: (patch: {
+    content?: string;
+    data?: Record<string, unknown>;
+    width?: number;
+    height?: number;
+  }) => void;
   /** Report a text card's measured height so stored `node.height` can follow. */
   onResize?: (height: number) => void;
+  /** Image-only: current viewport zoom, for the resize handle's math. */
+  scale?: number;
+  /** Image-only: bracket a resize drag so it's a single undo step. */
+  onResizeStart?: () => void;
+  onResizeEnd?: () => void;
   /** Begin a link drag from a text node's port (→ drop on a task to link it). */
   onLinkStart?: (e: ReactPointerEvent) => void;
   /** The parent canvas's name — a section uses it to name a new project. */
@@ -138,6 +153,7 @@ export function CanvasNode({
   const boxRef = useRef<HTMLDivElement>(null);
   const isSection = node.kind === "section";
   const isDraw = node.kind === "draw";
+  const isImage = node.kind === "image";
 
   // Focus + select all the text whenever we enter edit mode, so a double-click
   // re-edit lets you replace the content with the next keystroke (or click once
@@ -208,6 +224,21 @@ export function CanvasNode({
         selected={selected}
         smooth={smooth}
         onPointerDown={onPointerDown}
+      />
+    );
+  }
+
+  if (isImage) {
+    return (
+      <ImageNode
+        node={node}
+        selected={selected}
+        smooth={smooth}
+        scale={scale}
+        onPointerDown={onPointerDown}
+        onResize={(width, height) => onPatch?.({ width, height })}
+        onResizeStart={onResizeStart}
+        onResizeEnd={onResizeEnd}
       />
     );
   }

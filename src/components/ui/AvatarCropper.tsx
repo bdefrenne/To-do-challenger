@@ -87,7 +87,7 @@ export function AvatarCropper({
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/40 p-6 backdrop-blur-sm"
+      className="fixed inset-0 z-[210] flex items-center justify-center bg-slate-900/40 p-6 backdrop-blur-sm"
       onClick={onCancel}
     >
       <div

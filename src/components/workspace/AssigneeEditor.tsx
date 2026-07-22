@@ -78,7 +78,7 @@ export function AssigneeEditor({
       </button>
 
       {open ? (
-        <div className="absolute left-0 right-0 z-30 mt-1 rounded-lg border border-border bg-surface py-1 shadow-lg">
+        <div className="absolute left-0 right-0 z-40 mt-1 rounded-lg border border-border bg-surface py-1 shadow-lg">
           <div className="max-h-56 overflow-y-auto">
             {candidates.length === 0 ? (
               <p className="px-3 py-2 text-xs text-faint">No members yet.</p>

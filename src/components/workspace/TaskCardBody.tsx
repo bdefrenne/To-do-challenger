@@ -6,6 +6,7 @@ import { AvatarStack } from "@/components/PersonAvatar";
 import { QuickStatus } from "./QuickStatus";
 import { QuickImportance } from "./QuickImportance";
 import { QuickAssign } from "./QuickAssign";
+import { useWorkspace } from "./WorkspaceContext";
 
 /** The id-based handlers a card's controls call. Same shape the canvas Section
  *  and the kanban board both already have from `useWorkspace()`. */
@@ -27,6 +28,13 @@ export interface TaskCardHandlers {
 export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
   const id = task.id;
   const done = task.status === "done";
+  // Scope the assign picker to the task's project members (mirrors the task
+  // modal). Empty/undefined members ⇒ QuickAssign falls back to the whole
+  // roster. `projectId` is set whenever the task is on a board/canvas section.
+  const { projects, openProjectSettings } = useWorkspace();
+  const taskProject = task.projectId
+    ? projects.find((p) => p.id === task.projectId)
+    : undefined;
   return (
     <div className="min-w-0 flex-1">
       <button
@@ -56,7 +64,15 @@ export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
             importance={task.importance ?? 0}
             onChange={(v) => h.onImportance(id, v)}
           />
-          <QuickAssign taskId={id} assigneeIds={task.assigneeIds ?? []} onChange={h.onAssign} />
+          <QuickAssign
+            taskId={id}
+            assigneeIds={task.assigneeIds ?? []}
+            onChange={h.onAssign}
+            memberIds={taskProject?.members}
+            onEditMembers={
+              taskProject ? () => openProjectSettings(taskProject.id) : undefined
+            }
+          />
         </div>
       </div>
     </div>

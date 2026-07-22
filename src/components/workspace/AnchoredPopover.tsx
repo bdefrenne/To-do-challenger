@@ -118,7 +118,9 @@ export function AnchoredPopover({
         right: pos?.right,
         // Hidden for the one frame before the first measurement lands.
         visibility: pos ? "visible" : "hidden",
-        zIndex: 50,
+        // Dropdown/popover tier — above canvas chrome (20/30), below modals
+        // (100+). Portaled to <body>, so this must stay under the modal base.
+        zIndex: 40,
       }}
       className={className}
     >

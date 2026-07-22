@@ -27,6 +27,10 @@ export function useCardShortcut(
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() !== key) return;
+      // Ignore auto-repeat: each card shortcut is one discrete action, and it
+      // stops a held key (e.g. SPACE mid-pan drifting over a card) from firing
+      // repeatedly.
+      if (e.repeat) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const ae = document.activeElement;
       if (

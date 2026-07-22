@@ -622,6 +622,7 @@ export const canvasNodeKind = pgEnum("canvas_node_kind", [
   "frame",
   "section",
   "draw",
+  "image",
 ]);
 
 export const canvases = pgTable(
@@ -662,7 +663,9 @@ export const canvasNodes = pgTable(
       .references(() => canvases.id, { onDelete: "cascade" }),
     /** "text" = a markdown text block; "section" = a Figma-style titled outline
      *  bound to a board (`data.boardId`), whose lines are that board's live
-     *  tasks. ("frame" is a removed legacy kind — see the enum note above.) */
+     *  tasks; "draw" = a freehand pen stroke; "image" = a pasted/dropped picture
+     *  whose blob URL lives in `data.url`. ("frame" is a removed legacy kind —
+     *  see the enum note above.) */
     kind: canvasNodeKind("kind").notNull(),
     /** Markdown for a text node; the label/title for a section. */
     content: text("content").notNull().default(""),

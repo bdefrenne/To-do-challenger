@@ -16,8 +16,9 @@
  *
  * The SVG itself is `pointer-events: none` so the mostly-transparent bounding
  * box never blocks nodes underneath; a fat transparent hit-path (the same trick
- * the connector unlink lines use in CanvasEditor) makes only the *ink*
- * selectable/draggable.
+ * the connector unlink lines use in CanvasEditor) makes only the *ink* a hit
+ * target for the eraser. Strokes are NOT selectable or draggable — clicking one
+ * bubbles through to the canvas so you can keep drawing over it.
  */
 
 import type { PointerEvent as ReactPointerEvent } from "react";
@@ -110,7 +111,7 @@ export function DrawNode({
             r={hitWidth / 2}
             fill="transparent"
             data-draw-id={node.id}
-            className="pointer-events-auto cursor-grab active:cursor-grabbing"
+            className="pointer-events-auto"
             onPointerDown={onPointerDown}
           />
         </>
@@ -133,7 +134,7 @@ export function DrawNode({
             strokeLinecap="round"
             strokeLinejoin="round"
             data-draw-id={node.id}
-            className="pointer-events-auto cursor-grab active:cursor-grabbing"
+            className="pointer-events-auto"
             onPointerDown={onPointerDown}
           />
         </>

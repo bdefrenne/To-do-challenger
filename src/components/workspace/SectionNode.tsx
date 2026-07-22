@@ -671,10 +671,10 @@ export function SectionNode({
       {/* Header = title chip + drag handle + edit affordance */}
       <div
         onPointerDown={onPointerDown}
-        className="flex shrink-0 cursor-grab items-center gap-2 border-b border-border bg-surface-2 px-3 py-2 active:cursor-grabbing"
+        className="flex shrink-0 cursor-grab items-start gap-2 border-b border-border bg-surface-2 px-3 py-2 active:cursor-grabbing"
       >
         <span aria-hidden className="text-faint">▤</span>
-        <span className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
+        <span className="min-w-0 flex-1 break-words text-sm font-semibold text-fg">
           {title || "Untitled section"}
         </span>
         {saving ? (
@@ -790,6 +790,8 @@ export function SectionNode({
             onAssign={ws.editTask}
             onImportance={(id, v) => ws.editTask(id, { importance: v })}
             onMove={ws.moveNode}
+            onAssignSelf={ws.toggleSelfAssignee}
+            onDelete={ws.deleteTask}
             onAdd={() => !locked && enterAuthoring()}
           />
         )}
@@ -1061,6 +1063,10 @@ interface CardHandlers {
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
+  /** Toggle the viewer as an assignee (SPACE hover shortcut). */
+  onAssignSelf: (id: string) => void;
+  /** Delete the task with an undo window (DELETE hover shortcut). */
+  onDelete: (id: string) => void;
   dropHint: { id: string; pos: "before" | "after" } | null;
   setDropHint: (h: { id: string; pos: "before" | "after" } | null) => void;
 }
@@ -1082,6 +1088,14 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   // the number shortcuts alongside "I"'s full picker.
   useCardShortcut(cardRef, "1", () => id && h.onImportance(id, 1));
   useCardShortcut(cardRef, "2", () => id && h.onImportance(id, 2));
+  // SPACE toggles the viewer as an assignee. Fires in capture + stopPropagation
+  // (via useCardShortcut), so it intercepts the canvas space-to-pan only while a
+  // card is hovered — space still pans everywhere else.
+  useCardShortcut(cardRef, " ", () => id && h.onAssignSelf(id));
+  // DELETE / Backspace removes the task (with a ~5s undo toast). Beats the canvas
+  // editor's own Delete (which removes selected NODES) since it's hover-scoped.
+  useCardShortcut(cardRef, "delete", () => id && h.onDelete(id));
+  useCardShortcut(cardRef, "backspace", () => id && h.onDelete(id));
   if (!id || !t) return null;
   const ic = IMPORTANCE_CARD[t.importance ?? 0];
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
@@ -1148,6 +1162,8 @@ function CommittedList({
   onAssign,
   onImportance,
   onMove,
+  onAssignSelf,
+  onDelete,
   onAdd,
 }: {
   units: TaskUnit[];
@@ -1158,6 +1174,8 @@ function CommittedList({
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
+  onAssignSelf: (id: string) => void;
+  onDelete: (id: string) => void;
   onAdd: () => void;
 }) {
   const [dropHint, setDropHint] = useState<{ id: string; pos: "before" | "after" } | null>(null);
@@ -1173,7 +1191,7 @@ function CommittedList({
     );
   }
 
-  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, dropHint, setDropHint };
+  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, dropHint, setDropHint };
   return (
     <div className="space-y-1.5">
       {units.map((u) => (

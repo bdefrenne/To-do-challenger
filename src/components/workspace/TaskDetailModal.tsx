@@ -321,7 +321,11 @@ function TaskDetailLevel({
     <>
     <div
       className="fixed inset-0 flex items-start justify-center overflow-y-auto bg-slate-900/30 p-6 backdrop-blur-sm"
-      style={{ zIndex: 50 + depth * 10 }}
+      // Z-index scale (app-wide): chrome 20 · cursors 30 · dropdowns/popovers
+      // 40 · primary modals 100 (+10 per nesting depth) · secondary modals 200
+      // · toast 300. Base 100 keeps the task modal above the z-40 quick-edit
+      // popovers (which portal to <body> and would otherwise tie at z-50).
+      style={{ zIndex: 100 + depth * 10 }}
       onClick={closeTask}
     >
       <div
@@ -791,7 +795,7 @@ function TaskDetailLevel({
     {lightboxItem ? (
       <div
         className="fixed inset-0 flex items-center justify-center bg-slate-950/85 p-6 backdrop-blur-sm"
-        style={{ zIndex: 50 + depth * 10 + 5 }}
+        style={{ zIndex: 100 + depth * 10 + 5 }}
         onClick={() => setLightboxOpen(false)}
       >
         <button

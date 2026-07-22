@@ -90,7 +90,7 @@ export function BoardPill({
 
       {open ? (
         <div
-          className="absolute z-30 mt-1 w-52 overflow-hidden rounded-lg border border-border bg-surface py-1 shadow-lg"
+          className="absolute z-40 mt-1 w-52 overflow-hidden rounded-lg border border-border bg-surface py-1 shadow-lg"
           onClick={(e) => e.stopPropagation()}
         >
           {activeGroup ? (

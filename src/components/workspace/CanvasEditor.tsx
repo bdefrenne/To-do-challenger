@@ -41,6 +41,7 @@ import {
   DEFAULT_PEN_COLOR,
   DEFAULT_PEN_WIDTH,
 } from "./DrawNode";
+import { uploadCanvasImage } from "./uploadCanvasImage";
 import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 
 type Tool = "select" | "text" | "section" | "draw" | "erase";
@@ -57,6 +58,8 @@ interface Viewport {
 
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 3;
+/** Longest edge (canvas units) a freshly pasted/dropped image is scaled to. */
+const MAX_PLACE = 480;
 const uid = () => crypto.randomUUID();
 
 /** The task ids a text note links to (drawn as connectors to their cards). */
@@ -151,7 +154,7 @@ export function CanvasEditor({
   const updateMyPresence = useUpdateMyPresence();
   const history = useHistory();
   const broadcast = useBroadcastEvent();
-  const { subscribeLocalChange, refreshFromRemote, applyRemotePatch } = useWorkspace();
+  const { subscribeLocalChange, refreshFromRemote, applyRemotePatch, undoDelete } = useWorkspace();
 
   // useStorage's root is ToJson<Storage>, so `nodes` is a plain readonly
   // record (id → node), not a Map — hence Object.values, not .values().
@@ -183,6 +186,9 @@ export function CanvasEditor({
   const [pen, setPen] = useState<Pen>(() => loadPen(canvasId));
   const [drawing, setDrawing] = useState<number[] | null>(null);
 
+  // Count of image uploads in flight (paste/drop) — drives the "Pasting…" pill.
+  const [uploading, setUploading] = useState(0);
+
   // Note→task links. `linkDrag` is the in-flight connection (dragging a text
   // note's port toward a task card); `linkLines` are the committed connectors,
   // re-measured each frame from the task cards' live DOM positions.
@@ -207,6 +213,8 @@ export function CanvasEditor({
   const selectedRef = useRef(selected);
   const editingRef = useRef(editingId);
   const penRef = useRef(pen);
+  // Last cursor position in canvas coords — where a pasted image lands.
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   useEffect(() => void (nodesRef.current = nodes), [nodes]);
   useEffect(() => void (vpRef.current = viewport), [viewport]);
   useEffect(() => void (toolRef.current = tool), [tool]);
@@ -426,6 +434,54 @@ export function CanvasEditor({
       putNode(node);
     },
     [putNode],
+  );
+
+  /** Drop an uploaded image onto the canvas, centred at (cx, cy) in canvas
+   *  coords. Scales the source pixels down to MAX_PLACE so a big screenshot
+   *  arrives at a sane size; `data` keeps the natural size for aspect-locked
+   *  resize. Selects it (in the select tool) so you can immediately move it. */
+  const createImageNode = useCallback(
+    (url: string, natW: number, natH: number, cx: number, cy: number) => {
+      const longest = Math.max(natW, natH) || 1;
+      const s = Math.min(1, MAX_PLACE / longest);
+      const w = Math.max(1, Math.round(natW * s));
+      const h = Math.max(1, Math.round(natH * s));
+      const maxPos = nodesRef.current.reduce((m, nd) => Math.max(m, nd.position), 0);
+      const node: StoredNode = {
+        id: uid(),
+        kind: "image",
+        content: "",
+        x: Math.round(cx - w / 2),
+        y: Math.round(cy - h / 2),
+        width: w,
+        height: h,
+        color: null,
+        position: maxPos + 1,
+        data: { url, naturalW: natW, naturalH: natH },
+      };
+      putNode(node);
+      setTool("select");
+      setSelected(new Set([node.id]));
+    },
+    [putNode],
+  );
+
+  /** Upload one image file and drop it at (cx, cy). Tracks an in-flight count
+   *  so the "Pasting…" pill shows; awaits the upload before creating the node,
+   *  so a node is never persisted without its blob URL. */
+  const handleImageFile = useCallback(
+    async (file: File, cx: number, cy: number) => {
+      setUploading((n) => n + 1);
+      try {
+        const { url, w, h } = await uploadCanvasImage(canvasId, file);
+        createImageNode(url, w, h, cx, cy);
+      } catch {
+        /* swallow — a failed upload just drops nothing */
+      } finally {
+        setUploading((n) => n - 1);
+      }
+    },
+    [canvasId, createImageNode],
   );
 
   const deleteSelected = useCallback(() => {
@@ -651,8 +707,10 @@ export function CanvasEditor({
       if (meta && e.key.toLowerCase() === "z") {
         if (isTyping()) return;
         e.preventDefault();
+        // A pending task-delete takes priority over the node history, so Ctrl+Z
+        // right after a DELETE brings the task back; otherwise undo canvas nodes.
         if (e.shiftKey) history.redo();
-        else history.undo();
+        else if (!undoDelete()) history.undo();
         return;
       }
       if (isTyping()) return;
@@ -722,12 +780,80 @@ export function CanvasEditor({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [history, deleteSelected, nudge]);
+  }, [history, deleteSelected, nudge, undoDelete]);
+
+  /* -------- paste an image (⌘/Ctrl+V) -------- */
+  // Where a pasted image lands: under the cursor if we've seen it, else the
+  // centre of the current viewport (converted to canvas coords).
+  const placementPoint = useCallback(() => {
+    if (lastPointerRef.current) return lastPointerRef.current;
+    const rect = containerRef.current?.getBoundingClientRect();
+    const vp = vpRef.current;
+    if (!rect) return { x: 0, y: 0 };
+    return {
+      x: (rect.width / 2 - vp.x) / vp.scale,
+      y: (rect.height / 2 - vp.y) / vp.scale,
+    };
+  }, []);
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      // Don't hijack paste while typing into a text node / input.
+      const el = document.activeElement;
+      if (
+        editingRef.current !== null ||
+        (el instanceof HTMLElement && (el.tagName === "TEXTAREA" || el.tagName === "INPUT"))
+      )
+        return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+          const file = it.getAsFile();
+          if (file) {
+            e.preventDefault();
+            const p = placementPoint();
+            void handleImageFile(file, p.x, p.y);
+          }
+          break;
+        }
+      }
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [placementPoint, handleImageFile]);
+
+  /* -------- drag & drop image files -------- */
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes("Files")) {
+      e.preventDefault(); // allow the drop
+      e.dataTransfer.dropEffect = "copy";
+    }
+  }, []);
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      const files = Array.from(e.dataTransfer.files).filter((f) =>
+        f.type.startsWith("image/"),
+      );
+      if (!files.length) return;
+      e.preventDefault();
+      // Drop the first at the cursor; stagger any extras so they don't stack.
+      files.forEach((file, i) => {
+        const p = toCanvas(e.clientX + i * 16, e.clientY + i * 16);
+        void handleImageFile(file, p.x, p.y);
+      });
+    },
+    [toCanvas, handleImageFile],
+  );
 
   /* -------- pointer: nodes (select + drag) -------- */
   const onNodePointerDown = useCallback(
     (e: ReactPointerEvent, node: CanvasNode) => {
       if (e.button !== 0 || spaceRef.current) return;
+      // Pen strokes aren't selectable or draggable. Let the event bubble to the
+      // background so you can keep drawing (or marquee) straight over the ink;
+      // the eraser hit-tests strokes separately via `data-draw-id`.
+      if (node.kind === "draw") return;
       e.stopPropagation();
       if (editingRef.current === node.id) return;
 
@@ -872,6 +998,7 @@ export function CanvasEditor({
         const hit = nodesRef.current
           .filter(
             (n) =>
+              n.kind !== "draw" && // strokes aren't selectable/movable
               n.x < rect.x1 && n.x + n.width > rect.x0 && n.y < rect.y1 && n.y + n.height > rect.y0,
           )
           .map((n) => n.id);
@@ -896,6 +1023,7 @@ export function CanvasEditor({
   const onContainerPointerMove = useCallback(
     (e: ReactPointerEvent) => {
       const p = toCanvas(e.clientX, e.clientY);
+      lastPointerRef.current = p; // where a paste will land
       updateMyPresence({ cursor: { x: Math.round(p.x), y: Math.round(p.y) } });
     },
     [toCanvas, updateMyPresence],
@@ -1018,8 +1146,15 @@ export function CanvasEditor({
               ? "Drag to draw · pick colour & width on the left"
               : tool === "erase"
                 ? "Drag across a stroke to erase it"
-                : "T text · B board · P draw · E erase · space-drag to pan · ⌘-scroll to zoom"}
+                : "T text · B board · P draw · E erase · paste/drop an image · space-drag to pan · ⌘-scroll to zoom"}
       </div>
+
+      {/* Image upload in progress (paste / drop). */}
+      {uploading > 0 ? (
+        <div className="pointer-events-none absolute left-1/2 top-12 z-20 -translate-x-1/2 rounded-md bg-accent-soft px-2 py-1 text-[11px] font-medium text-accent shadow-sm backdrop-blur">
+          {uploading > 1 ? `Adding ${uploading} images…` : "Adding image…"}
+        </div>
+      ) : null}
 
       {/* Zoom controls */}
       <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-lg border border-border bg-surface p-1 text-sm shadow-sm">
@@ -1040,6 +1175,8 @@ export function CanvasEditor({
         onPointerDown={onBackgroundPointerDown}
         onPointerMove={onContainerPointerMove}
         onPointerLeave={onContainerPointerLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
         className="absolute inset-0 touch-none select-none"
         style={{
           cursor,
@@ -1074,6 +1211,9 @@ export function CanvasEditor({
               onPatch={(patch) =>
                 patchMany([{ id: node.id, patch: patch as Partial<StoredNode> }])
               }
+              scale={viewport.scale}
+              onResizeStart={() => history.pause()}
+              onResizeEnd={() => history.resume()}
               isMaster={node.data?.master === true}
               masterSection={(() => {
                 const bid = node.data?.boardId as string | undefined;

@@ -46,6 +46,7 @@ export function AppShell({
         <TaskDetailModal />
         <GlobalProjectSettings />
         <Notice />
+        <DeleteUndoToast />
       </WorkspaceProvider>
     </PeopleProvider>
   );
@@ -76,7 +77,7 @@ function Notice() {
 
   if (!notice) return null;
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
+    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-[300] flex justify-center px-4">
       <button
         onClick={clearNotice}
         role="status"
@@ -84,6 +85,37 @@ function Notice() {
       >
         {notice}
       </button>
+    </div>
+  );
+}
+
+/** "Deleted · Undo" toast for canvas task deletes still inside their undo
+ *  window. Clears itself when the window lapses (delete commits) or on Undo. */
+function DeleteUndoToast() {
+  const { pendingDeletes, undoDelete } = useWorkspace();
+  if (!pendingDeletes.length) return null;
+  const last = pendingDeletes[pendingDeletes.length - 1];
+  const label =
+    pendingDeletes.length > 1
+      ? `Deleted ${pendingDeletes.length} tasks`
+      : `Deleted “${last.title}”`;
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-20 z-[300] flex justify-center px-4">
+      <div
+        role="status"
+        className="pointer-events-auto flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm text-fg shadow-lg"
+      >
+        <span className="max-w-[16rem] truncate">{label}</span>
+        <button
+          onClick={() => undoDelete()}
+          className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-surface-2 px-2 py-0.5 text-xs font-medium text-accent transition-colors hover:border-accent"
+        >
+          Undo
+          <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
+            ⌘Z
+          </kbd>
+        </button>
+      </div>
     </div>
   );
 }
@@ -178,7 +210,7 @@ function Sidebar({ user }: { user: SessionUser }) {
         {menuOpen ? (
           <div
             role="menu"
-            className="absolute bottom-full left-2 right-2 mb-1 z-30 overflow-hidden rounded-lg border border-border bg-surface py-1 shadow-lg"
+            className="absolute bottom-full left-2 right-2 mb-1 z-40 overflow-hidden rounded-lg border border-border bg-surface py-1 shadow-lg"
           >
             <Link
               href="/settings"
