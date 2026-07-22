@@ -1239,7 +1239,9 @@ export const MAX_BULK_OPS = 200;
  *  per-task status transition is appended separately by `bulkUpdate`. */
 function describeBulkPatch(patch: UpdateTaskInput): string {
   const parts: string[] = [];
-  if (patch.title !== undefined) parts.push(`Title → “${patch.title}”`);
+  // Title & description edits are intentionally NOT logged: the UI autosaves
+  // them on a debounce, so every flush would otherwise write a near-identical
+  // activity row — a wall of noise during a single typing session.
   if (patch.assigneeIds !== undefined)
     parts.push(
       patch.assigneeIds.length
@@ -1260,8 +1262,6 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
   if (patch.recurrence !== undefined) parts.push(`Recurrence → ${patch.recurrence}`);
   if (patch.dependsOn !== undefined) parts.push("Dependencies updated");
   if (patch.customFields !== undefined) parts.push("Custom fields updated");
-  if (patch.description !== undefined)
-    parts.push(patch.description == null ? "Description cleared" : "Description updated");
   // Workflow fields — carried by the single-task edit path (not bulk).
   if (patch.plan !== undefined)
     parts.push(patch.plan == null ? "Plan cleared" : "Plan updated");

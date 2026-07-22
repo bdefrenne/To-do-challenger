@@ -33,6 +33,7 @@ import { useWorkspace, type DropPos } from "./WorkspaceContext";
 import { TaskCardBody } from "./TaskCardBody";
 import { useCardShortcut } from "./useCardShortcut";
 import { IMPORTANCE_CARD } from "@/lib/importance";
+import { STATUS_TONE, STATUS_CANVAS_BADGE } from "@/lib/statuses";
 
 export const NEW_SECTION_SIZE = { width: 420, height: 320 };
 
@@ -1098,6 +1099,11 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   useCardShortcut(cardRef, "backspace", () => id && h.onDelete(id));
   if (!id || !t) return null;
   const ic = IMPORTANCE_CARD[t.importance ?? 0];
+  // Status ring + corner badge — canvas only, and only for "started" statuses
+  // (analyzing/analyzed/building). Backlog/todo/done are absent from the map,
+  // so they get no ring/badge (done keeps its green wash below).
+  const badge = STATUS_CANVAS_BADGE[t.status];
+  const statusTone = STATUS_TONE[t.status];
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
   const half = (e: React.DragEvent) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1132,14 +1138,24 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
         // their own clicks from bubbling here, so they don't also open the task.
         onClick={() => h.onOpen(id)}
         className={[
-          "group/card cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
+          "group/card relative cursor-pointer rounded-lg border px-2 py-1.5 transition-colors",
           done
             ? "border-buff/40 bg-buff-soft hover:border-buff/60"
             : `${ic.border} ${ic.bg} ${ic.hover}`,
+          // Status ring (outline, not ring — avoids clashing with the drop-hint
+          // box-shadow below). Follows the rounded corners.
+          badge ? `outline outline-[3px] outline-offset-2 ${statusTone.outline}` : "",
           hint === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
           hint === "after" ? "shadow-[inset_0_-2px_0_0_var(--color-accent)]" : "",
         ].join(" ")}
       >
+        {badge ? (
+          <span
+            className={`absolute -top-2 right-2 z-10 rounded px-1.5 py-0.5 text-[10px] font-semibold text-white ${statusTone.dot}`}
+          >
+            {badge}
+          </span>
+        ) : null}
         <TaskCardBody task={t} h={h} />
       </div>
       {unit.children.length ? (
@@ -1197,12 +1213,6 @@ function CommittedList({
       {units.map((u) => (
         <TaskCard key={u.taskId ?? u.title} unit={u} depth={0} h={h} />
       ))}
-      <button
-        onClick={onAdd}
-        className="w-full rounded-md border border-dashed border-border px-2 py-1 text-left text-xs text-faint hover:border-accent hover:text-accent"
-      >
-        ＋ Add / edit outline
-      </button>
     </div>
   );
 }
