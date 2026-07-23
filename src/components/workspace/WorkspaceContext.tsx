@@ -96,6 +96,15 @@ interface WorkspaceContextValue {
    *  Returns how many were archived. */
   archiveAllDone: (scope?: { boardId?: string; projectId?: string }) => Promise<number>;
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
+  /** Move a task and its whole subtree into a canvas Section (re-tagging
+   *  `customFields.sectionId`, re-homing the board when it differs). Pass `rel`
+   *  to drop relative to a card; omit it to append at the end of the section. */
+  moveNodeIntoSection: (
+    dragId: string,
+    targetSectionId: string,
+    targetBoardId: string | null,
+    rel?: { targetId: string; pos: DropPos },
+  ) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
   moveToBoard: (id: string, boardId: string, status?: TaskStatus) => void;
@@ -938,6 +947,18 @@ export function WorkspaceProvider({
     const target = nodes.find((n) => n.id === targetId);
     if (!drag || !target) return;
 
+    // Cross-section drop (canvas): the target card belongs to a DIFFERENT
+    // section than the dragged one. A section is scoped by the hidden
+    // `customFields.sectionId` tag (not the board), so re-tagging — and, when
+    // the target section is on another board, re-homing the board — has to
+    // cascade to the whole subtree. Delegate to the section mover.
+    const dragSection = taskMap[dragId]?.customFields?.sectionId as string | undefined;
+    const targetSection = taskMap[targetId]?.customFields?.sectionId as string | undefined;
+    if (targetSection && dragSection !== targetSection) {
+      moveNodeIntoSection(dragId, targetSection, target.boardId ?? null, { targetId, pos });
+      return;
+    }
+
     if (pos === "inside") {
       mutate(
         () =>
@@ -977,6 +998,129 @@ export function WorkspaceProvider({
         api(`/api/tasks/${dragId}/move`, {
           method: "POST",
           body: JSON.stringify({ parentId: target.parentId, status, position }),
+        }),
+    );
+  }
+
+  // Move a task (and its WHOLE subtree) into a canvas Section — possibly one on
+  // a different board. A section is scoped by the hidden `customFields.sectionId`
+  // tag, so the move must (a) re-tag every task in the subtree into the target
+  // section, (b) re-home each to the target board when it differs, and (c) drop
+  // the root at the chosen spot. `rel` places it relative to a target card
+  // (before/after/inside); omit it to append at the end of the section's
+  // top-level list (e.g. dropping onto an empty section). One /api/tasks/bulk
+  // batch, mirroring SectionNode's sendToMaster.
+  function moveNodeIntoSection(
+    dragId: string,
+    targetSectionId: string,
+    targetBoardId: string | null,
+    rel?: { targetId: string; pos: DropPos },
+  ) {
+    const drag = nodes.find((n) => n.id === dragId);
+    if (!drag) return;
+    if (rel && (rel.targetId === dragId || isDescendant(nodes, dragId, rel.targetId))) return;
+
+    // The subtree = the dragged task plus every descendant (any depth).
+    const subtree: string[] = [dragId];
+    for (let i = 0; i < subtree.length; i++) {
+      for (const n of nodes) if (n.parentId === subtree[i]) subtree.push(n.id);
+    }
+    const inSubtree = new Set(subtree);
+    const boardChanged = drag.boardId !== targetBoardId;
+
+    // Siblings within the TARGET section under a given parent (position-ordered),
+    // excluding the dragged subtree so its own rows never skew the math.
+    const sectionSiblings = (parentId: string | null) =>
+      nodes
+        .filter(
+          (n) =>
+            !inSubtree.has(n.id) &&
+            n.parentId === parentId &&
+            (taskMap[n.id]?.customFields?.sectionId as string | undefined) === targetSectionId,
+        )
+        .sort((a, b) => a.position - b.position);
+
+    let parentId: string | null;
+    let position: number;
+    if (rel?.pos === "inside") {
+      parentId = rel.targetId;
+      const sibs = sectionSiblings(parentId);
+      position = (sibs[sibs.length - 1]?.position ?? 0) + 1;
+    } else if (rel) {
+      const target = nodes.find((n) => n.id === rel.targetId);
+      if (!target) return;
+      parentId = target.parentId;
+      const sibs = sectionSiblings(parentId);
+      const ti = sibs.findIndex((s) => s.id === rel.targetId);
+      if (rel.pos === "before") {
+        const prev = sibs[ti - 1];
+        position = prev ? (prev.position + target.position) / 2 : target.position - 1;
+      } else {
+        const next = sibs[ti + 1];
+        position = next ? (target.position + next.position) / 2 : target.position + 1;
+      }
+    } else {
+      parentId = null;
+      const sibs = sectionSiblings(null);
+      position = (sibs[sibs.length - 1]?.position ?? 0) + 1;
+    }
+
+    // No-op guard: same section, same spot, same board.
+    const dragSection = taskMap[dragId]?.customFields?.sectionId as string | undefined;
+    if (!boardChanged && dragSection === targetSectionId && drag.parentId === parentId && drag.position === position)
+      return;
+
+    // Build the bulk batch. updateTask REPLACES customFields, so resend the full
+    // object with only sectionId swapped. Descendants keep their parentId; only
+    // their sectionId (and board, if it changed) move.
+    const ops: unknown[] = [];
+    for (const id of subtree) {
+      const cf = taskMap[id]?.customFields ?? {};
+      ops.push({ op: "update", id, patch: { customFields: { ...cf, sectionId: targetSectionId } } });
+    }
+    if (boardChanged) {
+      for (const id of subtree) {
+        if (id === dragId) continue;
+        // Keep each descendant's own position — moveTask would otherwise default
+        // it to the end of its status group and scramble sibling order.
+        const n = nodes.find((x) => x.id === id);
+        ops.push({ op: "move", id, target: { boardId: targetBoardId, position: n?.position } });
+      }
+    }
+    ops.push({
+      op: "move",
+      id: dragId,
+      target: { parentId, position, ...(boardChanged ? { boardId: targetBoardId } : {}) },
+    });
+
+    mutate(
+      () => {
+        setTaskMap((prev) => {
+          const next = { ...prev };
+          for (const id of subtree) {
+            const t = next[id];
+            if (!t) continue;
+            next[id] = {
+              ...t,
+              customFields: { ...(t.customFields ?? {}), sectionId: targetSectionId },
+              ...(boardChanged ? { boardId: targetBoardId } : {}),
+            };
+          }
+          return next;
+        });
+        setNodes((prev) =>
+          prev.map((n) => {
+            if (n.id === dragId)
+              return { ...n, parentId, position, ...(boardChanged ? { boardId: targetBoardId } : {}) };
+            if (boardChanged && inSubtree.has(n.id)) return { ...n, boardId: targetBoardId };
+            return n;
+          }),
+        );
+      },
+      () =>
+        api("/api/tasks/bulk", {
+          method: "POST",
+          body: JSON.stringify({ operations: ops }),
         }),
     );
   }
@@ -1168,7 +1312,7 @@ export function WorkspaceProvider({
       () => {
         setTaskMap((prev) => ({
           ...prev,
-          [tempId]: { id: tempId, title, status, assigneeIds: meId ? [meId] : [], boardId, updatedAt: now },
+          [tempId]: { id: tempId, title, status, assigneeIds: [], boardId, updatedAt: now },
         }));
         setNodes((prev) => [
           ...prev,
@@ -1178,7 +1322,7 @@ export function WorkspaceProvider({
       () =>
         api("/api/tasks", {
           method: "POST",
-          body: JSON.stringify({ title, status, assigneeIds: meId ? [meId] : [], boardId }),
+          body: JSON.stringify({ title, status, assigneeIds: [], boardId }),
         }),
       {
         // Swap the optimistic temp row for the real one in a single commit — no
@@ -1236,7 +1380,7 @@ export function WorkspaceProvider({
             id: tempId,
             title,
             status: "backlog",
-            assigneeIds: meId ? [meId] : [],
+            assigneeIds: [],
             boardId,
             customFields: { sectionId },
             updatedAt: now,
@@ -1253,7 +1397,7 @@ export function WorkspaceProvider({
           body: JSON.stringify({
             title,
             status: "backlog",
-            assigneeIds: meId ? [meId] : [],
+            assigneeIds: [],
             boardId,
             parentId,
             customFields: { sectionId },
@@ -1300,7 +1444,7 @@ export function WorkspaceProvider({
       body: JSON.stringify({
         title: text,
         status: "backlog",
-        assigneeIds: meId ? [meId] : [],
+        assigneeIds: [],
         boardId: taskMap[parentId]?.boardId ?? null,
         parentId,
       }),
@@ -1506,6 +1650,7 @@ export function WorkspaceProvider({
         undoDelete,
         pendingDeletes,
         moveNode,
+        moveNodeIntoSection,
         dropToGroup,
         moveToBoard,
         addTask,

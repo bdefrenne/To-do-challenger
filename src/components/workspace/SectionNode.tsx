@@ -815,6 +815,9 @@ export function SectionNode({
             onAddSubtask={(parentId, title) =>
               ws.addSectionTask({ title, sectionId, boardId, parentId })
             }
+            onDropIntoSection={(dragId) =>
+              ws.moveNodeIntoSection(dragId, sectionId, boardId)
+            }
           />
         )}
       </div>
@@ -1159,10 +1162,12 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
         onDragOver={(e) => {
           if (!e.dataTransfer.types.includes(SECTION_DND_MIME)) return;
           e.preventDefault();
+          e.stopPropagation(); // over a card → not the section's blank-area zone
           h.setDropHint({ id, pos: half(e) });
         }}
         onDragLeave={() => h.dropHint?.id === id && h.setDropHint(null)}
         onDrop={(e) => {
+          e.stopPropagation(); // a card handled it — don't also fire the body zone
           const dragId = e.dataTransfer.getData(SECTION_DND_MIME);
           const pos = half(e);
           h.setDropHint(null);
@@ -1313,6 +1318,7 @@ function CommittedList({
   onDelete,
   onAddTask,
   onAddSubtask,
+  onDropIntoSection,
 }: {
   units: TaskUnit[];
   taskMap: Record<string, Task>;
@@ -1326,12 +1332,41 @@ function CommittedList({
   onDelete: (id: string) => void;
   onAddTask: (title: string) => void;
   onAddSubtask: (parentId: string, title: string) => void;
+  /** Drop a card into THIS section's blank area (or an empty section) — lands it
+   *  at the end as a top-level card, moving it (and its subtree) here. */
+  onDropIntoSection: (dragId: string) => void;
 }) {
   const [dropHint, setDropHint] = useState<{ id: string; pos: "before" | "after" } | null>(null);
+  // True while a section-task drag hovers the list's blank area (not a card) —
+  // draws a dashed ring so it reads as "drop here to move into this section".
+  const [overSection, setOverSection] = useState(false);
 
   const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onAddSubtask, dropHint, setDropHint };
   return (
-    <div className="space-y-1.5">
+    <div
+      // Section-level drop zone. Card drops stopPropagation, so this fires only
+      // for drops on the blank area — appending the dragged subtree here. Works
+      // for empty sections too (no cards to target).
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes(SECTION_DND_MIME)) return;
+        e.preventDefault();
+        setOverSection(true);
+      }}
+      onDragLeave={(e) => {
+        // Ignore leaves into child elements — only clear when truly exiting.
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        setOverSection(false);
+      }}
+      onDrop={(e) => {
+        setOverSection(false);
+        const dragId = e.dataTransfer.getData(SECTION_DND_MIME);
+        if (dragId) onDropIntoSection(dragId);
+      }}
+      className={[
+        "min-h-16 space-y-1.5 rounded-lg transition-colors",
+        overSection ? "outline-dashed outline-2 outline-offset-2 outline-accent/60" : "",
+      ].join(" ")}
+    >
       {units.map((u) => (
         <TaskCard key={u.taskId ?? u.title} unit={u} depth={0} h={h} />
       ))}

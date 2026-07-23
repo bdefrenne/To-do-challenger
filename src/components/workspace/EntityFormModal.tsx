@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Avatar } from "@/components/ui/Badge";
 import { AvatarCropper } from "@/components/ui/AvatarCropper";
 import { SUMMARY_FILENAME } from "@/lib/repo-sync";
@@ -141,7 +142,12 @@ export function EntityFormModal({
     }
   }
 
-  return (
+  if (typeof document === "undefined") return null;
+
+  // Portaled to <body> so the overlay always escapes any parent stacking
+  // context (e.g. the sidebar's `sticky` aside) and reliably paints above the
+  // canvas — matching AnchoredPopover's approach.
+  return createPortal(
     <div
       className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-900/40 p-6 backdrop-blur-sm"
       onClick={onClose}
@@ -328,6 +334,7 @@ export function EntityFormModal({
           }}
         />
       ) : null}
-    </div>
+    </div>,
+    document.body,
   );
 }
