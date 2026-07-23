@@ -34,6 +34,15 @@ export const importanceSchema = z
   .min(-1)
   .max(2) as z.ZodType<-1 | 0 | 1 | 2>;
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
+/** A task handle: its UUID, or its human code — the short ref people share,
+ *  like "PLAT-77" (locked) or "PLAT-77*" (soft; the trailing * is optional).
+ *  The service resolves either form (resolveTaskId) to the same task. */
+const taskHandle = z
+  .string()
+  .describe(
+    'A task handle: either its UUID or its human code (e.g. "PLAT-77", or ' +
+      '"PLAT-77*" while soft — the trailing * is optional). Both resolve to the same task.',
+  );
 /** Assignee refs — each a user id, email, or display name; the service
  *  resolves them to account ids on write. */
 const assigneeIdsSchema = z.array(z.string().max(120)).max(20);
@@ -56,7 +65,7 @@ export const createTaskSchema = z.object({
   difficulty: fibSchema.optional(),
   importance: importanceSchema.optional(),
   description: z.string().max(10_000).optional(),
-  parentId: z.string().nullable().optional(),
+  parentId: taskHandle.nullable().optional(),
   boardId: z.string().nullable().optional(),
 });
 
@@ -109,7 +118,7 @@ export const linkCommitSchema = z.object({
 });
 
 export const moveTaskSchema = z.object({
-  parentId: z.string().nullable().optional(),
+  parentId: taskHandle.nullable().optional(),
   status: statusSchema.optional(),
   position: z.number().optional(),
   boardId: z.string().nullable().optional(),
@@ -125,7 +134,7 @@ export const commentSchema = z.object({
 /** Same patch to many tasks: `{ ids, patch }`. Reuses updateTaskSchema so the
  *  field set + null-clearing rules stay identical to a single update. */
 export const bulkUpdateSchema = z.object({
-  ids: z.array(z.string()).min(1, "at least one id").max(500),
+  ids: z.array(taskHandle).min(1, "at least one id").max(500),
   patch: updateTaskSchema,
 });
 
@@ -133,11 +142,11 @@ export const bulkUpdateSchema = z.object({
  *  reusing the matching single-task schema. */
 export const bulkOpSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("create"), input: createTaskSchema }),
-  z.object({ op: z.literal("update"), id: z.string(), patch: updateTaskSchema }),
-  z.object({ op: z.literal("move"), id: z.string(), target: moveTaskSchema }),
-  z.object({ op: z.literal("complete"), id: z.string(), done: z.boolean().optional() }),
-  z.object({ op: z.literal("comment"), id: z.string(), message: z.string().min(1).max(10_000) }),
-  z.object({ op: z.literal("delete"), id: z.string() }),
+  z.object({ op: z.literal("update"), id: taskHandle, patch: updateTaskSchema }),
+  z.object({ op: z.literal("move"), id: taskHandle, target: moveTaskSchema }),
+  z.object({ op: z.literal("complete"), id: taskHandle, done: z.boolean().optional() }),
+  z.object({ op: z.literal("comment"), id: taskHandle, message: z.string().min(1).max(10_000) }),
+  z.object({ op: z.literal("delete"), id: taskHandle }),
 ]);
 
 /** Ordered heterogeneous ops: `{ operations }`. The 1000 ceiling just rejects

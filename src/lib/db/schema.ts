@@ -378,6 +378,10 @@ export const logKind = pgEnum("log_kind", [
   "updated", // one or more fields changed via a bulk update
 ]);
 
+/** Which surface produced an activity event: the web UI (session cookie), a
+ *  raw API/script call (bearer token), or Claude via the MCP server. */
+export const logSource = pgEnum("log_source", ["ui", "api", "mcp"]);
+
 /* ---- Tasks ----
    Flat table with self-referential parentId for nesting (matches the
    TaskNode tree in the UI). `position` is a fractional sort key so we
@@ -503,8 +507,16 @@ export const taskLogs = pgTable(
     at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
     kind: logKind("kind").notNull(),
     message: text("message").notNull(),
-    /** Who did it — e.g. "You", "Claude", an assignee name. */
+    /** Who did it — e.g. "You", "Claude", an assignee name. Legacy display
+     *  label; `actorId` is the real acting user (below). */
     author: text("author"),
+    /** The real acting user's account. Null for legacy rows written before
+     *  attribution existed. */
+    actorId: text("actor_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    /** Which surface produced the event (ui | api | mcp). Null for legacy rows. */
+    source: logSource("source"),
   },
   (t) => [index("task_logs_task_idx").on(t.taskId)],
 );

@@ -126,6 +126,17 @@ const customFieldsArg = z.record(
   z.union([z.string(), z.number(), z.boolean()]),
 );
 const ymd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "use YYYY-MM-DD");
+/**
+ * How you point at a task: its UUID, OR its human code — the short handle
+ * people actually share (e.g. "PLAT-77"). Both forms resolve to the same task.
+ */
+const taskHandle = z
+  .string()
+  .describe(
+    'A task handle: either its UUID or its human code — the short ref people ' +
+      'share, like "PLAT-77" (a locked code) or "PLAT-77*" (a soft/unlocked ' +
+      "code; the trailing * is optional). Both forms resolve to the same task.",
+  );
 const noteTypeEnum = z.enum([
   "decision",
   "progress",
@@ -249,8 +260,8 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_task",
-      "Get one task by id — its full detail plus its notes (decisions + standup callouts), linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context.",
-      { id: z.string() },
+      "Get one task by its id OR its code (the short ref people share, e.g. PLAT-77 — locked, or PLAT-77* — soft) — its full detail plus its notes (decisions + standup callouts), linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context — including when someone hands you a code like PLAT-77.",
+      { id: taskHandle },
       async ({ id }) => {
         const result = await getTask(id, currentUser());
         return result ? text(result) : text({ error: "Task not found" });
@@ -291,7 +302,7 @@ const handler = createMcpHandler(
         difficulty: fibEnum.optional(),
         importance: importanceArg.optional(),
         description: z.string().max(10_000).optional(),
-        parentId: z.string().optional(),
+        parentId: taskHandle.optional(),
         boardId: z.string().nullable().optional(),
       },
       async (input) =>
@@ -304,7 +315,7 @@ const handler = createMcpHandler(
       "update_task",
       "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call.",
       {
-        id: z.string(),
+        id: taskHandle,
         title: z.string().min(1).max(500).optional(),
         status: statusEnum.optional(),
         assigneeIds: assigneeIdsArg.optional(),
@@ -357,9 +368,9 @@ const handler = createMcpHandler(
       "move_task",
       "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), and/or position.",
       {
-        id: z.string(),
+        id: taskHandle,
         status: statusEnum.optional(),
-        parentId: z.string().nullable().optional(),
+        parentId: taskHandle.nullable().optional(),
         boardId: z.string().nullable().optional(),
         position: z.number().optional(),
       },
@@ -372,7 +383,7 @@ const handler = createMcpHandler(
     server.tool(
       "complete_task",
       "Mark a task done (default), or reopen it with done:false (sends it back to Planned).",
-      { id: z.string(), done: z.boolean().optional().default(true) },
+      { id: taskHandle, done: z.boolean().optional().default(true) },
       async ({ id, done }) => {
         const task = await completeTask(id, done, currentUser(), AI_AUTHOR);
         return task ? text({ task }) : text({ error: "Task not found" });
@@ -382,7 +393,7 @@ const handler = createMcpHandler(
     server.tool(
       "archive_task",
       "Archive a done task (default), or un-archive it with archived:false. Archiving hides a finished task from all active views (boards, lists, canvas) while keeping it in the Archived view; it stays done. Only tasks that are already done can be archived.",
-      { id: z.string(), archived: z.boolean().optional().default(true) },
+      { id: taskHandle, archived: z.boolean().optional().default(true) },
       async ({ id, archived }) => {
         const task = await archiveTask(id, archived, currentUser(), AI_AUTHOR);
         return task ? text({ task }) : text({ error: "Task not found" });
@@ -392,7 +403,7 @@ const handler = createMcpHandler(
     server.tool(
       "add_comment",
       "Add a note/comment to a task's activity log.",
-      { id: z.string(), message: z.string().min(1).max(10_000) },
+      { id: taskHandle, message: z.string().min(1).max(10_000) },
       async ({ id, message }) => {
         const comment = await addComment(id, message, currentUser(), AI_AUTHOR);
         return comment ? text({ comment }) : text({ error: "Task not found" });
@@ -402,7 +413,7 @@ const handler = createMcpHandler(
     server.tool(
       "delete_task",
       "Delete a task. Its subtasks are re-parented to the top level (not deleted).",
-      { id: z.string() },
+      { id: taskHandle },
       async ({ id }) => text({ ok: await deleteTask(id, currentUser()) }),
     );
 
@@ -457,7 +468,7 @@ const handler = createMcpHandler(
     server.tool(
       "lock_task",
       "Lock (freeze) a task's human code so it's stable to cite in commits — e.g. GH-20* becomes GH-20. Idempotent: locking an already-locked task just returns it. Normally you don't call this directly — the work_on_task prompt locks on handoff — but call it if you're about to commit work referencing a task whose code is still soft (ends with *).",
-      { id: z.string() },
+      { id: taskHandle },
       async ({ id }) => {
         const task = await mintRef(id, currentUser(), AI_AUTHOR);
         return task ? text({ task }) : text({ error: "Task not found" });
@@ -468,7 +479,7 @@ const handler = createMcpHandler(
       "add_note",
       "Add a note to a task — the one log for anything worth remembering. Use `decision` ONLY for a SIGNIFICANT choice, and usually only when the user says 'log this…' — never reflexively for small choices (put the 'why' in the note body). Use a standup-worthy callout otherwise: `progress`, `milestone`, `blocker`, `question`, `fyi`. Use `review` ONLY when the user explicitly asks you to flag something for them to visually double-check later — never add review notes on your own initiative. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
       {
-        id: z.string(),
+        id: taskHandle,
         note: z.string().min(1).max(10_000),
         type: noteTypeEnum.optional(),
         tags: z.array(z.string().min(1).max(60)).max(20).optional(),
@@ -483,7 +494,7 @@ const handler = createMcpHandler(
       "list_notes",
       "Query notes ACROSS all your tasks — filter by task, type (e.g. decision), or date range. Returns only OPEN notes unless `includeResolved` is true. Use for retros ('show our technical decisions'), audits, the standup digest, and listing open `review` items to double-check.",
       {
-        taskId: z.string().optional(),
+        taskId: taskHandle.optional(),
         type: noteTypeEnum.optional(),
         from: z.string().max(40).optional(),
         to: z.string().max(40).optional(),
@@ -512,7 +523,7 @@ const handler = createMcpHandler(
       "link_commit",
       "Record a git commit against a task so the task page lists what shipped it. Pass the `sha` (and ideally the `subject` line). Idempotent per (task, sha). Commit messages should reference the task's locked code, e.g. `[GH-20] …`.",
       {
-        id: z.string(),
+        id: taskHandle,
         sha: z.string().min(4).max(64),
         subject: z.string().max(500).optional(),
       },
@@ -815,7 +826,7 @@ const handler = createMcpHandler(
     server.tool(
       "bulk_update",
       "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). Tasks you don't own are silently skipped and returned in `skipped`.",
-      { ids: z.array(z.string()).min(1).max(500), patch: updateTaskSchema },
+      { ids: z.array(taskHandle).min(1).max(500), patch: updateTaskSchema },
       async ({ ids, patch }) =>
         text(await bulkUpdate(currentUser(), ids, patch, AI_AUTHOR)),
     );
