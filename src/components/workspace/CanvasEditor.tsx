@@ -861,6 +861,12 @@ export function CanvasEditor({
       // hit-test strokes via `data-draw-id`. With the Select tool they behave
       // like any other node — click to select, drag to move.
       if (node.kind === "draw" && toolRef.current !== "select") return;
+      // The pen and eraser are drag-over-canvas tools: a pointer-down on ANY
+      // node (image, note, section) must also fall through to the background so
+      // you can draw a stroke straight over it and the eraser can reach ink
+      // beneath. Without this an image/note swallows the press (its grab/move)
+      // and you can't draw over it.
+      if (toolRef.current === "draw" || toolRef.current === "erase") return;
       e.stopPropagation();
       if (editingRef.current === node.id) return;
 
@@ -1186,7 +1192,14 @@ export function CanvasEditor({
         onPointerLeave={onContainerPointerLeave}
         onDragOver={onDragOver}
         onDrop={onDrop}
-        className="absolute inset-0 touch-none select-none"
+        className={[
+          "absolute inset-0 touch-none select-none",
+          // While the pen/eraser is active, force the tool cursor over every
+          // node too — otherwise an image or note's own `cursor-grab` wins on
+          // hover and misleads you into thinking it'll grab instead of draw.
+          !spaceDown && tool === "draw" ? "[&_*]:cursor-crosshair!" : "",
+          !spaceDown && tool === "erase" ? "[&_*]:cursor-cell!" : "",
+        ].join(" ")}
         style={{
           cursor,
           backgroundImage: "radial-gradient(circle, var(--color-border-strong) 1px, transparent 1px)",

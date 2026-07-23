@@ -253,6 +253,15 @@ const LOCKING_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "done",
 ]);
 
+/** The two *active-work* states. When an agent enters one of these it's saying
+ *  "I'm on this now", so (for MCP/agent writes only — see the `assignActor`
+ *  flag on createTask/updateTask) the acting user is auto-added to the
+ *  assignees. Excludes the resting states (analyzed/review/done). */
+const WORK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "analyzing",
+  "building",
+]);
+
 /**
  * Compute the fields that freeze a task's soft code into a locked `ref`
  * (allocating a seq if it doesn't have one yet). Returns null if it's already
@@ -789,6 +798,10 @@ export async function createTask(
   input: CreateTaskInput,
   userId: string,
   author = "You",
+  /** MCP/agent path only: when the task is born into a work status
+   *  (analyzing/building), add the acting `userId` to the assignees so the
+   *  board records who's on it. Off for web/REST. */
+  assignActor = false,
 ): Promise<TaskDTO> {
   const status = input.status ?? "backlog";
   // Nest under any parent that exists (tasks are team-wide); else top-level.
@@ -816,7 +829,11 @@ export async function createTask(
   // code stays unlocked (soft, shows a trailing "*") until handoff / mint.
   const owner = ownerOf({ boardId, projectId, userId }, userId);
   const seq = await allocSeq(owner.scope, owner.id);
-  const assigneeIds = await resolveAssignees(input.assigneeIds ?? []);
+  let assigneeIds = await resolveAssignees(input.assigneeIds ?? []);
+  // Starting work on it = you own it. `userId` is already a canonical account id.
+  if (assignActor && WORK_STATUSES.has(status) && !assigneeIds.includes(userId)) {
+    assigneeIds = [...assigneeIds, userId];
+  }
   const [row] = await db
     .insert(tasks)
     .values({
@@ -877,6 +894,10 @@ export async function updateTask(
    * writer changed the row in the meantime. Omit it for last-write-wins.
    */
   expectedUpdatedAt?: string,
+  /** MCP/agent path only: when this update moves the task into a work status
+   *  (analyzing/building), ensure the acting `userId` is among the assignees
+   *  (merge, don't clobber). Off for web/REST. */
+  assignActor = false,
 ): Promise<TaskDTO | null> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return null;
@@ -893,8 +914,22 @@ export async function updateTask(
   const now = new Date();
   const values: Record<string, unknown> = { updatedAt: now };
   if (patch.title !== undefined) values.title = patch.title;
-  if (patch.assigneeIds !== undefined)
-    values.assigneeIds = await resolveAssignees(patch.assigneeIds);
+  // Assignees: fold together an explicit set and the agent auto-assign rule.
+  // If moving into a work status via the MCP/agent path, ensure the acting
+  // user is present — starting from the explicit list if given, else the
+  // current one (merge, never clobber other assignees).
+  const targetIsWork =
+    patch.status !== undefined && WORK_STATUSES.has(patch.status);
+  if (patch.assigneeIds !== undefined || (assignActor && targetIsWork)) {
+    let next =
+      patch.assigneeIds !== undefined
+        ? await resolveAssignees(patch.assigneeIds)
+        : current.assigneeIds;
+    if (assignActor && targetIsWork && !next.includes(userId)) {
+      next = [...next, userId];
+    }
+    values.assigneeIds = next;
+  }
   if (patch.startDate !== undefined) values.startDate = patch.startDate;
   if (patch.dueDate !== undefined) values.dueDate = patch.dueDate;
   if (patch.recurrence !== undefined) values.recurrence = patch.recurrence;

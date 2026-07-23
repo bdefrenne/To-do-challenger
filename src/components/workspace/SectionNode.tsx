@@ -1135,8 +1135,8 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   if (!id || !t) return null;
   const ic = IMPORTANCE_CARD[t.importance ?? 0];
   // Status ring + corner badge — canvas only, and only for "started" statuses
-  // (analyzing/analyzed/building). Backlog/todo/done are absent from the map,
-  // so they get no ring/badge (done keeps its green wash below).
+  // (analyzing/analyzed/building/review). Backlog/todo/done are absent from the
+  // map, so they get no ring/badge (done keeps its green wash below).
   const badge = STATUS_CANVAS_BADGE[t.status];
   const statusTone = STATUS_TONE[t.status];
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;

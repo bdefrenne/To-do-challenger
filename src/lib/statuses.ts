@@ -91,11 +91,13 @@ export const STATUS_TONE: Record<
 
 /** Statuses that get a ring + corner badge on the canvas, with their badge text.
  *  Presence here = "started work"; absent statuses (backlog/todo/done) get none.
- *  In-progress states carry an ellipsis; analyzed is a resting state, so plain. */
+ *  In-progress states carry an ellipsis; analyzed and review are resting states,
+ *  so plain. */
 export const STATUS_CANVAS_BADGE: Partial<Record<TaskStatus, string>> = {
   analyzing: "Analyzing…",
   analyzed: "Analyzed",
   building: "Building…",
+  review: "Review",
 };
 
 /** How often a task repeats — label + a compact glyph for chips. */

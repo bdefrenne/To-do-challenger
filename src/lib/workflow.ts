@@ -27,6 +27,10 @@ a stable, permanent ref for the task. There are two handoffs: To Do → Analyzin
 (understand + analysis) and Analyzed → Building (tech plan + execute) — they can be done by
 different people/AIs, or by you end to end.
 
+Moving a task into **Analyzing or Building auto-assigns it to you** (the user
+you're working with), so the board records who's on it — no need to assign
+yourself by hand. Existing assignees are kept.
+
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)

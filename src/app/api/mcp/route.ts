@@ -294,7 +294,9 @@ const handler = createMcpHandler(
         boardId: z.string().nullable().optional(),
       },
       async (input) =>
-        text({ task: await createTask(input, currentUser(), AI_AUTHOR) }),
+        // assignActor=true: a task born into analyzing/building is assigned to
+        // the acting user (the agent is starting work on it).
+        text({ task: await createTask(input, currentUser(), AI_AUTHOR, true) }),
     );
 
     server.tool(
@@ -337,6 +339,9 @@ const handler = createMcpHandler(
             currentUser(),
             AI_AUTHOR,
             expectedUpdatedAt,
+            // assignActor=true: moving a task into analyzing/building assigns
+            // the acting user (the agent is starting work on it).
+            true,
           );
           return task ? text({ task }) : text({ error: "Task not found" });
         } catch (e) {
