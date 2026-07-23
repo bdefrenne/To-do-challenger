@@ -328,6 +328,13 @@ export class ConflictError extends Error {
   }
 }
 
+/**
+ * Thrown by the service layer when a write is well-formed but violates a
+ * business rule (e.g. archiving a task that isn't done). `route()` turns it
+ * into a 400.
+ */
+export class ValidationError extends Error {}
+
 /* ---- Responses ---- */
 export const json = <T>(data: T, status = 200) =>
   NextResponse.json(data, { status });
@@ -352,6 +359,7 @@ export function route(
       if (e instanceof AuthError) return error(e.message, e.status);
       if (e instanceof ConflictError)
         return json({ error: e.message, task: e.current }, 409);
+      if (e instanceof ValidationError) return error(e.message, 400);
       if (e instanceof z.ZodError)
         return error(e.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "), 422);
       console.error("[api] unhandled error", e);

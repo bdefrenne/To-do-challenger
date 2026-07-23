@@ -29,6 +29,7 @@ const NAV = [
   { href: "/canvas", label: "Canvas", icon: "◳" },
   { href: "/notes", label: "Notes", icon: "✎" },
   { href: "/calendar", label: "Calendar", icon: "▦" },
+  { href: "/archived", label: "Archived", icon: "🗄" },
 ];
 
 export function AppShell({
@@ -97,10 +98,12 @@ function DeleteUndoToast() {
   const { pendingDeletes, undoDelete } = useWorkspace();
   if (!pendingDeletes.length) return null;
   const last = pendingDeletes[pendingDeletes.length - 1];
+  // Done tasks are archived, not deleted — the verb follows the latest action.
+  const verb = last.mode === "archive" ? "Archived" : "Deleted";
   const label =
     pendingDeletes.length > 1
-      ? `Deleted ${pendingDeletes.length} tasks`
-      : `Deleted “${last.title}”`;
+      ? `${verb} ${pendingDeletes.length} tasks`
+      : `${verb} “${last.title}”`;
   return (
     <div className="pointer-events-none fixed inset-x-0 bottom-20 z-[300] flex justify-center px-4">
       <div

@@ -89,8 +89,12 @@ interface WorkspaceContextValue {
   /** Cancel a pending delete and restore the task; no id ⇒ most recent (LIFO).
    *  Returns whether anything was undone (canvas Ctrl+Z tries this first). */
   undoDelete: (id?: string) => boolean;
-  /** Tasks inside their delete undo window (oldest → newest), for the toast. */
-  pendingDeletes: { id: string; title: string }[];
+  /** Tasks inside their delete undo window (oldest → newest), for the toast.
+   *  `mode` distinguishes a real delete from a done-task archive. */
+  pendingDeletes: { id: string; title: string; mode: "delete" | "archive" }[];
+  /** Archive every done task in scope (a board, a project, or all when omitted).
+   *  Returns how many were archived. */
+  archiveAllDone: (scope?: { boardId?: string; projectId?: string }) => Promise<number>;
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
@@ -385,9 +389,19 @@ export function WorkspaceProvider({
   // background poll can't resurrect the card; each timer fires the real DELETE
   // when its window lapses. `pendingDeletes` mirrors it for the toast.
   const pendingDeleteRef = useRef<
-    Map<string, { task: Task; node: TaskNode | undefined; timer: ReturnType<typeof setTimeout> }>
+    Map<
+      string,
+      {
+        task: Task;
+        node: TaskNode | undefined;
+        timer: ReturnType<typeof setTimeout>;
+        mode: "delete" | "archive";
+      }
+    >
   >(new Map());
-  const [pendingDeletes, setPendingDeletes] = useState<{ id: string; title: string }[]>([]);
+  const [pendingDeletes, setPendingDeletes] = useState<
+    { id: string; title: string; mode: "delete" | "archive" }[]
+  >([]);
 
   // Mirror of the open-modal stack so the (never re-armed) poll closure can
   // refresh every open task's thread when the cursor moves — no interval re-arm.
@@ -711,17 +725,29 @@ export function WorkspaceProvider({
       clearTimeout(entry.timer);
       pendingDeleteRef.current.delete(id);
       setPendingDeletes((s) => s.filter((d) => d.id !== id));
-      mutate(null, () => api(`/api/tasks/${id}`, { method: "DELETE" }));
+      mutate(null, () =>
+        entry.mode === "archive"
+          ? api(`/api/tasks/${id}/archive`, {
+              method: "POST",
+              body: JSON.stringify({ archived: true }),
+            })
+          : api(`/api/tasks/${id}`, { method: "DELETE" }),
+      );
     },
     [mutate],
   );
 
   /** Delete a task with an undo window: drop it from view immediately, then
-   *  commit the DELETE to Postgres after UNDO_WINDOW_MS unless `undoDelete`
-   *  cancels first. The removed node is snapshotted so undo can restore it. */
+   *  commit to Postgres after UNDO_WINDOW_MS unless `undoDelete` cancels first.
+   *  The removed node is snapshotted so undo can restore it.
+   *
+   *  Done tasks are ARCHIVED rather than deleted — pressing Delete on a finished
+   *  task tucks it into the Archived view (reversibly) instead of destroying it.
+   *  The toast reflects which happened ("Archived" vs "Deleted"). */
   function deleteTask(id: string) {
     const task = taskMapRef.current[id];
     if (!task || pendingDeleteRef.current.has(id)) return;
+    const mode: "delete" | "archive" = task.status === "done" ? "archive" : "delete";
     const node = nodesRef.current.find((n) => n.id === id);
     setTaskMap((prev) => {
       if (!prev[id]) return prev;
@@ -731,8 +757,8 @@ export function WorkspaceProvider({
     });
     setNodes((prev) => prev.filter((n) => n.id !== id));
     const timer = setTimeout(() => commitDelete(id), UNDO_WINDOW_MS);
-    pendingDeleteRef.current.set(id, { task, node, timer });
-    setPendingDeletes((s) => [...s.filter((d) => d.id !== id), { id, title: task.title }]);
+    pendingDeleteRef.current.set(id, { task, node, timer, mode });
+    setPendingDeletes((s) => [...s.filter((d) => d.id !== id), { id, title: task.title, mode }]);
   }
 
   /** Cancel a pending delete and restore the task. With no id, undoes the most
@@ -758,9 +784,16 @@ export function WorkspaceProvider({
   // inside the undo window doesn't silently drop the delete.
   useEffect(
     () => () => {
-      for (const [id, { timer }] of pendingDeleteRef.current) {
+      for (const [id, { timer, mode }] of pendingDeleteRef.current) {
         clearTimeout(timer);
-        void api(`/api/tasks/${id}`, { method: "DELETE" }).catch(() => {});
+        const req =
+          mode === "archive"
+            ? api(`/api/tasks/${id}/archive`, {
+                method: "POST",
+                body: JSON.stringify({ archived: true }),
+              })
+            : api(`/api/tasks/${id}`, { method: "DELETE" });
+        void req.catch(() => {});
       }
     },
     [],
@@ -849,6 +882,52 @@ export function WorkspaceProvider({
       () => patchStatusLocal(id, status),
       () => patchTask(id, { status }),
     );
+  }
+
+  /** Archive every done task in scope (a board, a project, or all when omitted).
+   *  Drops the visible done cards from view immediately, then persists +
+   *  refetches to reconcile (the server cascades each to its subtree and also
+   *  catches board-less project tasks the client can't match locally). */
+  async function archiveAllDone(
+    scope: { boardId?: string; projectId?: string } = {},
+  ): Promise<number> {
+    // Board ids in scope: the one board, every board of the project, or all.
+    const projectBoardIds = scope.projectId
+      ? new Set(
+          (projects.find((p) => p.id === scope.projectId)?.boards ?? []).map((b) => b.id),
+        )
+      : null;
+    const inScope = (boardId: string | null | undefined) =>
+      scope.boardId
+        ? boardId === scope.boardId
+        : projectBoardIds
+          ? boardId != null && projectBoardIds.has(boardId)
+          : true;
+    const doneIds = nodesRef.current
+      .filter((n) => n.status === "done" && inScope(n.boardId))
+      .map((n) => n.id);
+    const drop = new Set(doneIds);
+    if (drop.size) {
+      setTaskMap((prev) => {
+        const next = { ...prev };
+        for (const id of drop) delete next[id];
+        return next;
+      });
+      setNodes((prev) => prev.filter((n) => !drop.has(n.id)));
+    }
+    let archived = doneIds.length;
+    try {
+      const res = await api<{ archived: number }>(`/api/tasks/archive-done`, {
+        method: "POST",
+        body: JSON.stringify(scope),
+      });
+      archived = res.archived;
+    } finally {
+      await fetchAll();
+      await refreshVersion();
+      emitLocalChange();
+    }
+    return archived;
   }
 
   /* ---- Drag & drop: reorder / nest / cross-group ---- */
@@ -1453,6 +1532,7 @@ export function WorkspaceProvider({
           await refreshVersion();
           emitLocalChange();
         },
+        archiveAllDone,
         subscribeLocalChange,
         applyRemotePatch,
         refreshFromRemote,

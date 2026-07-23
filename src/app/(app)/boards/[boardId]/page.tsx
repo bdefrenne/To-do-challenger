@@ -10,6 +10,7 @@ import { KanbanBoard } from "@/components/workspace/KanbanBoard";
 import { TaskTable } from "@/components/workspace/TaskTable";
 import { EntityReadme } from "@/components/workspace/EntityReadme";
 import { BoardModal } from "@/components/workspace/BoardModal";
+import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
 
 /**
  * Single-board view. Two modes:
@@ -55,6 +56,7 @@ export default function BoardPage() {
                 Settings
               </button>
             ) : null}
+            {board ? <ArchiveDoneButton boardId={board.id} /> : null}
             <ViewToggle
               value={view}
               onChange={setView}

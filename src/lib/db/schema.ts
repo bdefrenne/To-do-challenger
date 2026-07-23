@@ -468,6 +468,9 @@ export const tasks = pgTable(
     /** Set when the task entered "done"; cleared when reopened. Doubles as the
      *  workflow "finishedAt". */
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    /** Set when a done task is archived (hidden from active views); cleared on
+     *  un-archive or when the task leaves "done". Only done tasks can be set. */
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -481,6 +484,7 @@ export const tasks = pgTable(
     index("tasks_project_idx").on(t.projectId),
     index("tasks_parent_idx").on(t.parentId),
     index("tasks_status_idx").on(t.status),
+    index("tasks_archived_idx").on(t.archivedAt),
   ],
 );
 

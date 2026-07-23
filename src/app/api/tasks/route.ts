@@ -30,6 +30,9 @@ export const GET = route(async (req: NextRequest, { userId }) => {
   const sp = new URL(req.url).searchParams;
   const statusCsv = sp.get("status");
   const overdue = sp.get("overdue");
+  // ?archived=only  → just archived tasks (the Archived view)
+  // ?archived=include|all → active + archived; anything else (or absent) hides them
+  const archived = sp.get("archived");
   const filter: TaskFilter = {
     boardId: sp.get("boardId") ?? undefined,
     projectId: sp.get("projectId") ?? undefined,
@@ -42,6 +45,8 @@ export const GET = route(async (req: NextRequest, { userId }) => {
     dueAfter: sp.get("dueAfter") ?? undefined,
     // presence => true; ?overdue=false / ?overdue=0 => false
     overdue: overdue == null ? undefined : overdue !== "false" && overdue !== "0",
+    archivedOnly: archived === "only",
+    includeArchived: archived === "include" || archived === "all",
   };
   // Assignees are stored as account ids; resolve a name/email/id filter to an id.
   if (filter.assignee) {

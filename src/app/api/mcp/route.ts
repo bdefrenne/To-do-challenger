@@ -31,6 +31,7 @@ import {
   updateTask,
   moveTask,
   completeTask,
+  archiveTask,
   addComment,
   deleteTask,
   bulkUpdate,
@@ -379,6 +380,16 @@ const handler = createMcpHandler(
     );
 
     server.tool(
+      "archive_task",
+      "Archive a done task (default), or un-archive it with archived:false. Archiving hides a finished task from all active views (boards, lists, canvas) while keeping it in the Archived view; it stays done. Only tasks that are already done can be archived.",
+      { id: z.string(), archived: z.boolean().optional().default(true) },
+      async ({ id, archived }) => {
+        const task = await archiveTask(id, archived, currentUser(), AI_AUTHOR);
+        return task ? text({ task }) : text({ error: "Task not found" });
+      },
+    );
+
+    server.tool(
       "add_comment",
       "Add a note/comment to a task's activity log.",
       { id: z.string(), message: z.string().min(1).max(10_000) },
@@ -411,6 +422,14 @@ const handler = createMcpHandler(
         overdue: z.boolean().optional().describe("past due and not done"),
         boardId: z.string().optional(),
         projectId: z.string().optional(),
+        includeArchived: z
+          .boolean()
+          .optional()
+          .describe("also include archived tasks (excluded by default)"),
+        archivedOnly: z
+          .boolean()
+          .optional()
+          .describe("return ONLY archived tasks (the Archived view)"),
         format: z.enum(["json", "markdown"]).optional().default("json"),
       },
       async ({ format, ...filter }) => {

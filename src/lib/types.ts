@@ -175,6 +175,9 @@ export interface Task {
   updatedAt?: string;
   /** ISO timestamp the task was completed (set on done, cleared on reopen). */
   completedAt?: string;
+  /** ISO timestamp a done task was archived (hidden from active views); null
+   *  when not archived. Cleared on un-archive or when the task leaves "done". */
+  archivedAt?: string | null;
   /** Nested sub-tasks, revealed when the row is expanded. */
   subtasks?: Task[];
   /** Image attachments (pasted or uploaded). */

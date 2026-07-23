@@ -10,6 +10,7 @@ import { BoardsColumns } from "@/components/workspace/BoardsColumns";
 import { ProjectModal } from "@/components/workspace/ProjectModal";
 import { EntityReadme } from "@/components/workspace/EntityReadme";
 import { TaskTable } from "@/components/workspace/TaskTable";
+import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
 
 /**
  * Project view. Two modes:
@@ -53,6 +54,7 @@ export default function ProjectPage() {
                 Settings
               </button>
             ) : null}
+            {project ? <ArchiveDoneButton projectId={project.id} /> : null}
             <ViewToggle
               value={view}
               onChange={setView}

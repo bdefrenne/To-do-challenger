@@ -48,7 +48,7 @@ import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 type Tool = "select" | "text" | "section" | "draw" | "erase";
 
 /** Pen palette + widths offered when the pencil is active. */
-const PEN_COLORS = ["#111827", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7"];
+const PEN_COLORS = ["#111827", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#ffffff"];
 const PEN_WIDTHS = [2, 4, 8];
 
 interface Viewport {

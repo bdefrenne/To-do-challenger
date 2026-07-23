@@ -8,7 +8,7 @@
   ====================================================================
 */
 
-import { and, asc, desc, eq, gte, ilike, inArray, isNull, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, or, sql, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
 import { db } from "./client";
@@ -35,7 +35,7 @@ import {
 } from "./schema";
 import { STATUS_LABEL } from "@/lib/statuses";
 import type { PublicUser } from "./users";
-import { ConflictError } from "@/lib/api";
+import { ConflictError, ValidationError } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
 import type {
@@ -169,6 +169,7 @@ function rowToTask(
     statusSince: iso(row.statusSince)!,
     lockedAt: iso(row.lockedAt) ?? null,
     completedAt: iso(row.completedAt),
+    archivedAt: iso(row.archivedAt) ?? null,
     createdAt: iso(row.createdAt)!,
     updatedAt: iso(row.updatedAt),
     attachments: attachments.length ? attachments : undefined,
@@ -527,6 +528,10 @@ export interface TaskFilter {
   dueAfter?: string;
   /** Only tasks past due and not done. */
   overdue?: boolean;
+  /** Include archived tasks alongside active ones (default: archived excluded). */
+  includeArchived?: boolean;
+  /** Return ONLY archived tasks (for the Archived view). Overrides includeArchived. */
+  archivedOnly?: boolean;
 }
 
 /** Build the WHERE for the team's tasks, narrowed by an optional filter. Tasks
@@ -555,6 +560,10 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
     conds.push(sql`${tasks.dueDate} < CURRENT_DATE`);
     conds.push(sql`${tasks.status} <> 'done'`);
   }
+  // Archived tasks are hidden from every active surface by default. `archivedOnly`
+  // powers the Archived view; `includeArchived` returns both.
+  if (filter?.archivedOnly) conds.push(isNotNull(tasks.archivedAt));
+  else if (!filter?.includeArchived) conds.push(isNull(tasks.archivedAt));
   return and(...conds);
 }
 
@@ -951,7 +960,11 @@ export async function updateTask(
     values.statusSince = now;
     // Track completion: stamp on entering "done", clear on leaving it.
     if (patch.status === "done") values.completedAt = now;
-    else if (current.status === "done") values.completedAt = null;
+    else if (current.status === "done") {
+      values.completedAt = null;
+      // An archived task is always done, so leaving "done" un-archives it too.
+      values.archivedAt = null;
+    }
     // Lock the code the first time the task enters the working part of the
     // spine (Analyzing+). Folded into THIS update so the If-Match guard below
     // still holds — no separate mintRef write to trip it. Any entry path (UI
@@ -1196,6 +1209,66 @@ export async function completeTask(
   });
 }
 
+/** Archive or un-archive a task, cascading to its whole subtree. Only a done
+ *  task can be archived (its descendants come along regardless of their own
+ *  status, so nothing is orphaned off the board); un-archive restores the
+ *  subtree intact. Hides/reveals the task across every active view. */
+export async function archiveTask(
+  handle: string,
+  archived = true,
+  userId: string,
+  author = "You",
+): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId);
+  if (!id) return null;
+  const current = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
+  if (!current) return null;
+  if (archived && current.status !== "done")
+    throw new ValidationError("Only done tasks can be archived");
+
+  const now = new Date();
+  // Cascade to the full subtree so children aren't left invisible (the board
+  // only renders top-level tasks + their present parents).
+  await db.execute(sql`
+    WITH RECURSIVE sub AS (
+      SELECT ${id}::text AS id
+      UNION ALL
+      SELECT t.id FROM ${tasks} t JOIN sub ON t.parent_id = sub.id
+    )
+    UPDATE ${tasks} SET archived_at = ${archived ? now : null}, updated_at = ${now}
+    WHERE id IN (SELECT id FROM sub)
+  `);
+  await log(id, "updated", archived ? "Archived" : "Un-archived", author);
+
+  const [counts, ctx] = await Promise.all([commentCounts(userId), codeCtx(userId)]);
+  const row = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
+  return row ? rowToTask(row, counts.get(id) ?? 0, undefined, ctx) : null;
+}
+
+/** Archive every done task in scope (a board, a project, or everywhere when no
+ *  scope is given), cascading each to its subtree. Returns how many done tasks
+ *  were archived. */
+export async function archiveAllDone(
+  userId: string,
+  scope: { boardId?: string; projectId?: string } = {},
+  author = "You",
+): Promise<number> {
+  const conds: (SQL | undefined)[] = [
+    eq(tasks.status, "done"),
+    isNull(tasks.archivedAt),
+  ];
+  if (scope.boardId) conds.push(eq(tasks.boardId, scope.boardId));
+  if (scope.projectId) conds.push(eq(tasks.projectId, scope.projectId));
+  const doneRoots = await db
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(and(...conds));
+  for (const { id } of doneRoots) {
+    await archiveTask(id, true, userId, author);
+  }
+  return doneRoots.length;
+}
+
 export async function addComment(
   handle: string,
   message: string,
@@ -1362,6 +1435,8 @@ export async function bulkUpdate(
     values.status = patch.status;
     values.statusSince = now;
     values.completedAt = patch.status === "done" ? now : null;
+    // Leaving "done" un-archives (an archived task is always done).
+    if (patch.status !== "done") values.archivedAt = null;
   }
 
   // 3. One UPDATE for the whole owned set.
