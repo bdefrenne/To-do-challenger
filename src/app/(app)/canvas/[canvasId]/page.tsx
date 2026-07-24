@@ -14,6 +14,7 @@ import { useParams } from "next/navigation";
 import { LiveMap, LiveObject, type Json } from "@liveblocks/client";
 import { LiveblocksProvider, RoomProvider } from "@liveblocks/react";
 import { CanvasEditor } from "@/components/workspace/CanvasEditor";
+import { CanvasConnectionStatus } from "@/components/workspace/CanvasConnectionStatus";
 import type { StoredNode } from "@/liveblocks.config";
 import type { Canvas, CanvasNode } from "@/lib/types";
 
@@ -122,6 +123,7 @@ export default function CanvasPage() {
               initialStorage={initialStorage}
             >
               <CanvasEditor canvasId={canvasId} canvasName={name} />
+              <CanvasConnectionStatus />
             </RoomProvider>
           </LiveblocksProvider>
         )}

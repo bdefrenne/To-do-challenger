@@ -15,7 +15,9 @@ import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { SectionNode } from "./SectionNode";
 import { DrawNode } from "./DrawNode";
 import { ImageNode } from "./ImageNode";
+import { SectionGroupNode } from "./SectionGroupNode";
 export { NEW_SECTION_SIZE } from "./SectionNode";
+export { NEW_GROUP_SIZE } from "./SectionGroupNode";
 
 /** Default geometry for freshly-dropped nodes (canvas units). */
 export const NEW_TEXT_SIZE = { width: 360, height: 64 };
@@ -109,6 +111,8 @@ export function CanvasNode({
   masterSection = null,
   onSetMaster,
   onRemove,
+  groupMemberCount = 0,
+  groupDropActive = false,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -146,14 +150,19 @@ export function CanvasNode({
   masterSection?: { id: string; name: string } | null;
   /** Section-only: mark/unmark this section as its board's master. */
   onSetMaster?: (master: boolean) => void;
-  /** Section-only: remove this node from the canvas (after sending its cards). */
+  /** Section / section_group: remove this node from the canvas. */
   onRemove?: () => void;
+  /** section_group-only: how many sections currently belong to it. */
+  groupMemberCount?: number;
+  /** section_group-only: a section is being dragged over it right now. */
+  groupDropActive?: boolean;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const isSection = node.kind === "section";
   const isDraw = node.kind === "draw";
   const isImage = node.kind === "image";
+  const isGroup = node.kind === "section_group";
 
   // Focus + select all the text whenever we enter edit mode, so a double-click
   // re-edit lets you replace the content with the next keystroke (or click once
@@ -239,6 +248,24 @@ export function CanvasNode({
         onResize={(width, height) => onPatch?.({ width, height })}
         onResizeStart={onResizeStart}
         onResizeEnd={onResizeEnd}
+      />
+    );
+  }
+
+  if (isGroup) {
+    return (
+      <SectionGroupNode
+        node={node}
+        selected={selected}
+        smooth={smooth}
+        editing={editing}
+        memberCount={groupMemberCount}
+        dropActive={groupDropActive}
+        onPointerDown={onPointerDown}
+        onStartEditing={onStartEditing}
+        onChange={onChange}
+        onStopEditing={onStopEditing}
+        onRemove={onRemove}
       />
     );
   }

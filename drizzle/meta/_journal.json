@@ -176,6 +176,20 @@
       "when": 1785300000000,
       "tag": "0024_add_task_archived_at",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1785400000000,
+      "tag": "0025_add_task_log_attribution",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1785500000000,
+      "tag": "0026_add_canvas_section_group_kind",
+      "breakpoints": true
     }
   ]
 }

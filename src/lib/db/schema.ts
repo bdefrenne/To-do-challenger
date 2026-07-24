@@ -643,6 +643,7 @@ export const canvasNodeKind = pgEnum("canvas_node_kind", [
   "section",
   "draw",
   "image",
+  "section_group",
 ]);
 
 export const canvases = pgTable(
@@ -684,8 +685,10 @@ export const canvasNodes = pgTable(
     /** "text" = a markdown text block; "section" = a Figma-style titled outline
      *  bound to a board (`data.boardId`), whose lines are that board's live
      *  tasks; "draw" = a freehand pen stroke; "image" = a pasted/dropped picture
-     *  whose blob URL lives in `data.url`. ("frame" is a removed legacy kind —
-     *  see the enum note above.) */
+     *  whose blob URL lives in `data.url`; "section_group" = a movable container
+     *  that arranges its member sections (each carrying `data.groupId`) in a
+     *  column and shows a big title. ("frame" is a removed legacy kind — see the
+     *  enum note above.) */
     kind: canvasNodeKind("kind").notNull(),
     /** Markdown for a text node; the label/title for a section. */
     content: text("content").notNull().default(""),

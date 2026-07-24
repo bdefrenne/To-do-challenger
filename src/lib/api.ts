@@ -283,7 +283,13 @@ export const reorderBoardsSchema = z.object({
 });
 
 /* ---- Canvas / whiteboard ---- */
-const canvasNodeKindSchema = z.enum(["text", "section", "draw", "image"]);
+const canvasNodeKindSchema = z.enum([
+  "text",
+  "section",
+  "draw",
+  "image",
+  "section_group",
+]);
 const canvasNodeData = z.record(z.string(), z.unknown());
 
 export const createCanvasSchema = z.object({

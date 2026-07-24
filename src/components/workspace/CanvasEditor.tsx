@@ -36,7 +36,13 @@ import {
   CanvasNode as NodeView,
   NEW_TEXT_SIZE,
   NEW_SECTION_SIZE,
+  NEW_GROUP_SIZE,
 } from "./CanvasNode";
+import {
+  GROUP_HEADER_H,
+  GROUP_PAD,
+  GROUP_GAP,
+} from "./SectionGroupNode";
 import {
   strokePath,
   DEFAULT_PEN_COLOR,
@@ -45,7 +51,7 @@ import {
 import { uploadCanvasImage } from "./uploadCanvasImage";
 import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 
-type Tool = "select" | "text" | "section" | "draw" | "erase";
+type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
 
 /** Pen palette + widths offered when the pencil is active. */
 const PEN_COLORS = ["#111827", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#ffffff"];
@@ -115,6 +121,100 @@ const sig = (n: {
     n.data ?? {},
   ]);
 
+/* ===================== Section-group column layout =====================
+ * A `section_group` is a movable container; its member sections (each tagged
+ * `data.groupId === group.id`) are stacked in a column and its box auto-fits
+ * them. Membership + order (the fractional `position` key) are the source of
+ * truth; each member's x/y and the group's width/height are DERIVED here and
+ * mirrored into storage, mirroring how a section mirrors its measured height. */
+
+/** A group's member sections, top-to-bottom (fractional `position` order). */
+const groupMembers = (nodes: CanvasNode[], groupId: string): CanvasNode[] =>
+  nodes
+    .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
+    .sort((a, b) => a.position - b.position);
+
+/** The topmost `section_group` whose box contains a canvas point (or null). */
+const groupAtPoint = (
+  nodes: CanvasNode[],
+  px: number,
+  py: number,
+): CanvasNode | null => {
+  let hit: CanvasNode | null = null;
+  for (const n of nodes) {
+    if (n.kind !== "section_group") continue;
+    if (px >= n.x && px <= n.x + n.width && py >= n.y && py <= n.y + n.height) {
+      if (!hit || n.position > hit.position) hit = n;
+    }
+  }
+  return hit;
+};
+
+/** A fractional `position` that drops a section into a group's column at the
+ *  slot nearest `cy` (canvas Y of the section's centre). `members` excludes the
+ *  section being placed and is already in column order. */
+const columnPositionForDrop = (members: CanvasNode[], cy: number): number => {
+  let index = 0;
+  for (const m of members) {
+    if (cy > m.y + m.height / 2) index++;
+    else break;
+  }
+  const above = members[index - 1];
+  const below = members[index];
+  const prev = above ? above.position : below ? below.position - 2 : 0;
+  const next = below ? below.position : above ? above.position + 2 : 2;
+  return (prev + next) / 2;
+};
+
+/** Compute the derived layout for every group: each member section's x/y slot
+ *  and the group's auto-fit width/height. Returns only the patches that differ
+ *  (rounded), skipping any node currently being dragged (`skip`) so a live drag
+ *  owns its own position. */
+const computeGroupLayout = (
+  nodes: CanvasNode[],
+  skip: Set<string>,
+): { id: string; patch: Partial<StoredNode> }[] => {
+  const patches: { id: string; patch: Partial<StoredNode> }[] = [];
+  for (const g of nodes) {
+    if (g.kind !== "section_group") continue;
+    const members = groupMembers(nodes, g.id);
+    if (members.length === 0) {
+      // Empty group shrinks back to its default drop-target size.
+      if (
+        Math.round(g.width) !== NEW_GROUP_SIZE.width ||
+        Math.round(g.height) !== NEW_GROUP_SIZE.height
+      ) {
+        if (!skip.has(g.id))
+          patches.push({
+            id: g.id,
+            patch: { width: NEW_GROUP_SIZE.width, height: NEW_GROUP_SIZE.height },
+          });
+      }
+      continue;
+    }
+    const innerX = Math.round(g.x + GROUP_PAD);
+    let cursorY = g.y + GROUP_HEADER_H + GROUP_PAD;
+    let maxW = 0;
+    for (const m of members) {
+      maxW = Math.max(maxW, m.width);
+      const ny = Math.round(cursorY);
+      if (!skip.has(m.id) && (Math.round(m.x) !== innerX || Math.round(m.y) !== ny)) {
+        patches.push({ id: m.id, patch: { x: innerX, y: ny } });
+      }
+      cursorY += m.height + GROUP_GAP;
+    }
+    const desiredW = Math.round(maxW + 2 * GROUP_PAD);
+    const desiredH = Math.round(cursorY - GROUP_GAP - g.y + GROUP_PAD);
+    if (
+      !skip.has(g.id) &&
+      (Math.round(g.width) !== desiredW || Math.round(g.height) !== desiredH)
+    ) {
+      patches.push({ id: g.id, patch: { width: desiredW, height: desiredH } });
+    }
+  }
+  return patches;
+};
+
 const loadViewport = (canvasId: string): Viewport => {
   try {
     const raw = localStorage.getItem(`canvas-vp:${canvasId}`);
@@ -183,6 +283,9 @@ export function CanvasEditor({
   // Nodes YOU are actively dragging — excluded from smoothing so they track
   // the cursor 1:1 (everyone else sees them glide via the node transition).
   const [draggingIds, setDraggingIds] = useState<Set<string>>(new Set());
+  // The section_group a section is currently being dragged over (drop target
+  // highlight). null when no section is over any group.
+  const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
 
   // Freehand pen. `pen` is the current ink (persisted per-user); `drawing` is
   // the in-flight stroke — a flat [x,y,…] list in canvas coords, shown as a live
@@ -290,6 +393,16 @@ export function CanvasEditor({
     for (const id of ids) map.delete(id);
   }, []);
 
+  // Derive every section_group's column layout from its members: slot each
+  // member section into place and auto-fit the group's box, mirroring the
+  // results into storage. The rounded guard in computeGroupLayout prevents a
+  // write loop, and nodes being dragged are skipped so a live drag owns its own
+  // position (a released/captured section then snaps in on the next pass).
+  useEffect(() => {
+    const patches = computeGroupLayout(nodes, draggingIds);
+    if (patches.length) patchMany(patches);
+  }, [nodes, draggingIds, patchMany]);
+
   /* -------- snapshot storage → Postgres (debounced diff) -------- */
   const savedRef = useRef<Map<string, string>>(new Map());
   const seededRef = useRef(false);
@@ -371,7 +484,12 @@ export function CanvasEditor({
   /* -------- node actions -------- */
   const createNode = useCallback(
     (kind: CanvasNodeKind, x: number, y: number) => {
-      const size = kind === "section" ? NEW_SECTION_SIZE : NEW_TEXT_SIZE;
+      const size =
+        kind === "section"
+          ? NEW_SECTION_SIZE
+          : kind === "section_group"
+            ? NEW_GROUP_SIZE
+            : NEW_TEXT_SIZE;
       const maxPos = nodesRef.current.reduce((m, n) => Math.max(m, n.position), 0);
       const node: StoredNode = {
         id: uid(),
@@ -390,7 +508,7 @@ export function CanvasEditor({
       putNode(node);
       setTool("select");
       setSelected(new Set([node.id]));
-      if (kind === "text") setEditingId(node.id);
+      if (kind === "text" || kind === "section_group") setEditingId(node.id);
     },
     [putNode, myId],
   );
@@ -490,13 +608,36 @@ export function CanvasEditor({
     [canvasId, createImageNode],
   );
 
+  // Delete nodes, releasing (not deleting) any member sections of a deleted
+  // section_group — the group is just a container, so its sections survive.
+  const deleteNodes = useCallback(
+    (ids: string[]) => {
+      if (!ids.length) return;
+      const releases: { id: string; patch: Partial<StoredNode> }[] = [];
+      const removing = new Set(ids);
+      for (const id of ids) {
+        const n = nodesRef.current.find((x) => x.id === id);
+        if (n?.kind !== "section_group") continue;
+        for (const m of groupMembers(nodesRef.current, id)) {
+          if (removing.has(m.id)) continue; // being deleted anyway
+          const rest = { ...(m.data ?? {}) };
+          delete rest.groupId;
+          releases.push({ id: m.id, patch: { data: rest as StoredNode["data"] } });
+        }
+      }
+      if (releases.length) patchMany(releases);
+      removeMany(ids);
+    },
+    [patchMany, removeMany],
+  );
+
   const deleteSelected = useCallback(() => {
     const ids = [...selectedRef.current];
     if (!ids.length) return;
-    removeMany(ids);
+    deleteNodes(ids);
     setSelected(new Set());
     setEditingId(null);
-  }, [removeMany]);
+  }, [deleteNodes]);
 
   const nudge = useCallback(
     (dx: number, dy: number) => {
@@ -729,6 +870,10 @@ export function CanvasEditor({
         case "S":
           setTool("section");
           break;
+        case "g":
+        case "G":
+          setTool("group");
+          break;
         case "p":
         case "P":
           setTool("draw");
@@ -881,18 +1026,31 @@ export function CanvasEditor({
       setEditingId(null);
 
       const scale = vpRef.current.scale;
+      // A section_group moves together with its members: seed the drag with the
+      // group + every section it holds so they translate as one (the column
+      // re-derives afterward and confirms the slots — no jump).
+      const moveIds = new Set(sel);
+      if (node.kind === "section_group") {
+        for (const m of groupMembers(nodesRef.current, node.id)) moveIds.add(m.id);
+      }
       const origin = new Map(
         nodesRef.current
-          .filter((n) => sel.has(n.id))
+          .filter((n) => moveIds.has(n.id))
           .map((n) => [n.id, { x: n.x, y: n.y }] as const),
       );
       const startX = e.clientX;
       const startY = e.clientY;
       let moved = false;
+      let lastDx = 0;
+      let lastDy = 0;
+      // Only a plain section can be dropped into a group (no nested groups).
+      const capturable = node.kind === "section";
 
       const onMove = (ev: PointerEvent) => {
         const dx = (ev.clientX - startX) / scale;
         const dy = (ev.clientY - startY) / scale;
+        lastDx = dx;
+        lastDy = dy;
         if (!moved && Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 3) {
           moved = true;
           history.pause(); // group the whole drag into one undo step
@@ -905,13 +1063,50 @@ export function CanvasEditor({
             patch: { x: Math.round(o.x + dx), y: Math.round(o.y + dy) },
           })),
         );
+        // Highlight the group a dragged section is currently hovering over.
+        if (capturable) {
+          const o = origin.get(node.id)!;
+          const cx = o.x + dx + node.width / 2;
+          const cy = o.y + dy + node.height / 2;
+          const g = groupAtPoint(nodesRef.current, cx, cy);
+          setGroupDropTarget(g ? g.id : null);
+        }
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        setGroupDropTarget(null);
         if (moved) {
           history.resume();
           setDraggingIds(new Set());
+          // Settle a dragged section into (or out of) a group by its final
+          // centre. Inside a group → set membership + a column slot; the layout
+          // mirror then snaps it into place. Outside all groups → release it.
+          if (capturable) {
+            const o = origin.get(node.id)!;
+            const cx = o.x + lastDx + node.width / 2;
+            const cy = o.y + lastDy + node.height / 2;
+            const g = groupAtPoint(nodesRef.current, cx, cy);
+            const currentGid = node.data?.groupId as string | undefined;
+            if (g) {
+              const siblings = groupMembers(nodesRef.current, g.id).filter(
+                (m) => m.id !== node.id,
+              );
+              patchMany([
+                {
+                  id: node.id,
+                  patch: {
+                    data: { ...node.data, groupId: g.id } as StoredNode["data"],
+                    position: columnPositionForDrop(siblings, cy),
+                  },
+                },
+              ]);
+            } else if (currentGid) {
+              const rest = { ...(node.data ?? {}) };
+              delete rest.groupId;
+              patchMany([{ id: node.id, patch: { data: rest as StoredNode["data"] } }]);
+            }
+          }
         }
       };
       window.addEventListener("pointermove", onMove);
@@ -943,6 +1138,13 @@ export function CanvasEditor({
         e.preventDefault();
         const p = toCanvas(e.clientX, e.clientY);
         createNode(toolRef.current, p.x, p.y);
+        return;
+      }
+
+      if (toolRef.current === "group") {
+        e.preventDefault();
+        const p = toCanvas(e.clientX, e.clientY);
+        createNode("section_group", p.x, p.y);
         return;
       }
 
@@ -1056,7 +1258,14 @@ export function CanvasEditor({
 
   // Frames render behind everything (they're backdrops); text + sections layer
   // by z-order among themselves.
-  const ordered = [...nodes].sort((a, b) => a.position - b.position);
+  // Section groups are backdrops for their members, so they render in a back
+  // layer (behind everything else); within each band we keep z-order by
+  // `position`.
+  const ordered = [...nodes].sort((a, b) => {
+    const ga = a.kind === "section_group" ? 0 : 1;
+    const gb = b.kind === "section_group" ? 0 : 1;
+    return ga - gb || a.position - b.position;
+  });
 
   // The master section per DB board: a section whose `data.master` is set. Its
   // Send buttons on sibling sections (same board) target it. `content` is the
@@ -1071,7 +1280,7 @@ export function CanvasEditor({
 
   const cursor = spaceDown
     ? "grab"
-    : tool === "text" || tool === "section" || tool === "draw"
+    : tool === "text" || tool === "section" || tool === "group" || tool === "draw"
       ? "crosshair"
       : tool === "erase"
         ? "cell"
@@ -1088,6 +1297,7 @@ export function CanvasEditor({
           <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
           <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
           <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (S)">▤</ToolBtn>
+          <ToolBtn active={tool === "group"} onClick={() => setTool("group")} title="Section Group — container that stacks sections (G)">▣</ToolBtn>
           <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)">✏️</ToolBtn>
           <ToolBtn active={tool === "erase"} onClick={() => setTool("erase")} title="Erase strokes (E)">⌫</ToolBtn>
         </div>
@@ -1157,7 +1367,9 @@ export function CanvasEditor({
           ? "Click to drop a text block"
           : tool === "section"
             ? "Click to drop a board — name it, then outline your tasks"
-            : tool === "draw"
+            : tool === "group"
+              ? "Click to drop a Section Group — then drag sections into it"
+              : tool === "draw"
               ? "Drag to draw · pick colour & width on the left"
               : tool === "erase"
                 ? "Drag across a stroke to erase it"
@@ -1267,7 +1479,7 @@ export function CanvasEditor({
                 patchMany(updates);
               }}
               onRemove={() => {
-                removeMany([node.id]);
+                deleteNodes([node.id]);
                 setSelected((s) => {
                   const next = new Set(s);
                   next.delete(node.id);
@@ -1278,6 +1490,14 @@ export function CanvasEditor({
                 node.kind === "text" ? (e) => startLink(e, node) : undefined
               }
               canvasName={canvasName}
+              groupMemberCount={
+                node.kind === "section_group"
+                  ? groupMembers(nodes, node.id).length
+                  : 0
+              }
+              groupDropActive={
+                node.kind === "section_group" && groupDropTarget === node.id
+              }
             />
           ))}
 
