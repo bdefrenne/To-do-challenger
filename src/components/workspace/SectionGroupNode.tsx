@@ -20,6 +20,9 @@ export const GROUP_HEADER_H = 56;
 export const GROUP_PAD = 16;
 /** Vertical gap between stacked members. */
 export const GROUP_GAP = 16;
+/** Empty band kept below the last member — always a visible landing target so
+ *  you can drop more sections in even once the column has one. */
+export const GROUP_DROPZONE = 76;
 /** Size of a freshly-dropped (empty) group — a visible drop target. */
 export const NEW_GROUP_SIZE = { width: 460, height: 220 };
 
@@ -137,13 +140,19 @@ export function SectionGroupNode({
         ) : null}
       </div>
 
-      {/* Body: a transparent drop zone. Member sections are separate nodes that
-          render on top (the editor positions them into this column), so this is
-          only the backdrop + empty-state hint. */}
-      <div className="pointer-events-none flex flex-1 items-center justify-center">
-        {memberCount === 0 ? (
-          <span className="text-sm text-faint">Drag sections here</span>
-        ) : null}
+      {/* Body: a transparent backdrop. Member sections are separate nodes that
+          render on top (the editor stacks them into the column from the top), so
+          the persistent drop hint is pinned to the bottom band — it stays
+          visible below the last member and is always a valid landing target. */}
+      <div className="pointer-events-none flex flex-1 flex-col items-center justify-end p-4">
+        <span
+          className={[
+            "rounded-md border border-dashed px-3 py-2 text-sm transition-colors",
+            dropActive ? "border-accent text-accent" : "border-border text-faint",
+          ].join(" ")}
+        >
+          {memberCount === 0 ? "Drag sections here" : "Drop another section here"}
+        </span>
       </div>
     </div>
   );

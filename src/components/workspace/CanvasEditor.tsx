@@ -42,6 +42,7 @@ import {
   GROUP_HEADER_H,
   GROUP_PAD,
   GROUP_GAP,
+  GROUP_DROPZONE,
 } from "./SectionGroupNode";
 import {
   strokePath,
@@ -134,16 +135,27 @@ const groupMembers = (nodes: CanvasNode[], groupId: string): CanvasNode[] =>
     .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
     .sort((a, b) => a.position - b.position);
 
-/** The topmost `section_group` whose box contains a canvas point (or null). */
+/** How far outside a group's box a dropped section still counts as "inside" —
+ *  a forgiveness margin so a near-miss drop is still captured. */
+const GROUP_CAPTURE_MARGIN = 28;
+
+/** The topmost `section_group` whose box (grown by the capture margin) contains
+ *  a canvas point (or null). */
 const groupAtPoint = (
   nodes: CanvasNode[],
   px: number,
   py: number,
 ): CanvasNode | null => {
+  const m = GROUP_CAPTURE_MARGIN;
   let hit: CanvasNode | null = null;
   for (const n of nodes) {
     if (n.kind !== "section_group") continue;
-    if (px >= n.x && px <= n.x + n.width && py >= n.y && py <= n.y + n.height) {
+    if (
+      px >= n.x - m &&
+      px <= n.x + n.width + m &&
+      py >= n.y - m &&
+      py <= n.y + n.height + m
+    ) {
       if (!hit || n.position > hit.position) hit = n;
     }
   }
@@ -204,7 +216,9 @@ const computeGroupLayout = (
       cursorY += m.height + GROUP_GAP;
     }
     const desiredW = Math.round(maxW + 2 * GROUP_PAD);
-    const desiredH = Math.round(cursorY - GROUP_GAP - g.y + GROUP_PAD);
+    // Keep a drop-zone band below the last member so there's always a visible,
+    // hittable target for adding more sections (not just a tight wrap of one).
+    const desiredH = Math.round(cursorY - GROUP_GAP - g.y + GROUP_DROPZONE);
     if (
       !skip.has(g.id) &&
       (Math.round(g.width) !== desiredW || Math.round(g.height) !== desiredH)
