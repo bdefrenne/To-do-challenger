@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/Button";
 import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip } from "@/components/ui/Badge";
 import { PersonAvatar } from "@/components/PersonAvatar";
+import { usePeople } from "@/components/PeopleContext";
 import { formatTime, formatShortDate, formatDue } from "@/lib/format";
 import { STATUS_LABEL, RECURRENCE_LABEL } from "@/lib/statuses";
 import { IMPORTANCE_ORDER, IMPORTANCE_LABEL } from "@/lib/importance";
@@ -32,6 +33,13 @@ const LOG_ICON: Record<TaskLogEntry["kind"], string> = {
   comment: "💬",
   attached: "📎",
   updated: "✎",
+};
+
+/** How each surface reads in the activity attribution line ("via …"). */
+const SOURCE_LABEL: Record<NonNullable<TaskLogEntry["source"]>, string> = {
+  ui: "UI",
+  api: "API",
+  mcp: "Claude",
 };
 
 const LOG_COLOR: Record<TaskLogEntry["kind"], string> = {
@@ -100,6 +108,7 @@ function TaskDetailLevel({
     projects,
     openProjectSettings,
   } = useWorkspace();
+  const { resolveById } = usePeople();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -199,13 +208,27 @@ function TaskDetailLevel({
   const activity = [
     ...allEntries
       .filter((e) => e.kind !== "comment")
-      .map((e) => ({
-        id: e.id,
-        at: e.at,
-        icon: LOG_ICON[e.kind],
-        color: LOG_COLOR[e.kind],
-        message: e.message,
-      })),
+      .map((e) => {
+        // Prefer the real acting user (actorId); fall back to the legacy author
+        // string on rows written before attribution existed.
+        const person = e.actorId ? resolveById(e.actorId) : undefined;
+        const who = person?.name ?? e.author ?? undefined;
+        const via = e.source
+          ? SOURCE_LABEL[e.source]
+          : e.author === "Claude" // legacy MCP rows had no source
+            ? "Claude"
+            : undefined;
+        return {
+          id: e.id,
+          at: e.at,
+          icon: LOG_ICON[e.kind],
+          color: LOG_COLOR[e.kind],
+          message: e.message,
+          who,
+          via,
+          avatarName: person?.name ?? e.author ?? undefined,
+        };
+      }),
     ...(notes[taskId] ?? [])
       .filter((n) => n.type === "decision")
       .map((n) => ({
@@ -214,6 +237,9 @@ function TaskDetailLevel({
         icon: "🎯",
         color: "text-accent",
         message: n.note,
+        who: undefined as string | undefined,
+        via: undefined as string | undefined,
+        avatarName: undefined as string | undefined,
       })),
   ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
   const kids = childrenOf(taskId);
@@ -675,6 +701,17 @@ function TaskDetailLevel({
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="text-sm text-fg">{e.message}</div>
+                      {e.who ? (
+                        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-faint">
+                          {e.avatarName ? (
+                            <PersonAvatar name={e.avatarName} size={16} />
+                          ) : null}
+                          <span>
+                            by {e.who}
+                            {e.via ? ` · via ${e.via}` : ""}
+                          </span>
+                        </div>
+                      ) : null}
                       <div className="text-[11px] text-faint">
                         {formatShortDate(e.at)} · {formatTime(e.at)}
                       </div>

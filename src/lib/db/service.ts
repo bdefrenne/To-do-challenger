@@ -37,6 +37,7 @@ import { STATUS_LABEL } from "@/lib/statuses";
 import type { PublicUser } from "./users";
 import { ConflictError, ValidationError } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
+import { currentLogContext } from "./log-context";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
 import type {
   Task,
@@ -503,7 +504,15 @@ async function log(
   message: string,
   author?: string,
 ) {
-  await db.insert(taskLogs).values({ taskId, kind, message, author });
+  const ctx = currentLogContext();
+  await db.insert(taskLogs).values({
+    taskId,
+    kind,
+    message,
+    author,
+    actorId: ctx?.actorId,
+    source: ctx?.source,
+  });
 }
 
 /* -------------------------------------------------------------------- */
@@ -693,6 +702,8 @@ export async function getTask(
       kind: l.kind,
       message: l.message,
       author: l.author ?? undefined,
+      actorId: l.actorId ?? undefined,
+      source: l.source ?? undefined,
     })),
     notes: noteRows.map(rowToNote),
     commits: commitRows.map(rowToCommit),
@@ -1277,9 +1288,17 @@ export async function addComment(
 ): Promise<TaskLogEntry | null> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return null;
+  const ctx = currentLogContext();
   const [row] = await db
     .insert(taskLogs)
-    .values({ taskId: id, kind: "comment", message, author })
+    .values({
+      taskId: id,
+      kind: "comment",
+      message,
+      author,
+      actorId: ctx?.actorId,
+      source: ctx?.source,
+    })
     .returning();
   await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, id));
   return { id: row.id, at: iso(row.at)!, kind: "comment", message: row.message };
@@ -1449,6 +1468,7 @@ export async function bulkUpdate(
   // 4. One batched INSERT into the activity log — a trail row per task.
   const constMsg = describeBulkPatch(patch);
   const priorStatus = new Map(owned.map((r) => [r.id, r.status]));
+  const ctx = currentLogContext();
   const logRows = rows.map((r) => {
     const parts: string[] = [];
     if (patch.status !== undefined && patch.status !== priorStatus.get(r.id))
@@ -1461,6 +1481,8 @@ export async function bulkUpdate(
       kind: "updated" as const,
       message: parts.length ? parts.join(" · ") : "Updated",
       author,
+      actorId: ctx?.actorId,
+      source: ctx?.source,
     };
   });
   if (logRows.length) await db.insert(taskLogs).values(logRows);

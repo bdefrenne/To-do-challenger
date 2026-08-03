@@ -37,24 +37,49 @@ function bearer(req: Request): string | null {
   return m ? m[1].trim() : null;
 }
 
+/** How a request authenticated: a browser session (web UI) or a bearer token
+ *  (an AI/script hitting the REST API). Drives activity-log surface attribution. */
+export type AuthVia = "session" | "token";
+
+/**
+ * Resolve the current user from a request, plus HOW they authenticated, or
+ * null if unauthenticated. Session cookie wins (web UI); otherwise a bearer
+ * token (AI/script).
+ */
+export async function getAuth(
+  req: Request,
+): Promise<{ userId: string; via: AuthVia } | null> {
+  const cookie = readCookie(req, SESSION_COOKIE);
+  const uid = verifySession(cookie, Date.now());
+  if (uid) return { userId: uid, via: "session" };
+
+  const token = bearer(req);
+  if (token) {
+    const tid = await resolveToken(token);
+    if (tid) return { userId: tid, via: "token" };
+  }
+
+  return null;
+}
+
 /**
  * Resolve the current user id from a request, or null if unauthenticated.
  * Session cookie wins (web UI); otherwise a bearer token (AI/script).
  */
 export async function getUserId(req: Request): Promise<string | null> {
-  const cookie = readCookie(req, SESSION_COOKIE);
-  const uid = verifySession(cookie, Date.now());
-  if (uid) return uid;
+  return (await getAuth(req))?.userId ?? null;
+}
 
-  const token = bearer(req);
-  if (token) return await resolveToken(token);
-
-  return null;
+/** Like getAuth, but throws AuthError when there's no valid credential. */
+export async function requireAuth(
+  req: Request,
+): Promise<{ userId: string; via: AuthVia }> {
+  const auth = await getAuth(req);
+  if (!auth) throw new AuthError("Sign in, or present a valid API token.");
+  return auth;
 }
 
 /** Like getUserId, but throws AuthError when there's no valid credential. */
 export async function requireUser(req: Request): Promise<string> {
-  const uid = await getUserId(req);
-  if (!uid) throw new AuthError("Sign in, or present a valid API token.");
-  return uid;
+  return (await requireAuth(req)).userId;
 }

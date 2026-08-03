@@ -6,7 +6,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { AuthError, requireUser } from "./auth";
+import { AuthError, requireAuth } from "./auth";
+import { withLogContext } from "./db/log-context";
 
 /* ---- Validation schemas (shared by REST + MCP) ---- */
 export const statusSchema = z.enum([
@@ -368,8 +369,13 @@ export function route(
 ) {
   return async (req: NextRequest, ctx: RouteCtx) => {
     try {
-      const userId = await requireUser(req);
-      return await handler(req, { ...ctx, userId });
+      const { userId, via } = await requireAuth(req);
+      // Surface attribution for the activity log: a browser session is the web
+      // UI; a bearer token on the REST API is a script/AI call.
+      const source = via === "session" ? "ui" : "api";
+      return await withLogContext({ actorId: userId, source }, () =>
+        handler(req, { ...ctx, userId }),
+      );
     } catch (e) {
       if (e instanceof AuthError) return error(e.message, e.status);
       if (e instanceof ConflictError)

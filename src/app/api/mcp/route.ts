@@ -19,6 +19,7 @@ import { createMcpHandler } from "mcp-handler";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { requireUser, AuthError } from "@/lib/auth";
+import { withLogContext } from "@/lib/db/log-context";
 import { ConflictError, bulkOpSchema, updateTaskSchema } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
 import {
@@ -1250,7 +1251,10 @@ async function authed(req: Request): Promise<Response> {
     }
     throw e;
   }
-  return userStore.run(userId, () => handler(req));
+  // MCP requests are attributed to the token's owner, acting "via Claude".
+  return userStore.run(userId, () =>
+    withLogContext({ actorId: userId, source: "mcp" }, () => handler(req)),
+  );
 }
 
 export { authed as GET, authed as POST, authed as DELETE };

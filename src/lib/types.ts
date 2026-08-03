@@ -249,6 +249,11 @@ export interface TaskLogEntry {
     | "attached" // an image was attached or removed
     | "updated"; // one or more fields changed via a bulk update
   message: string;
-  /** Who wrote/triggered it — e.g. "You", "Claude", an assignee name. */
+  /** Who wrote/triggered it — e.g. "You", "Claude", an assignee name. Legacy
+   *  display label; `actorId` is the real acting user. */
   author?: string;
+  /** The real acting user's account id (absent on legacy rows). */
+  actorId?: string;
+  /** Which surface produced the event: web UI, API/script, or Claude (MCP). */
+  source?: "ui" | "api" | "mcp";
 }
