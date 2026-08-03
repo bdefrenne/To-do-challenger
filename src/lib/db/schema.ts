@@ -425,6 +425,21 @@ export const tasks = pgTable(
     customFields: jsonb("custom_fields")
       .notNull()
       .default(sql`'{}'::jsonb`),
+    /** Which canvas Section this task is pinned to (a `canvas_nodes.id`), or
+     *  null for "not placed". Null is the NORMAL state: a canvas resolves an
+     *  unpinned task into its board's INBOX lane, so a task created from the
+     *  API, MCP or a board view is still visible without anyone tagging it.
+     *  Writing this is an explicit override — it only happens when someone
+     *  drags a card into a section.
+     *
+     *  Deliberately NOT a foreign key. `canvas_nodes` in Postgres is a lagging
+     *  mirror of a Liveblocks room (the editor flushes on an 800ms debounce and
+     *  silently skips on network failure), so a constraint pointing at it would
+     *  let task writes fail on view-layer sync state. A dangling value is
+     *  harmless instead of exceptional: the canvas already has to treat an id
+     *  it can't find among its own nodes as unpinned, because ids from OTHER
+     *  canvases look exactly the same. */
+    canvasSectionId: text("canvas_section_id"),
     /** Fibonacci payoff points (1/2/3/5/8) — the "value" axis. */
     value: smallint("value"),
     /** Fibonacci effort points (1/2/3/5/8) — the "difficulty" axis. */
@@ -489,6 +504,7 @@ export const tasks = pgTable(
     index("tasks_parent_idx").on(t.parentId),
     index("tasks_status_idx").on(t.status),
     index("tasks_archived_idx").on(t.archivedAt),
+    index("tasks_canvas_section_idx").on(t.canvasSectionId),
   ],
 );
 
@@ -687,7 +703,8 @@ export const canvasNodes = pgTable(
      *  tasks; "draw" = a freehand pen stroke; "image" = a pasted/dropped picture
      *  whose blob URL lives in `data.url`; "section_group" = a movable container
      *  that arranges its member sections (each carrying `data.groupId`) in a
-     *  column and shows a big title. ("frame" is a removed legacy kind — see the
+     *  column or a row (`data.layout`: "portrait" (default) / "landscape") and
+     *  shows a big title. ("frame" is a removed legacy kind — see the
      *  enum note above.) */
     kind: canvasNodeKind("kind").notNull(),
     /** Markdown for a text node; the label/title for a section. */
@@ -701,7 +718,8 @@ export const canvasNodes = pgTable(
     color: text("color"),
     /** Fractional z-order (higher = on top). */
     position: doublePrecision("position").notNull().default(0),
-    /** Free-form extras: font size, and a section's bound `boardId`. */
+    /** Free-form extras: font size; a section's bound `boardId` and optional own
+     *  `name`; a group's `layout`. */
     data: jsonb("data").notNull().default(sql`'{}'::jsonb`),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

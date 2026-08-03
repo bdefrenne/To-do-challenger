@@ -43,6 +43,9 @@ import {
   GROUP_PAD,
   GROUP_GAP,
   GROUP_DROPZONE,
+  GROUP_DROPZONE_W,
+  groupLayoutOf,
+  type GroupLayout,
 } from "./SectionGroupNode";
 import {
   strokePath,
@@ -51,6 +54,16 @@ import {
 } from "./DrawNode";
 import { uploadCanvasImage } from "./uploadCanvasImage";
 import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
+import { MIN_SECTION_HEIGHT } from "./SectionNode";
+import { SectionMembershipProvider } from "./SectionMembershipContext";
+import {
+  boardsNeedingInbox,
+  buildSectionMembership,
+  inboxGroupId,
+  inboxLaneId,
+  isInboxNode,
+  laneBoardId,
+} from "@/lib/sections";
 
 type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
 
@@ -122,25 +135,32 @@ const sig = (n: {
     n.data ?? {},
   ]);
 
-/* ===================== Section-group column layout =====================
+/* ===================== Section-group layout =====================
  * A `section_group` is a movable container; its member sections (each tagged
- * `data.groupId === group.id`) are stacked in a column and its box auto-fits
- * them. Membership + order (the fractional `position` key) are the source of
- * truth; each member's x/y and the group's width/height are DERIVED here and
- * mirrored into storage, mirroring how a section mirrors its measured height. */
+ * `data.groupId === group.id`) are packed either down a column (portrait) or
+ * across a row (landscape, per `group.data.layout`) and its box auto-fits them.
+ * Membership + order (the fractional `position` key) are the source of truth;
+ * each member's x/y and the group's width/height are DERIVED here and mirrored
+ * into storage, mirroring how a section mirrors its measured height. */
 
-/** A group's member sections, top-to-bottom (fractional `position` order). */
+/** A group's member sections in packing order (fractional `position` order) —
+ *  top-to-bottom in portrait, left-to-right in landscape. */
 const groupMembers = (nodes: CanvasNode[], groupId: string): CanvasNode[] =>
   nodes
     .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
     .sort((a, b) => a.position - b.position);
 
-/** How far outside a group's box a dropped section still counts as "inside" —
- *  a forgiveness margin so a near-miss drop is still captured. */
+/** How far outside a group's box the drag cursor still counts as "inside" — a
+ *  forgiveness band that works both ways: it captures a near-miss drop, and
+ *  (since release uses the same test) gives a member free hysteresis so a
+ *  jittery pointer can't pop it out. */
 const GROUP_CAPTURE_MARGIN = 28;
 
 /** The topmost `section_group` whose box (grown by the capture margin) contains
- *  a canvas point (or null). */
+ *  a canvas point (or null). The point is the drag's GRAB POINT — the cursor —
+ *  never the dragged section's centre: a section is `height:auto` and can be
+ *  1000+ units tall, so its centre sits far below the group you're aiming at and
+ *  tall sections could never be captured at all. */
 const groupAtPoint = (
   nodes: CanvasNode[],
   px: number,
@@ -162,15 +182,34 @@ const groupAtPoint = (
   return hit;
 };
 
-/** A fractional `position` that drops a section into a group's column at the
- *  slot nearest `cy` (canvas Y of the section's centre). `members` excludes the
- *  section being placed and is already in column order. */
-const columnPositionForDrop = (members: CanvasNode[], cy: number): number => {
+/** Which slot of a group's packing order a drop lands in: the count of members
+ *  the drop point has passed, comparing against each member's midline along the
+ *  packing axis (the standard list-reorder rule). `c` is the drop CURSOR on that
+ *  axis — canvas Y in portrait, canvas X in landscape. `members` excludes the
+ *  section being placed and is already in packing order. */
+const slotIndexForDrop = (
+  members: CanvasNode[],
+  c: number,
+  layout: GroupLayout,
+): number => {
   let index = 0;
   for (const m of members) {
-    if (cy > m.y + m.height / 2) index++;
+    const mid = layout === "landscape" ? m.x + m.width / 2 : m.y + m.height / 2;
+    if (c > mid) index++;
     else break;
   }
+  return index;
+};
+
+/** A fractional `position` that drops a section into a group at the slot nearest
+ *  the drop cursor — midway between the fractional keys of the slot's
+ *  neighbours. Args as `slotIndexForDrop`. */
+const slotPositionForDrop = (
+  members: CanvasNode[],
+  c: number,
+  layout: GroupLayout,
+): number => {
+  const index = slotIndexForDrop(members, c, layout);
   const above = members[index - 1];
   const below = members[index];
   const prev = above ? above.position : below ? below.position - 2 : 0;
@@ -178,10 +217,46 @@ const columnPositionForDrop = (members: CanvasNode[], cy: number): number => {
   return (prev + next) / 2;
 };
 
+/** The insertion caret for slot `index` of a group: a thin bar in the gap the
+ *  section would land in, in CANVAS coords. Drawn above every node because a
+ *  group packs its members on top of itself, so the dragged section covers the
+ *  group's body (and its drop hint) — the accent ring alone can't say WHERE it
+ *  will land. Takes the index (not a cursor) so the live drag can keep only the
+ *  index in state and derive this at render — see `dropCaret`. */
+const slotCaretRect = (
+  group: CanvasNode,
+  members: CanvasNode[],
+  index: number,
+  layout: GroupLayout,
+): { x: number; y: number; w: number; h: number } => {
+  const prev = members[index - 1];
+  const thickness = 3;
+  if (layout === "landscape") {
+    // Vertical bar in the row: after `prev`'s right edge, else at the inner left.
+    return {
+      x: (prev ? prev.x + prev.width + GROUP_GAP / 2 : group.x + GROUP_PAD / 2) - thickness / 2,
+      y: group.y + GROUP_HEADER_H + GROUP_PAD,
+      w: thickness,
+      h: Math.max(0, group.height - GROUP_HEADER_H - 2 * GROUP_PAD),
+    };
+  }
+  // Horizontal bar in the column: below `prev`, else just under the header.
+  return {
+    x: group.x + GROUP_PAD,
+    y:
+      (prev
+        ? prev.y + prev.height + GROUP_GAP / 2
+        : group.y + GROUP_HEADER_H + GROUP_PAD / 2) - thickness / 2,
+    w: Math.max(0, group.width - 2 * GROUP_PAD),
+    h: thickness,
+  };
+};
+
 /** Compute the derived layout for every group: each member section's x/y slot
- *  and the group's auto-fit width/height. Returns only the patches that differ
- *  (rounded), skipping any node currently being dragged (`skip`) so a live drag
- *  owns its own position. */
+ *  (packed down a column in portrait, across a row in landscape) and the group's
+ *  auto-fit width/height. Returns only the patches that differ (rounded),
+ *  skipping any node currently being dragged (`skip`) so a live drag owns its
+ *  own position. */
 const computeGroupLayout = (
   nodes: CanvasNode[],
   skip: Set<string>,
@@ -204,21 +279,32 @@ const computeGroupLayout = (
       }
       continue;
     }
+    // Pack along the group's axis: portrait walks a cursor down the column at a
+    // fixed inner X; landscape walks it across the row at a fixed inner Y. The
+    // cross-axis extent is the widest (resp. tallest) member.
+    const landscape = groupLayoutOf(g) === "landscape";
     const innerX = Math.round(g.x + GROUP_PAD);
-    let cursorY = g.y + GROUP_HEADER_H + GROUP_PAD;
-    let maxW = 0;
+    const innerY = Math.round(g.y + GROUP_HEADER_H + GROUP_PAD);
+    let cursor = landscape ? g.x + GROUP_PAD : g.y + GROUP_HEADER_H + GROUP_PAD;
+    let cross = 0;
     for (const m of members) {
-      maxW = Math.max(maxW, m.width);
-      const ny = Math.round(cursorY);
-      if (!skip.has(m.id) && (Math.round(m.x) !== innerX || Math.round(m.y) !== ny)) {
-        patches.push({ id: m.id, patch: { x: innerX, y: ny } });
+      const nx = landscape ? Math.round(cursor) : innerX;
+      const ny = landscape ? innerY : Math.round(cursor);
+      cross = Math.max(cross, landscape ? m.height : m.width);
+      if (!skip.has(m.id) && (Math.round(m.x) !== nx || Math.round(m.y) !== ny)) {
+        patches.push({ id: m.id, patch: { x: nx, y: ny } });
       }
-      cursorY += m.height + GROUP_GAP;
+      cursor += (landscape ? m.width : m.height) + GROUP_GAP;
     }
-    const desiredW = Math.round(maxW + 2 * GROUP_PAD);
-    // Keep a drop-zone band below the last member so there's always a visible,
-    // hittable target for adding more sections (not just a tight wrap of one).
-    const desiredH = Math.round(cursorY - GROUP_GAP - g.y + GROUP_DROPZONE);
+    // Keep a drop-zone band past the last member so there's always a visible,
+    // hittable target for adding more sections (not just a tight wrap of one) —
+    // below the column in portrait, right of the row in landscape.
+    const desiredW = landscape
+      ? Math.round(cursor - GROUP_GAP - g.x + GROUP_DROPZONE_W)
+      : Math.round(cross + 2 * GROUP_PAD);
+    const desiredH = landscape
+      ? Math.round(GROUP_HEADER_H + cross + 2 * GROUP_PAD)
+      : Math.round(cursor - GROUP_GAP - g.y + GROUP_DROPZONE);
     if (
       !skip.has(g.id) &&
       (Math.round(g.width) !== desiredW || Math.round(g.height) !== desiredH)
@@ -272,7 +358,17 @@ export function CanvasEditor({
   const updateMyPresence = useUpdateMyPresence();
   const history = useHistory();
   const broadcast = useBroadcastEvent();
-  const { subscribeLocalChange, refreshFromRemote, applyRemotePatch, undoDelete } = useWorkspace();
+  const {
+    subscribeLocalChange,
+    refreshFromRemote,
+    applyRemotePatch,
+    undoDelete,
+    openTaskIds,
+    nodes: taskNodes,
+    taskMap,
+    projects,
+    registerPlacement,
+  } = useWorkspace();
 
   // useStorage's root is ToJson<Storage>, so `nodes` is a plain readonly
   // record (id → node), not a Map — hence Object.values, not .values().
@@ -300,6 +396,11 @@ export function CanvasEditor({
   // The section_group a section is currently being dragged over (drop target
   // highlight). null when no section is over any group.
   const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
+  // Which slot of `groupDropTarget`'s packing order the dragged section would
+  // land in. A plain index, NOT the caret rect: this is set on every pointermove,
+  // and a fresh rect object would defeat React's bail-out and re-render the whole
+  // editor at pointer frequency. The rect is derived at render (see `dropCaret`).
+  const [dropSlotIndex, setDropSlotIndex] = useState<number | null>(null);
 
   // Freehand pen. `pen` is the current ink (persisted per-user); `drawing` is
   // the in-flight stroke — a flat [x,y,…] list in canvas coords, shown as a live
@@ -336,12 +437,17 @@ export function CanvasEditor({
   const penRef = useRef(pen);
   // Last cursor position in canvas coords — where a pasted image lands.
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+  // Is a task-detail modal open over the canvas? TaskDetailModal has its own
+  // document-level paste listener, so without this the canvas would ALSO drop a
+  // node behind the modal on the same ⌘V that attaches the image to the task.
+  const modalOpenRef = useRef(false);
   useEffect(() => void (nodesRef.current = nodes), [nodes]);
   useEffect(() => void (vpRef.current = viewport), [viewport]);
   useEffect(() => void (toolRef.current = tool), [tool]);
   useEffect(() => void (selectedRef.current = selected), [selected]);
   useEffect(() => void (editingRef.current = editingId), [editingId]);
   useEffect(() => void (penRef.current = pen), [pen]);
+  useEffect(() => void (modalOpenRef.current = openTaskIds.length > 0), [openTaskIds]);
 
   // Persist this user's own viewport (per-user, not shared with the room).
   useEffect(() => {
@@ -416,6 +522,152 @@ export function CanvasEditor({
     const patches = computeGroupLayout(nodes, draggingIds);
     if (patches.length) patchMany(patches);
   }, [nodes, draggingIds, patchMany]);
+
+  /* -------- INBOX: keep a lane for every board with unplaced tasks -------- */
+
+  /** Board id → name, for lane titles (a lane's `content` is its board name,
+   *  exactly like a hand-bound section's). */
+  const boardNames = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of projects) for (const b of p.boards ?? []) m.set(b.id, b.name);
+    return m;
+  }, [projects]);
+
+  /**
+   * Reconcile the INBOX group and its lanes from the tasks that no work Section
+   * claims — the same derive-and-mirror-back shape as the group layout above.
+   *
+   * Node ids are DERIVED from the canvas + board (`inboxLaneId`) rather than
+   * random, which is what makes this safe to run in every client at once:
+   * storage is a LiveMap keyed by node id, so two clients creating "the Platform
+   * lane" converge on one entry instead of racing to two. Writes only happen
+   * when the desired set differs from what's there, so this can't loop.
+   */
+  useEffect(() => {
+    if (!nodesMap) return;
+    const needed = boardsNeedingInbox(nodes, taskNodes, taskMap);
+    const groupId = inboxGroupId(canvasId);
+    const existingLanes = nodes.filter((n) => n.kind === "section" && isInboxNode(n));
+    const wantedIds = new Set([...needed].map((b) => inboxLaneId(canvasId, b)));
+
+    // Lanes whose board no longer has unplaced tasks — drop them so an emptied
+    // inbox shrinks away instead of leaving a wall of empty boxes.
+    const stale = existingLanes.filter((n) => !wantedIds.has(n.id)).map((n) => n.id);
+    const group = nodes.find((n) => n.id === groupId);
+    const missing = [...needed].filter(
+      (b) => !nodes.some((n) => n.id === inboxLaneId(canvasId, b)),
+    );
+
+    if (!needed.size) {
+      // Nothing to triage: remove the lanes, and the group with them.
+      const gone = [...stale, ...(group ? [groupId] : [])];
+      if (gone.length) removeMany(gone);
+      return;
+    }
+
+    if (stale.length) removeMany(stale);
+    if (!group) {
+      // Park the group clear of existing content, to the LEFT of everything —
+      // it's a tray you glance at, not something that should shove work aside.
+      const xs = nodes.filter((n) => n.kind !== "draw").map((n) => n.x);
+      const ys = nodes.filter((n) => n.kind !== "draw").map((n) => n.y);
+      putNode({
+        id: groupId,
+        kind: "section_group",
+        content: "INBOX",
+        x: Math.round((xs.length ? Math.min(...xs) : 0) - NEW_GROUP_SIZE.width - 120),
+        y: Math.round(ys.length ? Math.min(...ys) : 0),
+        width: NEW_GROUP_SIZE.width,
+        height: NEW_GROUP_SIZE.height,
+        color: null,
+        // Behind the work sections, like any other group.
+        position: 0,
+        data: { inbox: true, layout: "portrait" },
+      });
+    }
+    for (const boardId of missing) {
+      putNode({
+        id: inboxLaneId(canvasId, boardId),
+        kind: "section",
+        content: boardId ? (boardNames.get(boardId) ?? "") : "",
+        // computeGroupLayout owns the real position; these are just a first frame.
+        x: 0,
+        y: 0,
+        width: NEW_SECTION_SIZE.width,
+        height: MIN_SECTION_HEIGHT,
+        color: null,
+        position: 0,
+        data: {
+          inbox: true,
+          groupId,
+          ...(boardId ? { boardId } : {}),
+          ...(boardId ? {} : { name: "No board" }),
+        },
+      });
+    }
+  }, [
+    nodesMap,
+    nodes,
+    taskNodes,
+    taskMap,
+    canvasId,
+    boardNames,
+    putNode,
+    removeMany,
+  ]);
+
+  /** Identity of the section set as far as membership is concerned: which
+   *  sections exist and which board each INBOX lane serves. Deliberately excludes
+   *  geometry — `nodes` gets a fresh identity on every pointermove of a drag
+   *  (that's how positions travel), but where a task renders never depends on
+   *  where a section sits. */
+  const sectionsKey = useMemo(
+    () =>
+      nodes
+        .filter((n) => n.kind === "section")
+        .map((n) => `${n.id}:${isInboxNode(n) ? (laneBoardId(n) ?? "-") : ""}`)
+        .join("|"),
+    [nodes],
+  );
+
+  /** The section nodes, with an identity that survives a pure move. Keyed on
+   *  `sectionsKey` on purpose: without it the whole canvas re-resolves and every
+   *  Section re-renders at pointer frequency, which is very visibly laggy. */
+  const sectionNodes = useMemo(
+    () => nodes.filter((n) => n.kind === "section"),
+    // `nodes` is read but intentionally not a dep — `sectionsKey` is the part of
+    // it this depends on. Adding `nodes` would defeat the whole point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sectionsKey],
+  );
+
+  /** Which Section shows which tasks, for this whole canvas. One pass, shared
+   *  by every Section via context — see SectionMembershipContext. */
+  const membership = useMemo(
+    () => buildSectionMembership(sectionNodes, taskNodes, taskMap),
+    [sectionNodes, taskNodes, taskMap],
+  );
+
+  // Lend the resolution to WorkspaceContext so its shared drag paths can re-pin
+  // a dragged card correctly — they can't derive a card's Section themselves.
+  useEffect(() => {
+    const laneIds = new Set(
+      sectionNodes.filter((n) => isInboxNode(n)).map((n) => n.id),
+    );
+    const sectionByTask = new Map<string, string>();
+    for (const [sectionId, ids] of membership.bySection)
+      for (const id of ids) sectionByTask.set(id, sectionId);
+    registerPlacement({
+      sectionOf: (taskId) => sectionByTask.get(taskId) ?? null,
+      // Dropping into an INBOX lane means "unpin" — a lane shows its board's
+      // unpinned tasks, so pinning to the lane would be a contradiction.
+      pinFor: (sectionNodeId) =>
+        sectionNodeId && !laneIds.has(sectionNodeId) ? sectionNodeId : null,
+      membersOf: (sectionNodeId) =>
+        (sectionNodeId && membership.bySection.get(sectionNodeId)) || new Set<string>(),
+    });
+    return () => registerPlacement(null);
+  }, [sectionNodes, membership, registerPlacement]);
 
   /* -------- snapshot storage → Postgres (debounced diff) -------- */
   const savedRef = useRef<Map<string, string>>(new Map());
@@ -855,9 +1107,14 @@ export function CanvasEditor({
 
   /* -------- keyboard -------- */
   useEffect(() => {
+    // Also treat "a task modal is open" as typing: it owns the keyboard while
+    // it's up (its own Escape closes it, ←/→ step the lightbox), so canvas
+    // shortcuts must not fire behind it — Backspace especially, which would
+    // delete the selected nodes out of sight.
     const isTyping = () => {
       const el = document.activeElement;
       return (
+        modalOpenRef.current ||
         editingRef.current !== null ||
         (el instanceof HTMLElement &&
           (el.tagName === "TEXTAREA" || el.tagName === "INPUT"))
@@ -963,9 +1220,11 @@ export function CanvasEditor({
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      // Don't hijack paste while typing into a text node / input.
+      // Don't hijack paste while typing into a text node / input, or while a
+      // task-detail modal is open — that modal handles the paste itself.
       const el = document.activeElement;
       if (
+        modalOpenRef.current ||
         editingRef.current !== null ||
         (el instanceof HTMLElement && (el.tagName === "TEXTAREA" || el.tagName === "INPUT"))
       )
@@ -1057,8 +1316,18 @@ export function CanvasEditor({
       let moved = false;
       let lastDx = 0;
       let lastDy = 0;
-      // Only a plain section can be dropped into a group (no nested groups).
-      const capturable = node.kind === "section";
+      // Only a plain section can be dropped into a group (no nested groups), and
+      // only one that's actually part of this drag — a shift-click that
+      // deselected it leaves it out of `origin`, so it never moves and must not
+      // re-parent either.
+      const capturable = node.kind === "section" && moveIds.has(node.id);
+      // The grab point in canvas coords — the anchor for group hit-testing,
+      // translated below by the same dx/dy as the node so it stays glued to the
+      // spot you grabbed. Sampled once here rather than re-derived from the live
+      // viewport each move: the drag moves nodes using the `scale` captured
+      // above, so a live lookup would drift from where the node is actually
+      // drawn if the viewport moves mid-drag.
+      const grab = toCanvas(e.clientX, e.clientY);
 
       const onMove = (ev: PointerEvent) => {
         const dx = (ev.clientX - startX) / scale;
@@ -1077,46 +1346,67 @@ export function CanvasEditor({
             patch: { x: Math.round(o.x + dx), y: Math.round(o.y + dy) },
           })),
         );
-        // Highlight the group a dragged section is currently hovering over.
+        // Highlight the group the cursor is over, and mark the slot it'd land in.
         if (capturable) {
-          const o = origin.get(node.id)!;
-          const cx = o.x + dx + node.width / 2;
-          const cy = o.y + dy + node.height / 2;
-          const g = groupAtPoint(nodesRef.current, cx, cy);
+          const px = grab.x + dx;
+          const py = grab.y + dy;
+          const g = groupAtPoint(nodesRef.current, px, py);
           setGroupDropTarget(g ? g.id : null);
+          if (g) {
+            const layout = groupLayoutOf(g);
+            const siblings = groupMembers(nodesRef.current, g.id).filter(
+              (m) => m.id !== node.id,
+            );
+            setDropSlotIndex(
+              slotIndexForDrop(siblings, layout === "landscape" ? px : py, layout),
+            );
+          } else {
+            setDropSlotIndex(null);
+          }
         }
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         setGroupDropTarget(null);
+        setDropSlotIndex(null);
         if (moved) {
           history.resume();
           setDraggingIds(new Set());
-          // Settle a dragged section into (or out of) a group by its final
-          // centre. Inside a group → set membership + a column slot; the layout
-          // mirror then snaps it into place. Outside all groups → release it.
+          // Settle a dragged section into (or out of) a group by where the CURSOR
+          // released. Inside a group → set membership + a slot; the layout mirror
+          // then snaps it into place. Outside all groups → release it.
           if (capturable) {
-            const o = origin.get(node.id)!;
-            const cx = o.x + lastDx + node.width / 2;
-            const cy = o.y + lastDy + node.height / 2;
-            const g = groupAtPoint(nodesRef.current, cx, cy);
-            const currentGid = node.data?.groupId as string | undefined;
+            const px = grab.x + lastDx;
+            const py = grab.y + lastDy;
+            const g = groupAtPoint(nodesRef.current, px, py);
+            // Re-read: `node` is a pointerdown snapshot, so merging its `data`
+            // would revert anything written to this section during the drag (a
+            // peer binding a board, a master toggle).
+            const cur = nodesRef.current.find((n) => n.id === node.id) ?? node;
+            const currentGid = cur.data?.groupId as string | undefined;
             if (g) {
               const siblings = groupMembers(nodesRef.current, g.id).filter(
                 (m) => m.id !== node.id,
               );
+              // Slot it by where it landed along the group's own axis — down the
+              // column in portrait, across the row in landscape.
+              const layout = groupLayoutOf(g);
               patchMany([
                 {
                   id: node.id,
                   patch: {
-                    data: { ...node.data, groupId: g.id } as StoredNode["data"],
-                    position: columnPositionForDrop(siblings, cy),
+                    data: { ...cur.data, groupId: g.id } as StoredNode["data"],
+                    position: slotPositionForDrop(
+                      siblings,
+                      layout === "landscape" ? px : py,
+                      layout,
+                    ),
                   },
                 },
               ]);
             } else if (currentGid) {
-              const rest = { ...(node.data ?? {}) };
+              const rest = { ...(cur.data ?? {}) };
               delete rest.groupId;
               patchMany([{ id: node.id, patch: { data: rest as StoredNode["data"] } }]);
             }
@@ -1126,7 +1416,7 @@ export function CanvasEditor({
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     },
-    [patchMany, history],
+    [patchMany, history, toCanvas],
   );
 
   /* -------- pointer: background (pan / create / marquee) -------- */
@@ -1270,6 +1560,17 @@ export function CanvasEditor({
     return m;
   }, [others]);
 
+  // The insertion caret for a pending section→group drop, derived from the slot
+  // index rather than stored — so it also tracks the group as its box grows, and
+  // costs nothing on the pointermoves where the slot didn't change.
+  const dropCaret = useMemo(() => {
+    if (dropSlotIndex === null || groupDropTarget === null) return null;
+    const g = nodes.find((n) => n.id === groupDropTarget);
+    if (!g) return null;
+    const members = groupMembers(nodes, g.id).filter((m) => !draggingIds.has(m.id));
+    return slotCaretRect(g, members, dropSlotIndex, groupLayoutOf(g));
+  }, [dropSlotIndex, groupDropTarget, nodes, draggingIds]);
+
   // Frames render behind everything (they're backdrops); text + sections layer
   // by z-order among themselves.
   // Section groups are backdrops for their members, so they render in a back
@@ -1288,7 +1589,10 @@ export function CanvasEditor({
   for (const n of nodes) {
     const bid = n.data?.boardId as string | undefined;
     if (n.kind === "section" && bid && n.data?.master === true) {
-      masterByBoard.set(bid, { id: n.id, name: n.content });
+      // Label it the way its header reads: its own name if it has one, else the
+      // board's (`content`) — this feeds siblings' "Send to …" button.
+      const own = ((n.data?.name as string | undefined) ?? "").trim();
+      masterByBoard.set(bid, { id: n.id, name: own || n.content });
     }
   }
 
@@ -1304,6 +1608,7 @@ export function CanvasEditor({
     // Fill the positioned parent via absolute inset-0 rather than h-full: Safari
     // doesn't treat a flex item's height as "definite", so a percentage height
     // here collapses to 0 and (with overflow-hidden) blanks the whole canvas.
+    <SectionMembershipProvider value={membership}>
     <div className="absolute inset-0 overflow-hidden">
       {/* Toolbar */}
       <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-1">
@@ -1515,6 +1820,22 @@ export function CanvasEditor({
             />
           ))}
 
+          {/* Insertion caret for a pending section→group drop. Rendered after the
+              nodes (later sibling, no z-index — same trick as the connector svg
+              below) because the dragged section paints over the group it's headed
+              for, hiding the group's own drop hint. */}
+          {dropCaret ? (
+            <div
+              className="pointer-events-none absolute rounded-full bg-accent"
+              style={{
+                left: dropCaret.x,
+                top: dropCaret.y,
+                width: dropCaret.w,
+                height: dropCaret.h,
+              }}
+            />
+          ) : null}
+
           {/* Note→task connectors + the in-flight drag line. Above the nodes so
               arrowheads stay visible; endpoints sit on the boxes' borders so the
               stroke lives in the gap, not across the cards. */}
@@ -1686,6 +2007,7 @@ export function CanvasEditor({
         </div>
       ) : null}
     </div>
+    </SectionMembershipProvider>
   );
 
   function zoomAtCenter(factor: number) {

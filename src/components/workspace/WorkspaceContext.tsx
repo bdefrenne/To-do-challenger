@@ -39,6 +39,22 @@ export type DropPos = "before" | "after" | "inside";
 export type PromptKind = "analyze" | "plan" | "work" | "analyze-work";
 
 /** Ordered tree node: parentId = nesting, position = order within group. */
+/**
+ * How the mounted canvas answers placement questions for the shared drag paths.
+ * Section membership is derived per canvas, so it can't be read off a task —
+ * the canvas owns the resolution and lends it here.
+ */
+export interface PlacementResolver {
+  /** The Section node a card renders in — an INBOX lane counts — or null when
+   *  this canvas can't show it. */
+  sectionOf: (taskId: string) => string | null;
+  /** What to WRITE to place a task in that Section: the node id, or null for an
+   *  INBOX lane, since belonging to a lane IS the absence of a pin. */
+  pinFor: (sectionNodeId: string | null) => string | null;
+  /** Ids of the tasks currently rendering in that Section, for position math. */
+  membersOf: (sectionNodeId: string | null) => Set<string>;
+}
+
 export interface TaskNode {
   id: string;
   parentId: string | null;
@@ -68,6 +84,9 @@ interface WorkspaceContextValue {
   addSubtask: (parentId: string, title: string) => Promise<void>;
   childrenOf: (id: string | null) => TaskNode[];
   nodeById: (id: string) => TaskNode | undefined;
+  /** Canvas-only: lend this context your Section resolution so the shared drag
+   *  paths can re-pin correctly. Pass null on unmount. */
+  registerPlacement: (resolver: PlacementResolver | null) => void;
   start: (id: string) => void;
   toggleDone: (id: string) => void;
   setStatus: (id: string, status: TaskStatus) => void;
@@ -96,26 +115,29 @@ interface WorkspaceContextValue {
    *  Returns how many were archived. */
   archiveAllDone: (scope?: { boardId?: string; projectId?: string }) => Promise<number>;
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
-  /** Move a task and its whole subtree into a canvas Section (re-tagging
-   *  `customFields.sectionId`, re-homing the board when it differs). Pass `rel`
-   *  to drop relative to a card; omit it to append at the end of the section. */
+  /** Re-pin a dragged card (and re-home its subtree's board). `targetPin` is what
+   *  to write: a Section node id, or **null** to unpin — which is how a card
+   *  belongs to an INBOX lane. */
   moveNodeIntoSection: (
     dragId: string,
-    targetSectionId: string,
+    targetPin: string | null,
     targetBoardId: string | null,
-    rel?: { targetId: string; pos: DropPos },
+    opts?: { targetId?: string; pos?: DropPos; siblingIds?: Set<string> },
   ) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
   moveToBoard: (id: string, boardId: string, status?: TaskStatus) => void;
   addTask: (status: TaskStatus, title: string, boardId?: string | null) => void;
-  /** Create a task inside a canvas Section (tagged by `customFields.sectionId`),
-   *  optionally nested under `parentId`. Optimistic, like `addTask`. */
+  /** Create a task inside a canvas Section, optionally nested under `parentId`.
+   *  Optimistic, like `addTask`. */
   addSectionTask: (input: {
     title: string;
-    sectionId: string;
+    /** Pin the new card to this Section, or null to leave it unpinned — which is
+     *  what an INBOX lane and a subtask both want. */
+    canvasSectionId: string | null;
     boardId: string | null;
     parentId?: string | null;
+    siblingIds?: Set<string>;
   }) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
@@ -392,6 +414,15 @@ export function WorkspaceProvider({
   // Latest nodes list, so a delete can snapshot the removed node for undo.
   const nodesRef = useRef<TaskNode[]>([]);
   useEffect(() => void (nodesRef.current = nodes), [nodes]);
+
+  // How the mounted canvas resolves which Section a card renders in. Registered
+  // by CanvasEditor (see registerPlacement) and left null on the board views,
+  // which have no sections — so the shared drag paths can ask about placement
+  // without this context knowing what a canvas is.
+  const placementRef = useRef<PlacementResolver | null>(null);
+  const registerPlacement = useCallback((resolver: PlacementResolver | null) => {
+    placementRef.current = resolver;
+  }, []);
 
   // Tasks removed on the canvas but not yet committed to Postgres — kept alive
   // for the ~5s undo window (Gmail-style). `fetchAll` filters these ids so a
@@ -947,16 +978,23 @@ export function WorkspaceProvider({
     const target = nodes.find((n) => n.id === targetId);
     if (!drag || !target) return;
 
-    // Cross-section drop (canvas): the target card belongs to a DIFFERENT
-    // section than the dragged one. A section is scoped by the hidden
-    // `customFields.sectionId` tag (not the board), so re-tagging — and, when
-    // the target section is on another board, re-homing the board — has to
-    // cascade to the whole subtree. Delegate to the section mover.
-    const dragSection = taskMap[dragId]?.customFields?.sectionId as string | undefined;
-    const targetSection = taskMap[targetId]?.customFields?.sectionId as string | undefined;
-    if (targetSection && dragSection !== targetSection) {
-      moveNodeIntoSection(dragId, targetSection, target.boardId ?? null, { targetId, pos });
-      return;
+    // Cross-section drop (canvas): the target card renders in a DIFFERENT
+    // section than the dragged one, so the whole subtree has to be re-pinned —
+    // and re-homed when the target section sits on another board. The canvas
+    // passes `placement` (it owns the resolution; see buildSectionMembership),
+    // because a card's section is derived, not readable off the task alone.
+    const placement = placementRef.current;
+    if (placement) {
+      const from = placement.sectionOf(dragId);
+      const to = placement.sectionOf(targetId);
+      if (to && from !== to) {
+        moveNodeIntoSection(dragId, placement.pinFor(to), target.boardId ?? null, {
+          targetId,
+          pos,
+          siblingIds: placement.membersOf(to),
+        });
+        return;
+      }
     }
 
     if (pos === "inside") {
@@ -1002,20 +1040,29 @@ export function WorkspaceProvider({
     );
   }
 
-  // Move a task (and its WHOLE subtree) into a canvas Section — possibly one on
-  // a different board. A section is scoped by the hidden `customFields.sectionId`
-  // tag, so the move must (a) re-tag every task in the subtree into the target
-  // section, (b) re-home each to the target board when it differs, and (c) drop
-  // the root at the chosen spot. `rel` places it relative to a target card
-  // (before/after/inside); omit it to append at the end of the section's
-  // top-level list (e.g. dropping onto an empty section). One /api/tasks/bulk
-  // batch, mirroring SectionNode's sendToMaster.
+  // Move a task into a canvas Section — possibly one on a different board.
+  //
+  // `targetPin` is what to WRITE, not where it lands visually: a section node id
+  // pins the task there, and **null unpins it**, which is how a task belongs to
+  // an INBOX lane (a lane shows its board's unpinned tasks, so being in one is
+  // the absence of a pin, not a pin to the lane). Only the dragged root is
+  // re-pinned — descendants inherit their parent's placement, so re-pinning them
+  // would be redundant and would strand them if the parent moved again.
+  //
+  // The board move still has to cascade to the whole subtree, since boardId is
+  // real per-task state. `opts.targetId`/`pos` place the root relative to a card
+  // (before/after/inside); omit them to append at the end. `opts.siblingIds`
+  // carries the target section's current members from the canvas — position math
+  // needs them because membership is derived and can't be read off a task.
+  // One /api/tasks/bulk batch.
   function moveNodeIntoSection(
     dragId: string,
-    targetSectionId: string,
+    targetPin: string | null,
     targetBoardId: string | null,
-    rel?: { targetId: string; pos: DropPos },
+    opts?: { targetId?: string; pos?: DropPos; siblingIds?: Set<string> },
   ) {
+    const rel =
+      opts?.targetId && opts.pos ? { targetId: opts.targetId, pos: opts.pos } : undefined;
     const drag = nodes.find((n) => n.id === dragId);
     if (!drag) return;
     if (rel && (rel.targetId === dragId || isDescendant(nodes, dragId, rel.targetId))) return;
@@ -1029,15 +1076,15 @@ export function WorkspaceProvider({
     const boardChanged = drag.boardId !== targetBoardId;
 
     // Siblings within the TARGET section under a given parent (position-ordered),
-    // excluding the dragged subtree so its own rows never skew the math.
+    // excluding the dragged subtree so its own rows never skew the math. Falls
+    // back to pin equality when the canvas didn't supply its members (e.g. a
+    // board view calling in).
+    const members = opts?.siblingIds;
+    const inTarget = (id: string) =>
+      members ? members.has(id) : (taskMap[id]?.canvasSectionId ?? null) === targetPin;
     const sectionSiblings = (parentId: string | null) =>
       nodes
-        .filter(
-          (n) =>
-            !inSubtree.has(n.id) &&
-            n.parentId === parentId &&
-            (taskMap[n.id]?.customFields?.sectionId as string | undefined) === targetSectionId,
-        )
+        .filter((n) => !inSubtree.has(n.id) && n.parentId === parentId && inTarget(n.id))
         .sort((a, b) => a.position - b.position);
 
     let parentId: string | null;
@@ -1065,18 +1112,21 @@ export function WorkspaceProvider({
       position = (sibs[sibs.length - 1]?.position ?? 0) + 1;
     }
 
-    // No-op guard: same section, same spot, same board.
-    const dragSection = taskMap[dragId]?.customFields?.sectionId as string | undefined;
-    if (!boardChanged && dragSection === targetSectionId && drag.parentId === parentId && drag.position === position)
+    // No-op guard: same pin, same spot, same board.
+    const dragPin = taskMap[dragId]?.canvasSectionId ?? null;
+    if (!boardChanged && dragPin === targetPin && drag.parentId === parentId && drag.position === position)
       return;
 
-    // Build the bulk batch. updateTask REPLACES customFields, so resend the full
-    // object with only sectionId swapped. Descendants keep their parentId; only
-    // their sectionId (and board, if it changed) move.
-    const ops: unknown[] = [];
+    // Build the bulk batch. `canvasSectionId` is a scalar column, so re-pinning
+    // is a plain assignment — no read-modify-write of a shared customFields bag,
+    // and nothing for a concurrent writer to clobber. Only the root is re-pinned;
+    // descendants follow it by inheritance, so any pin THEY carry from an earlier
+    // drag is cleared to keep them with their parent.
+    const ops: unknown[] = [{ op: "update", id: dragId, patch: { canvasSectionId: targetPin } }];
     for (const id of subtree) {
-      const cf = taskMap[id]?.customFields ?? {};
-      ops.push({ op: "update", id, patch: { customFields: { ...cf, sectionId: targetSectionId } } });
+      if (id === dragId) continue;
+      if ((taskMap[id]?.canvasSectionId ?? null) !== null)
+        ops.push({ op: "update", id, patch: { canvasSectionId: null } });
     }
     if (boardChanged) {
       for (const id of subtree) {
@@ -1102,7 +1152,7 @@ export function WorkspaceProvider({
             if (!t) continue;
             next[id] = {
               ...t,
-              customFields: { ...(t.customFields ?? {}), sectionId: targetSectionId },
+              canvasSectionId: id === dragId ? targetPin : null,
               ...(boardChanged ? { boardId: targetBoardId } : {}),
             };
           }
@@ -1160,7 +1210,7 @@ export function WorkspaceProvider({
         .map((n) => n.position),
     );
     mutate(
-      () =>
+      () => {
         setNodes((prev) =>
           prev.map((n) =>
             n.id === id
@@ -1174,7 +1224,15 @@ export function WorkspaceProvider({
                 }
               : n,
           ),
-        ),
+        );
+        // Mirror moveTask's rule: changing board drops any canvas pin, since the
+        // pinned Section belongs to the board we just left. Without this the card
+        // would linger in that Section until the next refetch.
+        if (node.boardId !== boardId)
+          setTaskMap((prev) =>
+            prev[id] ? { ...prev, [id]: { ...prev[id], canvasSectionId: null } } : prev,
+          );
+      },
       () =>
         api(`/api/tasks/${id}/move`, {
           method: "POST",
@@ -1345,17 +1403,20 @@ export function WorkspaceProvider({
     );
   }
 
-  // Create a task inside a canvas Section. A section's tasks are scoped by the
-  // hidden `customFields.sectionId` tag (not by board), so that tag — and the
-  // section's boardId — MUST ride along or the card won't show. Mirrors addTask's
-  // optimistic temp-id → real-id swap; `parentId` set makes it a subtask.
+  // Create a task inside a canvas Section. `canvasSectionId` pins it there —
+  // pass **null** for an INBOX lane (a lane shows its board's unpinned tasks, so
+  // pinning would take the card straight back out of it) and for a subtask, which
+  // inherits its parent's placement. Mirrors addTask's optimistic temp-id →
+  // real-id swap; `parentId` set makes it a subtask. `siblingIds` is the target
+  // Section's current members, for end-of-list position math.
   function addSectionTask(input: {
     title: string;
-    sectionId: string;
+    canvasSectionId: string | null;
     boardId: string | null;
     parentId?: string | null;
+    siblingIds?: Set<string>;
   }) {
-    const { title, sectionId, boardId } = input;
+    const { title, canvasSectionId, boardId, siblingIds } = input;
     const parentId = input.parentId ?? null;
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
@@ -1368,7 +1429,9 @@ export function WorkspaceProvider({
         .filter(
           (n) =>
             n.parentId === parentId &&
-            taskMap[n.id]?.customFields?.sectionId === sectionId,
+            (siblingIds
+              ? siblingIds.has(n.id)
+              : (taskMap[n.id]?.canvasSectionId ?? null) === canvasSectionId),
         )
         .map((n) => n.position),
     );
@@ -1382,7 +1445,7 @@ export function WorkspaceProvider({
             status: "backlog",
             assigneeIds: [],
             boardId,
-            customFields: { sectionId },
+            canvasSectionId,
             updatedAt: now,
           },
         }));
@@ -1400,7 +1463,7 @@ export function WorkspaceProvider({
             assigneeIds: [],
             boardId,
             parentId,
-            customFields: { sectionId },
+            canvasSectionId,
           }),
         }),
       {
@@ -1639,6 +1702,7 @@ export function WorkspaceProvider({
         addSubtask,
         childrenOf,
         nodeById,
+        registerPlacement,
         start,
         toggleDone,
         setStatus,

@@ -161,6 +161,14 @@ export interface Task {
   dependsOn?: string[];
   /** User-defined fields, keyed by name (the ClickUp custom-field bag). */
   customFields?: Record<string, CustomFieldValue>;
+  /** The canvas Section this task is pinned to (a `CanvasNode.id`), or null for
+   *  "not placed" — the normal state. A canvas resolves an unpinned task into
+   *  its board's INBOX lane, so tasks created from the API, MCP or a board view
+   *  show up without anyone tagging them; pinning is an explicit override
+   *  written when someone drags a card into a section. An id belonging to a
+   *  DIFFERENT canvas (or to a deleted node) reads as unpinned — see
+   *  `resolveSectionId`. */
+  canvasSectionId?: string | null;
   /** Payoff points (Fibonacci) — the "value" axis. */
   value?: FibPoints;
   /** Effort points (Fibonacci) — the "difficulty" axis. */
@@ -190,8 +198,9 @@ export interface Task {
  *  board container whose lines are that board's live tasks), a `draw` freehand
  *  pen stroke (its sampled points ride in `data`), an `image` (a pasted or
  *  dropped picture whose blob URL rides in `data.url`), or a `section_group` (a
- *  movable container that stacks its member sections — each tagged with
- *  `data.groupId` — in a column under a big title). The `canvas_node_kind` DB
+ *  movable container that arranges its member sections — each tagged with
+ *  `data.groupId` — under a big title, in a column or a row per its
+ *  `data.layout`: "portrait" (default) or "landscape"). The `canvas_node_kind` DB
  *  enum still carries a legacy `frame` value (the feature was removed); nothing
  *  writes it, so it never reaches this type. */
 export type CanvasNodeKind = "text" | "section" | "draw" | "image" | "section_group";
@@ -228,7 +237,8 @@ export interface CanvasNode {
   color?: string | null;
   /** Fractional z-order (higher = on top). */
   position: number;
-  /** Free-form extras (e.g. a section's bound `boardId`). */
+  /** Free-form extras (e.g. a section's bound `boardId` and optional own
+   *  `name`; a group's `layout`). */
   data?: Record<string, unknown>;
 }
 

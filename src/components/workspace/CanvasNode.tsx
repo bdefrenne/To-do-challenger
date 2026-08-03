@@ -266,6 +266,11 @@ export function CanvasNode({
         onChange={onChange}
         onStopEditing={onStopEditing}
         onRemove={onRemove}
+        onToggleLayout={
+          onPatch
+            ? (layout) => onPatch({ data: { ...node.data, layout } })
+            : undefined
+        }
       />
     );
   }

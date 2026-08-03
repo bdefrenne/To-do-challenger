@@ -13,6 +13,10 @@
  * Before it's bound (`data.boardId`) the Section shows a name input that
  * autosuggests existing boards (or creates a new one). Task reads/writes go
  * through useWorkspace(); the commit is one-to-three /api/tasks/bulk batches.
+ *
+ * A section can also carry a name of its OWN (`data.name`, set by double-clicking
+ * the header title). When set it takes the title slot and the bound board's name
+ * (`node.content`) trails it inline, dimmed and regular weight.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -30,6 +34,8 @@ import {
 } from "@/lib/outline";
 import type { TaskStatus, Importance } from "@/lib/types";
 import { useWorkspace, type DropPos } from "./WorkspaceContext";
+import { useSectionMembership } from "./SectionMembershipContext";
+import { isInboxNode } from "@/lib/sections";
 import { TaskCardBody } from "./TaskCardBody";
 import { useCardShortcut } from "./useCardShortcut";
 import { IMPORTANCE_CARD } from "@/lib/importance";
@@ -40,23 +46,32 @@ export const NEW_SECTION_SIZE = { width: 420, height: 320 };
 /** Floor height for a section card so an empty/naming one isn't a sliver. Above
  *  this the card grows to fit its outline/tasks (`height: auto`), and the height
  *  is mirrored back into stored `node.height`. */
-const MIN_SECTION_HEIGHT = 140;
+export const MIN_SECTION_HEIGHT = 140;
 
 const SECTION_DND_MIME = "application/x-section-task";
 
 type Mode = "naming" | "authoring" | "committed";
 
-/** The task TREE for ONE section, read from the live workspace. A section is
- *  scoped by a hidden `customFields.sectionId` tag (not by its board), so a new
- *  section starts empty and several sections can live on the same board without
- *  showing each other's tasks. Arbitrary nesting depth. */
+/** The task TREE for ONE section, read from the live workspace. Which tasks
+ *  belong here is resolved for the whole canvas at once (see
+ *  `buildSectionMembership`): a task pinned to this node, or — if this node is
+ *  an INBOX lane — any unpinned task on its board. Arbitrary nesting depth. */
 function useSectionUnits(sectionId: string): TaskUnit[] {
   const { nodes, taskMap } = useWorkspace();
+  const { bySection } = useSectionMembership();
   return useMemo(() => {
-    const inSection = (id: string) => taskMap[id]?.customFields?.sectionId === sectionId;
-    const childrenOf = (parentId: string | null): TaskUnit[] =>
-      nodes
-        .filter((n) => n.parentId === parentId && inSection(n.id))
+    const members = bySection.get(sectionId);
+    if (!members) return [];
+    const childrenOf = (parentId: string) =>
+      nodes.filter((n) => n.parentId === parentId && members.has(n.id));
+    // Roots of THIS section: top-level tasks, plus any whose parent isn't here
+    // too — a subtask whose parent was dragged into another section would
+    // otherwise have no row to hang off and would vanish.
+    const roots = nodes.filter(
+      (n) => members.has(n.id) && (n.parentId === null || !members.has(n.parentId)),
+    );
+    const build = (rows: typeof nodes): TaskUnit[] =>
+      [...rows]
         .sort((a, b) => a.position - b.position)
         .map((n) => {
           const t = taskMap[n.id];
@@ -64,11 +79,11 @@ function useSectionUnits(sectionId: string): TaskUnit[] {
             taskId: n.id,
             title: t?.title ?? "",
             description: t?.description ?? "",
-            children: childrenOf(n.id),
+            children: build(childrenOf(n.id)),
           };
         });
-    return childrenOf(null);
-  }, [sectionId, nodes, taskMap]);
+    return build(roots);
+  }, [sectionId, nodes, taskMap, bySection]);
 }
 
 export function SectionNode({
@@ -117,6 +132,17 @@ export function SectionNode({
   // by its board — so it starts empty and stays separate from sibling sections.
   const sectionId = node.id;
   const units = useSectionUnits(sectionId);
+  // An INBOX lane: a tray showing its board's UNPINNED tasks, so that anything
+  // created from the API, MCP or a board view is visible here instead of nowhere.
+  // Cards land in it by having no pin, which is why `pin` is null for a lane —
+  // pinning to it would immediately take the card out of it again.
+  const isInbox = isInboxNode(node);
+  const pin = isInbox ? null : sectionId;
+  const { bySection } = useSectionMembership();
+  const siblingIds = useMemo(
+    () => bySection.get(sectionId) ?? new Set<string>(),
+    [bySection, sectionId],
+  );
 
   // Soft field-lock (presence): while a user authors this section's outline they
   // publish `editing`, and peers show a lock + can't open the outline — so two
@@ -135,13 +161,15 @@ export function SectionNode({
   // PEER adds to this section while we're editing a stale local outline.
   const knownIdsRef = useRef<Set<string>>(new Set());
 
-  const [mode, setMode] = useState<Mode>(boardId ? "committed" : "naming");
+  // An INBOX lane never goes through naming: its board is fixed by the
+  // reconciler, and the "No board" lane is legitimately board-less.
+  const [mode, setMode] = useState<Mode>(boardId || isInbox ? "committed" : "naming");
   // `mode` is seeded from `boardId` only once, so a peer sitting in naming (the
   // placeholder) when the author picks a board would stay stuck on the pre-bind
   // view. Derive the DISPLAYED mode from the live `boardId` instead of mutating
   // state in an effect: once bound, everyone renders committed. The state
   // machine (authoring transitions, saves) still keys off the real `mode`.
-  const viewMode: Mode = boardId && mode === "naming" ? "committed" : mode;
+  const viewMode: Mode = (boardId || isInbox) && mode === "naming" ? "committed" : mode;
   // Text-mode display preference (session-only): descriptions grow up to 6 rows
   // by default; toggled to unbounded via the header button. Not persisted.
   const [descExpanded, setDescExpanded] = useState(false);
@@ -388,11 +416,9 @@ export function SectionNode({
     setSaving(true);
     try {
       const built = rowsToUnits(current);
-      // Section tasks are scoped by the sectionId tag, never the board — so
-      // saving one section never touches another section's tasks.
-      const sectionNodes = ws.nodes.filter(
-        (n) => ws.taskMap[n.id]?.customFields?.sectionId === sectionId,
-      );
+      // Scoped to the tasks THIS section renders (resolved canvas-wide), never
+      // the board — so saving one section never touches another's tasks.
+      const sectionNodes = ws.nodes.filter((n) => siblingIds.has(n.id));
       const surviving = survivingIds(built);
       // Only delete tasks THIS session knows about (baseline + ones it created).
       // A task a peer added to this section meanwhile isn't in knownIds, so our
@@ -401,7 +427,6 @@ export function SectionNode({
         .map((n) => n.id)
         .filter((id) => knownIdsRef.current.has(id) && !surviving.has(id));
 
-      const tag = { sectionId };
       const flat = flattenUnits(built);
       const maxDepth = flat.reduce((m, n) => Math.max(m, n.depth), 0);
 
@@ -418,7 +443,9 @@ export function SectionNode({
             description: n.unit.description || undefined,
             boardId,
             parentId: n.parent?.taskId ?? undefined,
-            customFields: tag,
+            // Only roots carry the pin — nested lines inherit their parent's
+            // placement. Null in an INBOX lane, where unpinned IS the membership.
+            ...(n.parent ? {} : { canvasSectionId: pin }),
           },
         }));
         const { results } = await bulk(ops);
@@ -504,7 +531,7 @@ export function SectionNode({
         void save();
       }
     }
-  }, [boardId, sectionId, ws]);
+  }, [boardId, ws, pin, siblingIds]);
 
   /** Save now, cancelling any pending debounce (used on toggle / Esc / unmount). */
   const flush = useCallback(() => {
@@ -569,6 +596,38 @@ export function SectionNode({
     setRows(next);
   }, [units, mode]);
 
+  /* ---------------- the section's own name ---------------- */
+  // `data.name` is optional and lives alongside the bound board (`node.content`
+  // stays the BOARD's name). Double-clicking the header title opens this inline
+  // field; committing happens on blur only (Enter/Escape just blur), with
+  // `cancelRenameRef` marking an Escape so it discards instead of saving.
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const cancelRenameRef = useRef(false);
+
+  const startRename = () => {
+    cancelRenameRef.current = false;
+    setNameDraft(((node.data?.name as string | undefined) ?? "").trim());
+    setRenaming(true);
+  };
+
+  const commitName = (raw: string) => {
+    setRenaming(false);
+    if (cancelRenameRef.current) {
+      cancelRenameRef.current = false;
+      return;
+    }
+    const next = raw.trim();
+    const current = ((node.data?.name as string | undefined) ?? "").trim();
+    if (next === current) return;
+    const data = { ...(node.data ?? {}) };
+    // Clearing the field drops the key entirely, so the header falls back to
+    // showing just the board name (as it did before a name was ever set).
+    if (next) data.name = next;
+    else delete data.name;
+    onPatch({ data });
+  };
+
   /* ---------------- binding (naming) ---------------- */
   const bindBoard = (id: string, name: string) => {
     onPatch({ content: name, data: { ...(node.data ?? {}), boardId: id } });
@@ -587,16 +646,13 @@ export function SectionNode({
   /* ---------------- send everything to the master section ------------- */
   // Re-group this section's cards onto its board's master section (placed on
   // top), then remove this now-empty section from the canvas. Source and master
-  // share a board, so this only re-tags `customFields.sectionId` and reorders —
-  // no board move.
+  // share a board, so this only re-pins and reorders — no board move.
   const sendToMaster = useCallback(async () => {
     if (!boardId || !masterSection) return;
 
-    // Every task in this section (all depths), read from the workspace so it's
-    // independent of the current view mode.
-    const sectionTaskIds = ws.nodes
-      .filter((n) => ws.taskMap[n.id]?.customFields?.sectionId === sectionId)
-      .map((n) => n.id);
+    // Every task in this section (all depths), read from the resolved membership
+    // so it's independent of the current view mode.
+    const sectionTaskIds = ws.nodes.filter((n) => siblingIds.has(n.id)).map((n) => n.id);
 
     const n = sectionTaskIds.length;
     if (
@@ -611,29 +667,19 @@ export function SectionNode({
     setSaving(true);
     try {
       if (n) {
-        const topLevel = (secId: string) =>
+        const topLevel = (members: Set<string>) =>
           ws.nodes
-            .filter(
-              (nd) =>
-                nd.parentId === null &&
-                ws.taskMap[nd.id]?.customFields?.sectionId === secId,
-            )
+            .filter((nd) => nd.parentId === null && members.has(nd.id))
             .sort((a, b) => a.position - b.position)
             .map((nd) => nd.id);
-        const sourceTop = topLevel(sectionId);
-        const masterTop = topLevel(masterSection.id);
+        const sourceTop = topLevel(siblingIds);
+        const masterTop = topLevel(bySection.get(masterSection.id) ?? new Set());
 
         const ops: unknown[] = [];
-        // Re-tag every source task into the master section. updateTask REPLACES
-        // customFields, so resend the full object (preserving other fields).
-        for (const id of sectionTaskIds) {
-          const cf = ws.taskMap[id]?.customFields ?? {};
-          ops.push({
-            op: "update",
-            id,
-            patch: { customFields: { ...cf, sectionId: masterSection.id } },
-          });
-        }
+        // Re-pin every top-level source card onto the master section; nested ones
+        // inherit their parent's placement, so they need no write of their own.
+        for (const id of sourceTop)
+          ops.push({ op: "update", id, patch: { canvasSectionId: masterSection.id } });
         // Reassert dense top-level order: source cards first (= on top), then
         // the master's existing cards. Nested tasks keep their parent/order.
         [...sourceTop, ...masterTop].forEach((id, i) =>
@@ -649,13 +695,18 @@ export function SectionNode({
     } finally {
       setSaving(false);
     }
-  }, [boardId, masterSection, sectionId, ws, onRemove]);
+  }, [boardId, masterSection, ws, onRemove, siblingIds, bySection]);
 
   /* =================================================================== */
   /* Render                                                              */
   /* =================================================================== */
 
-  const title = node.content.trim();
+  // Header title. `node.content` is the BOARD's name (set when the section was
+  // bound); `data.name` is the section's OWN name, optional. With a name set it
+  // takes the title slot and the board name trails it inline, dimmed and regular
+  // weight — so the header reads "what this section is · which board it's on".
+  const boardName = node.content.trim();
+  const sectionName = ((node.data?.name as string | undefined) ?? "").trim();
 
   return (
     <div
@@ -677,8 +728,11 @@ export function SectionNode({
         outlineOffset: 2,
       }}
       className={[
-        "group/section flex flex-col overflow-hidden rounded-xl border-2 bg-surface shadow-sm",
-        selected ? "border-accent" : "border-border-strong",
+        "group/section flex flex-col overflow-hidden rounded-xl border-2 shadow-sm",
+        // An INBOX lane reads as a tray, not a workspace: dashed edge and a muted
+        // fill, so untriaged cards are visibly not "placed" anywhere yet.
+        isInbox ? "border-dashed bg-surface-2/70" : "bg-surface",
+        selected ? "border-accent" : isInbox ? "border-border" : "border-border-strong",
       ].join(" ")}
     >
       {/* Header = title chip + drag handle + edit affordance */}
@@ -686,10 +740,58 @@ export function SectionNode({
         onPointerDown={onPointerDown}
         className="flex shrink-0 cursor-grab items-start gap-2 border-b border-border bg-surface-2 px-3 py-2 active:cursor-grabbing"
       >
-        <span aria-hidden className="text-faint">▤</span>
-        <span className="min-w-0 flex-1 break-words text-sm font-semibold text-fg">
-          {title || "Untitled section"}
+        <span aria-hidden className="text-faint" title={isInbox ? "Inbox — unplaced tasks" : undefined}>
+          {isInbox ? "⇥" : "▤"}
         </span>
+        {renaming ? (
+          <input
+            autoFocus
+            value={nameDraft}
+            onFocus={(e) => e.currentTarget.select()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => setNameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              // Keep section shortcuts / canvas keys out of the field. Enter and
+              // Escape both leave via blur — commit lives in onBlur alone, so it
+              // can never run twice for one edit.
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                e.currentTarget.blur();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                cancelRenameRef.current = true;
+                e.currentTarget.blur();
+              }
+            }}
+            onBlur={() => commitName(nameDraft)}
+            placeholder="Section name…"
+            className="min-w-0 flex-1 rounded border border-accent bg-surface px-1.5 py-0.5 text-sm font-semibold text-fg outline-none placeholder:font-normal placeholder:text-faint"
+          />
+        ) : (
+          <span
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              startRename();
+            }}
+            title={
+              sectionName
+                ? `${sectionName} — on board “${boardName}”. Double-click to rename.`
+                : "Double-click to give this section its own name"
+            }
+            className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-1.5 gap-y-0.5"
+          >
+            <span className="min-w-0 break-words text-sm font-semibold text-fg">
+              {sectionName || boardName || "Untitled section"}
+            </span>
+            {sectionName && boardName ? (
+              <span className="min-w-0 truncate text-sm font-normal text-fg opacity-[0.84]">
+                {boardName}
+              </span>
+            ) : null}
+          </span>
+        )}
         {saving ? (
           <span
             aria-label="Saving"
@@ -707,7 +809,7 @@ export function SectionNode({
         ) : null}
         {/* Send-to-master: shown on non-master sections that have a master on
             the same board. Hover-revealed, like the canvas-index card's ✕. */}
-        {boardId && !isMaster && masterSection ? (
+        {boardId && !isInbox && !isMaster && masterSection ? (
           <button
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
@@ -739,18 +841,22 @@ export function SectionNode({
             {descExpanded ? "↕ All" : "↕ 6"}
           </button>
         ) : null}
-        {boardId ? (
+        {boardId || isInbox ? (
           <div
             onPointerDown={(e) => e.stopPropagation()}
             className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5"
           >
-            <ViewToggleBtn
-              active={isMaster}
-              onClick={() => onSetMaster?.(!isMaster)}
-              title={isMaster ? "Master section (click to unset)" : "Make this the board's master section"}
-            >
-              {isMaster ? "★" : "☆"}
-            </ViewToggleBtn>
+            {/* An INBOX lane can't be a master: it's a tray tasks pass THROUGH,
+                never a destination siblings should send their cards to. */}
+            {isInbox ? null : (
+              <ViewToggleBtn
+                active={isMaster}
+                onClick={() => onSetMaster?.(!isMaster)}
+                title={isMaster ? "Master section (click to unset)" : "Make this the board's master section"}
+              >
+                {isMaster ? "★" : "☆"}
+              </ViewToggleBtn>
+            )}
             <ViewToggleBtn
               active={mode === "authoring"}
               disabled={locked}
@@ -811,12 +917,16 @@ export function SectionNode({
             onMove={ws.moveNode}
             onAssignSelf={ws.toggleSelfAssignee}
             onDelete={ws.deleteTask}
-            onAddTask={(title) => ws.addSectionTask({ title, sectionId, boardId, parentId: null })}
+            onAddTask={(title) =>
+              ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
+            }
+            // Subtasks are never pinned — they inherit their parent's placement,
+            // so they follow it if the parent is dragged elsewhere.
             onAddSubtask={(parentId, title) =>
-              ws.addSectionTask({ title, sectionId, boardId, parentId })
+              ws.addSectionTask({ title, canvasSectionId: null, boardId, parentId })
             }
             onDropIntoSection={(dragId) =>
-              ws.moveNodeIntoSection(dragId, sectionId, boardId)
+              ws.moveNodeIntoSection(dragId, pin, boardId, { siblingIds })
             }
           />
         )}

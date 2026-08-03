@@ -1,30 +1,67 @@
 "use client";
 
 /**
- * A `section_group` node — a movable container that stacks its member sections
- * in a vertical column under a big title. Purely presentational: it stores only
- * its own name (`content`) and anchor (`x/y`); membership lives on the children
- * (each member section carries `data.groupId === this.id`), and the column
- * layout — each member's position plus this box's derived `width/height` — is
- * computed and mirrored back in CanvasEditor. The header doubles as the drag
- * handle (moving the group re-derives the whole column, so members follow).
+ * A `section_group` node — a movable container that arranges its member sections
+ * under a big title, either **portrait** (stacked in a column, the default) or
+ * **landscape** (laid out left-to-right in a row); the header carries an icon to
+ * toggle between the two. Purely presentational: it stores only its own name
+ * (`content`), anchor (`x/y`) and orientation (`data.layout`); membership lives
+ * on the children (each member section carries `data.groupId === this.id`), and
+ * the arrangement — each member's position plus this box's derived
+ * `width/height` — is computed and mirrored back in CanvasEditor. The header
+ * doubles as the drag handle (moving the group re-derives the whole layout, so
+ * members follow).
  */
 
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 
+/** How a group arranges its members: a vertical column ("portrait", the
+ *  default) or a horizontal row ("landscape" / paysage). */
+export type GroupLayout = "portrait" | "landscape";
+
+/** A group's orientation, read off `data.layout` (absent ⇒ portrait, which is
+ *  how every group behaved before the toggle existed). */
+export const groupLayoutOf = (node: CanvasNodeT): GroupLayout =>
+  node.data?.layout === "landscape" ? "landscape" : "portrait";
+
 /** Title-band height (canvas units). Kept in sync with the layout math in
  *  CanvasEditor via the shared constants below. */
 export const GROUP_HEADER_H = 56;
-/** Inner padding around the member column. */
+/** Inner padding around the member column/row. */
 export const GROUP_PAD = 16;
-/** Vertical gap between stacked members. */
+/** Gap between adjacent members (down the column, or across the row). */
 export const GROUP_GAP = 16;
-/** Empty band kept below the last member — always a visible landing target so
- *  you can drop more sections in even once the column has one. */
+/** Empty band kept after the last member — always a visible landing target so
+ *  you can drop more sections in even once the column/row has one. Portrait
+ *  keeps it below the last member; landscape keeps it to the right. */
 export const GROUP_DROPZONE = 76;
+/** Landscape's trailing band is horizontal, so it needs to be wide enough for
+ *  the hint chip rather than tall enough for a line of text. */
+export const GROUP_DROPZONE_W = 170;
 /** Size of a freshly-dropped (empty) group — a visible drop target. */
 export const NEW_GROUP_SIZE = { width: 460, height: 220 };
+
+/** The toggle's glyph: two stacked bars for portrait (a column), two
+ *  side-by-side bars for landscape (a row). Depicts the CURRENT layout — the
+ *  tooltip says what clicking it switches to. */
+function LayoutGlyph({ layout }: { layout: GroupLayout }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+      {layout === "portrait" ? (
+        <>
+          <rect x="1" y="1.5" width="12" height="4.5" rx="1" fill="currentColor" />
+          <rect x="1" y="8" width="12" height="4.5" rx="1" fill="currentColor" />
+        </>
+      ) : (
+        <>
+          <rect x="1.5" y="1" width="4.5" height="12" rx="1" fill="currentColor" />
+          <rect x="8" y="1" width="4.5" height="12" rx="1" fill="currentColor" />
+        </>
+      )}
+    </svg>
+  );
+}
 
 export function SectionGroupNode({
   node,
@@ -38,6 +75,7 @@ export function SectionGroupNode({
   onChange,
   onStopEditing,
   onRemove,
+  onToggleLayout,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -52,8 +90,12 @@ export function SectionGroupNode({
   onChange: (content: string) => void;
   onStopEditing: () => void;
   onRemove?: () => void;
+  /** Flip portrait ⇄ landscape; the editor re-derives the arrangement. */
+  onToggleLayout?: (layout: GroupLayout) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const layout = groupLayoutOf(node);
+  const landscape = layout === "landscape";
 
   // Focus + select the name when entering edit mode, so a fresh group (or a
   // re-edit) lets you type the name straight away.
@@ -123,6 +165,27 @@ export function SectionGroupNode({
             {title || <span className="text-faint">Untitled group</span>}
           </span>
         )}
+        {onToggleLayout ? (
+          <button
+            type="button"
+            title={
+              landscape
+                ? "Landscape — click for portrait (stack sections in a column)"
+                : "Portrait — click for landscape (lay sections out in a row)"
+            }
+            aria-label={landscape ? "Switch to portrait layout" : "Switch to landscape layout"}
+            aria-pressed={landscape}
+            onPointerDown={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleLayout(landscape ? "portrait" : "landscape");
+            }}
+            className="shrink-0 rounded-md border border-border px-1.5 py-1 text-faint transition-colors hover:border-accent hover:text-accent"
+          >
+            <LayoutGlyph layout={layout} />
+          </button>
+        ) : null}
         {onRemove ? (
           <button
             type="button"
@@ -141,17 +204,29 @@ export function SectionGroupNode({
       </div>
 
       {/* Body: a transparent backdrop. Member sections are separate nodes that
-          render on top (the editor stacks them into the column from the top), so
-          the persistent drop hint is pinned to the bottom band — it stays
-          visible below the last member and is always a valid landing target. */}
-      <div className="pointer-events-none flex flex-1 flex-col items-center justify-end p-4">
+          render on top (the editor packs them in from the top/left), so the
+          persistent drop hint is pinned to the trailing band — below the last
+          member in portrait, right of it in landscape — where it stays visible
+          and is always a valid landing target. */}
+      <div
+        className={[
+          "pointer-events-none flex flex-1 p-4",
+          landscape
+            ? "flex-row items-center justify-end"
+            : "flex-col items-center justify-end",
+        ].join(" ")}
+      >
         <span
           className={[
-            "rounded-md border border-dashed px-3 py-2 text-sm transition-colors",
+            "rounded-md border border-dashed px-3 py-2 text-center text-sm transition-colors",
             dropActive ? "border-accent text-accent" : "border-border text-faint",
           ].join(" ")}
         >
-          {memberCount === 0 ? "Drag sections here" : "Drop another section here"}
+          {memberCount === 0
+            ? "Drag sections here"
+            : landscape
+              ? "Drop another here"
+              : "Drop another section here"}
         </span>
       </div>
     </div>

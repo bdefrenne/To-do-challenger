@@ -117,8 +117,12 @@ async function codeCtx(_userId?: string): Promise<CodeCtx> {
   };
 }
 
-/** Resolve the current prefix for a task (board → project → owning user). */
-function resolvePrefix(row: TaskRow, ctx?: CodeCtx): string | null {
+/** Resolve the current prefix for a task (board → project → owning user). Takes
+ *  just the owning fields, so a not-yet-inserted task can resolve one too. */
+function resolvePrefix(
+  row: { boardId: string | null; projectId: string | null; userId: string },
+  ctx?: CodeCtx,
+): string | null {
   if (!ctx) return null;
   const fromBoard = row.boardId ? ctx.board.get(row.boardId) : null;
   if (fromBoard) return fromBoard;
@@ -158,6 +162,7 @@ function rowToTask(
     recurrence: row.recurrence,
     dependsOn: row.dependsOn ?? [],
     customFields: (row.customFields as Record<string, CustomFieldValue>) ?? {},
+    canvasSectionId: row.canvasSectionId ?? null,
     value: (row.value as FibPoints | null) ?? undefined,
     difficulty: (row.difficulty as FibPoints | null) ?? undefined,
     importance: clampImportance(row.importance ?? 0),
@@ -757,6 +762,10 @@ export interface CreateTaskInput {
   recurrence?: Recurrence;
   dependsOn?: string[];
   customFields?: Record<string, CustomFieldValue>;
+  /** Pin the new task to a canvas Section. Omit it — the canvas surfaces
+   *  unpinned tasks in their board's INBOX lane, so only the canvas's own
+   *  composers (which know which section you typed into) should set this. */
+  canvasSectionId?: string | null;
   value?: FibPoints;
   difficulty?: FibPoints;
   importance?: Importance;
@@ -849,6 +858,21 @@ export async function createTask(
   // code stays unlocked (soft, shows a trailing "*") until handoff / mint.
   const owner = ownerOf({ boardId, projectId, userId }, userId);
   const seq = await allocSeq(owner.scope, owner.id);
+  const ctx = await codeCtx(userId);
+  // Born straight into the working part of the spine (Analyzing+)? Then lock the
+  // code here. `updateTask`/`moveTask` only lock on a status TRANSITION, and a
+  // task created at that status never has one — so without this it would keep a
+  // soft code forever while being real work. Same freeze as `computeLockFields`,
+  // inlined because there's no row yet to hand it.
+  let ref: string | null = null;
+  let lockedAt: Date | null = null;
+  if (LOCKING_STATUSES.has(status)) {
+    const prefix =
+      resolvePrefix({ boardId, projectId, userId }, ctx) ??
+      (await ensureOwnerCode(owner, userId));
+    ref = `${prefix}-${seq}`;
+    lockedAt = new Date();
+  }
   let assigneeIds = await resolveAssignees(input.assigneeIds ?? []);
   // Starting work on it = you own it. `userId` is already a canonical account id.
   if (assignActor && WORK_STATUSES.has(status) && !assigneeIds.includes(userId)) {
@@ -866,6 +890,7 @@ export async function createTask(
       recurrence: input.recurrence,
       dependsOn: input.dependsOn ?? [],
       customFields: input.customFields ?? {},
+      canvasSectionId: input.canvasSectionId ?? null,
       value: input.value,
       difficulty: input.difficulty,
       importance: clampImportance(input.importance ?? 0),
@@ -876,10 +901,18 @@ export async function createTask(
       seq,
       position,
       completedAt: status === "done" ? new Date() : null,
+      ref,
+      refLocked: ref !== null,
+      lockedAt,
     })
     .returning();
-  await log(row.id, "created", `Created in ${STATUS_LABEL[status]}`, author);
-  return rowToTask(row, 0, [], await codeCtx(userId));
+  await log(
+    row.id,
+    "created",
+    `Created in ${STATUS_LABEL[status]}${ref ? ` · 🔒 Locked as ${ref}` : ""}`,
+    author,
+  );
+  return rowToTask(row, 0, [], ctx);
 }
 
 export interface UpdateTaskInput {
@@ -892,6 +925,10 @@ export interface UpdateTaskInput {
   recurrence?: Recurrence;
   dependsOn?: string[];
   customFields?: Record<string, CustomFieldValue>;
+  /** Pin/unpin the task on a canvas Section: an id pins it, `null` releases it
+   *  back to its board's INBOX lane. Unlike `customFields` this is a single
+   *  scalar, so re-pinning never has to read-modify-write a shared bag. */
+  canvasSectionId?: string | null;
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
   importance?: Importance;
@@ -955,6 +992,7 @@ export async function updateTask(
   if (patch.recurrence !== undefined) values.recurrence = patch.recurrence;
   if (patch.dependsOn !== undefined) values.dependsOn = patch.dependsOn;
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
+  if (patch.canvasSectionId !== undefined) values.canvasSectionId = patch.canvasSectionId;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
   if (patch.importance !== undefined) values.importance = clampImportance(patch.importance);
@@ -1047,6 +1085,11 @@ export async function moveTask(
     status?: TaskStatus;
     position?: number;
     boardId?: string | null;
+    /** Re-pin (or, with null, unpin) the task on a canvas Section. Moving to a
+     *  different board must clear a pin the caller doesn't overwrite: the old
+     *  Section is bound to the old board, so leaving the pin would render the
+     *  card in a Section for a board it no longer belongs to. */
+    canvasSectionId?: string | null;
   },
   userId: string,
   author = "You",
@@ -1131,6 +1174,15 @@ export async function moveTask(
     autoLocked = ref;
   }
 
+  // An explicit pin wins; otherwise a board change drops the stale one, because
+  // the Section it pointed at belongs to the board we just left.
+  const canvasSectionId =
+    target.canvasSectionId !== undefined
+      ? target.canvasSectionId
+      : boardChanged
+        ? null
+        : current.canvasSectionId;
+
   const [row] = await db
     .update(tasks)
     .set({
@@ -1138,6 +1190,7 @@ export async function moveTask(
       parentId,
       boardId,
       projectId,
+      canvasSectionId,
       seq,
       ref,
       refLocked,
@@ -1390,6 +1443,8 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
   if (patch.recurrence !== undefined) parts.push(`Recurrence → ${patch.recurrence}`);
   if (patch.dependsOn !== undefined) parts.push("Dependencies updated");
   if (patch.customFields !== undefined) parts.push("Custom fields updated");
+  if (patch.canvasSectionId !== undefined)
+    parts.push(patch.canvasSectionId == null ? "Removed from canvas section" : "Moved to canvas section");
   // Workflow fields — carried by the single-task edit path (not bulk).
   if (patch.plan !== undefined)
     parts.push(patch.plan == null ? "Plan cleared" : "Plan updated");
@@ -1446,6 +1501,7 @@ export async function bulkUpdate(
   if (patch.recurrence !== undefined) values.recurrence = patch.recurrence;
   if (patch.dependsOn !== undefined) values.dependsOn = patch.dependsOn;
   if (patch.customFields !== undefined) values.customFields = patch.customFields;
+  if (patch.canvasSectionId !== undefined) values.canvasSectionId = patch.canvasSectionId;
   if (patch.value !== undefined) values.value = patch.value;
   if (patch.difficulty !== undefined) values.difficulty = patch.difficulty;
   if (patch.importance !== undefined) values.importance = clampImportance(patch.importance);
@@ -1465,6 +1521,32 @@ export async function bulkUpdate(
     .where(inArray(tasks.id, ownedIds))
     .returning();
 
+  // 3b. Lock the code of anything this moved into the working spine (Analyzing+)
+  //     that wasn't locked already — the same freeze `updateTask`/`moveTask` do,
+  //     so a task can't reach committed work with a soft code whichever path it
+  //     took. Can't ride the bulk UPDATE above: every ref is per-task (its own
+  //     prefix + seq), so it's one write each — but only for those that need it,
+  //     and only ever once per task.
+  const codes = await codeCtx(userId);
+  const relocked = new Map<string, TaskRow>();
+  if (patch.status !== undefined && LOCKING_STATUSES.has(patch.status)) {
+    for (const r of rows) {
+      const lock = await computeLockFields(r, userId, codes);
+      if (!lock) continue;
+      const [row] = await db
+        .update(tasks)
+        .set({
+          ref: lock.ref,
+          refLocked: true,
+          lockedAt: lock.lockedAt,
+          seq: lock.seq,
+        })
+        .where(and(eq(tasks.id, r.id), eq(tasks.refLocked, false)))
+        .returning();
+      if (row) relocked.set(r.id, row);
+    }
+  }
+
   // 4. One batched INSERT into the activity log — a trail row per task.
   const constMsg = describeBulkPatch(patch);
   const priorStatus = new Map(owned.map((r) => [r.id, r.status]));
@@ -1476,6 +1558,8 @@ export async function bulkUpdate(
         `Status: ${STATUS_LABEL[priorStatus.get(r.id)!]} → ${STATUS_LABEL[patch.status]}`,
       );
     if (constMsg) parts.push(constMsg);
+    const ref = relocked.get(r.id)?.ref;
+    if (ref) parts.push(`🔒 Locked as ${ref}`);
     return {
       taskId: r.id,
       kind: "updated" as const,
@@ -1487,12 +1571,16 @@ export async function bulkUpdate(
   });
   if (logRows.length) await db.insert(taskLogs).values(logRows);
 
-  // 5. Shape the refreshed tasks (comment counts, like updateTask).
+  // 5. Shape the refreshed tasks (comment counts, like updateTask), preferring
+  //     the post-lock row for anything 3b froze. `codes` is passed so soft codes
+  //     resolve their prefix — without it every `code` came back undefined.
   const counts = await commentCounts(userId);
   return {
     updated: rows.length,
     skipped,
-    tasks: rows.map((r) => rowToTask(r, counts.get(r.id) ?? 0)),
+    tasks: rows.map((r) =>
+      rowToTask(relocked.get(r.id) ?? r, counts.get(r.id) ?? 0, [], codes),
+    ),
   };
 }
 

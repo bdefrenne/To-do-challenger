@@ -62,6 +62,7 @@ export const createTaskSchema = z.object({
   recurrence: recurrenceSchema.optional(),
   dependsOn: dependsOnSchema.optional(),
   customFields: customFieldsSchema.optional(),
+  canvasSectionId: z.string().nullable().optional(),
   value: fibSchema.optional(),
   difficulty: fibSchema.optional(),
   importance: importanceSchema.optional(),
@@ -80,6 +81,7 @@ export const updateTaskSchema = z
     recurrence: recurrenceSchema,
     dependsOn: dependsOnSchema,
     customFields: customFieldsSchema,
+    canvasSectionId: z.string().nullable(),
     value: fibSchema.nullable(),
     difficulty: fibSchema.nullable(),
     importance: importanceSchema,
@@ -123,6 +125,9 @@ export const moveTaskSchema = z.object({
   status: statusSchema.optional(),
   position: z.number().optional(),
   boardId: z.string().nullable().optional(),
+  /** Re-pin/unpin on a canvas Section. Omitted on a board change means "clear
+   *  it" — see moveTask. */
+  canvasSectionId: z.string().nullable().optional(),
 });
 
 export const commentSchema = z.object({
