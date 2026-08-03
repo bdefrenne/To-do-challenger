@@ -21,7 +21,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useMyPresence, useOthers, useSelf } from "@liveblocks/react";
+import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT, Task } from "@/lib/types";
 import {
   type OutlineRow,
@@ -148,13 +148,28 @@ export function SectionNode({
   // publish `editing`, and peers show a lock + can't open the outline — so two
   // people don't batch-save the same section over each other. Presence is
   // ephemeral, so the lock auto-releases if their tab closes.
-  const [, updateMyPresence] = useMyPresence();
-  const others = useOthers();
-  const editingPeer = others.find((o) => o.presence.editing?.taskId === sectionId);
-  const remoteEditor = editingPeer
-    ? { name: editingPeer.info?.name ?? "Someone", color: editingPeer.info?.color ?? "#888" }
-    : null;
+  //
+  // Both subscriptions below are deliberately NARROW. `useMyPresence()` returns
+  // the value as well as the updater, so it re-renders on every presence write —
+  // including your own cursor, which is broadcast on every pointermove; and a
+  // bare `useOthers()` re-renders on ANY peer's presence change, cursors
+  // included. With a canvas full of sections that made panning unusable, and a
+  // memo boundary on the node can't help — the subscription is in here.
+  // `useUpdateMyPresence` doesn't subscribe at all, and a selector + `shallow`
+  // re-renders only when this section's own lock actually changes.
+  const updateMyPresence = useUpdateMyPresence();
+  const remoteEditor = useOthers((others) => {
+    const peer = others.find((o) => o.presence.editing?.taskId === sectionId);
+    return peer
+      ? { name: peer.info?.name ?? "Someone", color: peer.info?.color ?? "#888" }
+      : null;
+  }, shallow);
   const locked = remoteEditor !== null;
+  /** Who created this section, for the pre-bind placeholder. A primitive, so it
+   *  compares by value and cursors never touch it. */
+  const creatorName = useOthers(
+    (others) => others.find((o) => o.id === createdBy)?.info?.name ?? "Someone",
+  );
 
   // Task ids this authoring session is allowed to delete = the section's tasks
   // when authoring began, plus any it creates. Guards against deleting a task a
@@ -893,9 +908,7 @@ export function SectionNode({
           isCreator ? (
             <NameBinder onBind={bindBoard} />
           ) : (
-            <PendingSetup
-              who={others.find((o) => o.id === createdBy)?.info?.name ?? "Someone"}
-            />
+            <PendingSetup who={creatorName} />
           )
         ) : viewMode === "authoring" ? (
           <OutlineEditor

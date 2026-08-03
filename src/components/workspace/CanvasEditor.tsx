@@ -33,11 +33,11 @@ import {
 import type { CanvasNode, CanvasNodeKind } from "@/lib/types";
 import type { StoredNode } from "@/liveblocks.config";
 import {
-  CanvasNode as NodeView,
   NEW_TEXT_SIZE,
   NEW_SECTION_SIZE,
   NEW_GROUP_SIZE,
 } from "./CanvasNode";
+import { CanvasNodeHost, type NodeApi } from "./CanvasNodeHost";
 import {
   GROUP_HEADER_H,
   GROUP_PAD,
@@ -84,6 +84,17 @@ const MAX_PLACE = 480;
 const uid = () => crypto.randomUUID();
 
 /** The task ids a text note links to (drawn as connectors to their cards). */
+/** A drawn note→task connector, in canvas coords. */
+interface LinkLine {
+  key: string;
+  fromId: string;
+  taskId: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
 const linkedIdsOf = (n: { data?: Record<string, unknown> }): string[] =>
   (n.data?.linkedTaskIds as string[] | undefined) ?? [];
 
@@ -422,9 +433,7 @@ export function CanvasEditor({
     y: number;
     overTaskId: string | null;
   } | null>(null);
-  const [linkLines, setLinkLines] = useState<
-    { key: string; fromId: string; taskId: string; x1: number; y1: number; x2: number; y2: number }[]
-  >([]);
+  const [linkLines, setLinkLines] = useState<LinkLine[]>([]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
@@ -450,12 +459,18 @@ export function CanvasEditor({
   useEffect(() => void (modalOpenRef.current = openTaskIds.length > 0), [openTaskIds]);
 
   // Persist this user's own viewport (per-user, not shared with the room).
+  // DEBOUNCED: zoom and pan fire continuously, and localStorage.setItem is a
+  // synchronous main-thread write — doing it per wheel tick stalls the frame.
+  // Only the resting position matters, so settle for 200ms first.
   useEffect(() => {
-    try {
-      localStorage.setItem(`canvas-vp:${canvasId}`, JSON.stringify(viewport));
-    } catch {
-      /* ignore */
-    }
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(`canvas-vp:${canvasId}`, JSON.stringify(viewport));
+      } catch {
+        /* ignore */
+      }
+    }, 200);
+    return () => clearTimeout(t);
   }, [viewport, canvasId]);
 
   // Persist the chosen pen (per-user, like the viewport).
@@ -641,6 +656,18 @@ export function CanvasEditor({
     [sectionsKey],
   );
 
+  /** Which notes link to which tasks — geometry-free, like `sectionsKey`, so the
+   *  connector-measuring loop below isn't torn down and rebuilt on every
+   *  pointermove of a drag. Empty string ⇒ there are no links at all. */
+  const linksKey = useMemo(
+    () =>
+      nodes
+        .filter((n) => n.kind === "text" && linkedIdsOf(n).length > 0)
+        .map((n) => `${n.id}:${linkedIdsOf(n).join(",")}`)
+        .join("|"),
+    [nodes],
+  );
+
   /** Which Section shows which tasks, for this whole canvas. One pass, shared
    *  by every Section via context — see SectionMembershipContext. */
   const membership = useMemo(
@@ -738,14 +765,44 @@ export function CanvasEditor({
   }, [flush]);
 
   /* -------- coordinate transform -------- */
-  const toCanvas = useCallback((clientX: number, clientY: number) => {
+  // The container's own rect, cached. `toCanvas` runs on EVERY pointermove (the
+  // cursor broadcast), and `getBoundingClientRect` forces a synchronous layout —
+  // brutal mid-pan, when the transform has just been invalidated and the canvas
+  // holds hundreds of cards. The container is the fixed viewport element, so pan
+  // and zoom (which transform an inner div) never move it; only a window resize
+  // or page scroll can, and both are handled below.
+  const rectRef = useRef<DOMRect | null>(null);
+  const containerRect = useCallback((): DOMRect => {
+    const cached = rectRef.current;
+    if (cached) return cached;
     const rect = containerRef.current!.getBoundingClientRect();
-    const vp = vpRef.current;
-    return {
-      x: (clientX - rect.left - vp.x) / vp.scale,
-      y: (clientY - rect.top - vp.y) / vp.scale,
+    rectRef.current = rect;
+    return rect;
+  }, []);
+  useEffect(() => {
+    const invalidate = () => void (rectRef.current = null);
+    window.addEventListener("resize", invalidate);
+    window.addEventListener("scroll", invalidate, true);
+    const ro = new ResizeObserver(invalidate);
+    if (containerRef.current) ro.observe(containerRef.current);
+    return () => {
+      window.removeEventListener("resize", invalidate);
+      window.removeEventListener("scroll", invalidate, true);
+      ro.disconnect();
     };
   }, []);
+
+  const toCanvas = useCallback(
+    (clientX: number, clientY: number) => {
+      const rect = containerRect();
+      const vp = vpRef.current;
+      return {
+        x: (clientX - rect.left - vp.x) / vp.scale,
+        y: (clientY - rect.top - vp.y) / vp.scale,
+      };
+    },
+    [containerRect],
+  );
 
   /* -------- node actions -------- */
   const createNode = useCallback(
@@ -1015,7 +1072,7 @@ export function CanvasEditor({
   // frame whenever a link exists or a drag is in flight — cheap DOM reads, and
   // we only re-render when the geometry actually changes.
   useEffect(() => {
-    const anyLinks = nodes.some((n) => n.kind === "text" && linkedIdsOf(n).length > 0);
+    const anyLinks = linksKey.length > 0;
     if (!anyLinks && !linkDrag) {
       // Nothing to track — clear any stale lines on the next frame (deferred so
       // this isn't a synchronous setState in the effect body).
@@ -1025,7 +1082,22 @@ export function CanvasEditor({
       return () => cancelAnimationFrame(raf);
     }
     let raf = 0;
-    let prevKey = "";
+    let prev: LinkLine[] = [];
+    // Cache each linked card's element. `querySelector` across a canvas holding
+    // hundreds of cards, once per link per FRAME, was the dominant cost here.
+    // Revalidated by `isConnected`, so a re-rendered card is re-found rather
+    // than held stale.
+    const els = new Map<string, HTMLElement>();
+    const cardEl = (inner: HTMLElement, taskId: string): HTMLElement | null => {
+      const hit = els.get(taskId);
+      if (hit?.isConnected) return hit;
+      const found = inner.querySelector(
+        `[data-task-id="${CSS.escape(taskId)}"]`,
+      ) as HTMLElement | null;
+      if (found) els.set(taskId, found);
+      else els.delete(taskId);
+      return found;
+    };
     const measure = () => {
       const inner = innerRef.current;
       if (inner) {
@@ -1040,9 +1112,7 @@ export function CanvasEditor({
           const noteCx = node.x + node.width / 2;
           const noteCy = node.y + node.height / 2;
           for (const taskId of ids) {
-            const el = inner.querySelector(
-              `[data-task-id="${CSS.escape(taskId)}"]`,
-            ) as HTMLElement | null;
+            const el = cardEl(inner, taskId);
             if (!el) continue; // linked task isn't on this canvas — skip its line
             const r = el.getBoundingClientRect();
             const taskRect = {
@@ -1066,9 +1136,22 @@ export function CanvasEditor({
             });
           }
         }
-        const key = JSON.stringify(out);
-        if (key !== prevKey) {
-          prevKey = key;
+        // Field compare rather than JSON.stringify — this runs every frame, and
+        // the whole point is to NOT re-render when the geometry is unchanged.
+        const changed =
+          out.length !== prev.length ||
+          out.some((l, i) => {
+            const q = prev[i];
+            return (
+              l.key !== q.key ||
+              l.x1 !== q.x1 ||
+              l.y1 !== q.y1 ||
+              l.x2 !== q.x2 ||
+              l.y2 !== q.y2
+            );
+          });
+        if (changed) {
+          prev = out;
           setLinkLines(out);
         }
       }
@@ -1076,19 +1159,27 @@ export function CanvasEditor({
     };
     raf = requestAnimationFrame(measure);
     return () => cancelAnimationFrame(raf);
-  }, [nodes, linkDrag]);
+    // Keyed on `linksKey`, not `nodes`: the loop reads `nodesRef.current`, so
+    // depending on `nodes` only tore the loop down and rebuilt it on every
+    // pointermove of every drag.
+  }, [linksKey, linkDrag]);
 
   /* -------- zoom -------- */
-  const zoomAt = useCallback((clientX: number, clientY: number, factor: number) => {
-    setViewport((vp) => {
-      const rect = containerRef.current!.getBoundingClientRect();
-      const mx = clientX - rect.left;
-      const my = clientY - rect.top;
-      const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, vp.scale * factor));
-      const k = next / vp.scale;
-      return { scale: next, x: mx - (mx - vp.x) * k, y: my - (my - vp.y) * k };
-    });
-  }, []);
+  const zoomAt = useCallback(
+    (clientX: number, clientY: number, factor: number) => {
+      // Cached rect: a wheel-driven zoom fires continuously, and reading it live
+      // forces a layout flush per tick right after the transform changed.
+      const rect = containerRect();
+      setViewport((vp) => {
+        const mx = clientX - rect.left;
+        const my = clientY - rect.top;
+        const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, vp.scale * factor));
+        const k = next / vp.scale;
+        return { scale: next, x: mx - (mx - vp.x) * k, y: my - (my - vp.y) * k };
+      });
+    },
+    [containerRect],
+  );
 
   useEffect(() => {
     const el = containerRef.current;
@@ -1560,6 +1651,58 @@ export function CanvasEditor({
     return m;
   }, [others]);
 
+  /** The node mutations handed to every CanvasNodeHost. ONE stable object: it's
+   *  part of each host's memo compare, so if this were rebuilt per render the
+   *  whole memo boundary would be pointless. Each method takes its node/id, so
+   *  nothing here closes over a particular node. */
+  const nodeApi = useMemo<NodeApi>(
+    () => ({
+      pointerDown: (e, node) => onNodePointerDown(e, node),
+      startEditing: (id) => {
+        setSelected(new Set([id]));
+        setEditingId(id);
+      },
+      stopEditing: () => setEditingId(null),
+      patch: (id, patch) =>
+        patchMany([{ id, patch: patch as Partial<StoredNode> }]),
+      resizeStart: () => history.pause(),
+      resizeEnd: () => history.resume(),
+      setMaster: (node, master) => {
+        const bid = node.data?.boardId as string | undefined;
+        const updates: { id: string; patch: Partial<StoredNode> }[] = [
+          { id: node.id, patch: { data: { ...node.data, master } } },
+        ];
+        // One master per board: marking this one demotes any sibling.
+        if (master && bid) {
+          for (const other of nodesRef.current) {
+            if (
+              other.id !== node.id &&
+              other.kind === "section" &&
+              other.data?.boardId === bid &&
+              other.data?.master === true
+            ) {
+              updates.push({
+                id: other.id,
+                patch: { data: { ...other.data, master: false } },
+              });
+            }
+          }
+        }
+        patchMany(updates);
+      },
+      remove: (id) => {
+        deleteNodes([id]);
+        setSelected((s) => {
+          const next = new Set(s);
+          next.delete(id);
+          return next;
+        });
+      },
+      linkStart: (e, node) => startLink(e, node),
+    }),
+    [onNodePointerDown, patchMany, history, deleteNodes, startLink],
+  );
+
   // The insertion caret for a pending section→group drop, derived from the slot
   // index rather than stored — so it also tracks the group as its box grows, and
   // costs nothing on the pointermoves where the slot didn't change.
@@ -1746,79 +1889,34 @@ export function CanvasEditor({
             transformOrigin: "0 0",
           }}
         >
-          {ordered.map((node) => (
-            <NodeView
-              key={node.id}
-              node={node}
-              selected={selected.has(node.id)}
-              editing={editingId === node.id}
-              smooth={!draggingIds.has(node.id)}
-              onPointerDown={(e) => onNodePointerDown(e, node)}
-              onStartEditing={() => {
-                setSelected(new Set([node.id]));
-                setEditingId(node.id);
-              }}
-              onChange={(content) => patchMany([{ id: node.id, patch: { content } }])}
-              onResize={(height) => patchMany([{ id: node.id, patch: { height } }])}
-              onStopEditing={() => setEditingId(null)}
-              onPatch={(patch) =>
-                patchMany([{ id: node.id, patch: patch as Partial<StoredNode> }])
-              }
-              scale={viewport.scale}
-              onResizeStart={() => history.pause()}
-              onResizeEnd={() => history.resume()}
-              isMaster={node.data?.master === true}
-              masterSection={(() => {
-                const bid = node.data?.boardId as string | undefined;
-                if (!bid) return null;
-                const m = masterByBoard.get(bid);
-                return m && m.id !== node.id ? m : null;
-              })()}
-              onSetMaster={(v) => {
-                const bid = node.data?.boardId as string | undefined;
-                const updates: { id: string; patch: Partial<StoredNode> }[] = [
-                  { id: node.id, patch: { data: { ...node.data, master: v } } },
-                ];
-                // One master per board: marking this one demotes any sibling.
-                if (v && bid) {
-                  for (const other of nodes) {
-                    if (
-                      other.id !== node.id &&
-                      other.kind === "section" &&
-                      other.data?.boardId === bid &&
-                      other.data?.master === true
-                    ) {
-                      updates.push({
-                        id: other.id,
-                        patch: { data: { ...other.data, master: false } },
-                      });
-                    }
-                  }
+          {ordered.map((node) => {
+            const bid = node.data?.boardId as string | undefined;
+            const master = bid ? masterByBoard.get(bid) : undefined;
+            const other = master && master.id !== node.id ? master : null;
+            return (
+              <CanvasNodeHost
+                key={node.id}
+                node={node}
+                selected={selected.has(node.id)}
+                editing={editingId === node.id}
+                smooth={!draggingIds.has(node.id)}
+                scale={viewport.scale}
+                canvasName={canvasName}
+                isMaster={node.data?.master === true}
+                masterSectionId={other?.id ?? null}
+                masterSectionName={other?.name ?? null}
+                groupMemberCount={
+                  node.kind === "section_group"
+                    ? groupMembers(nodes, node.id).length
+                    : 0
                 }
-                patchMany(updates);
-              }}
-              onRemove={() => {
-                deleteNodes([node.id]);
-                setSelected((s) => {
-                  const next = new Set(s);
-                  next.delete(node.id);
-                  return next;
-                });
-              }}
-              onLinkStart={
-                node.kind === "text" ? (e) => startLink(e, node) : undefined
-              }
-              canvasName={canvasName}
-              groupMemberCount={
-                node.kind === "section_group"
-                  ? groupMembers(nodes, node.id).length
-                  : 0
-              }
-              groupDropActive={
-                node.kind === "section_group" && groupDropTarget === node.id
-              }
-            />
-          ))}
+                groupDropActive={
+                  node.kind === "section_group" && groupDropTarget === node.id
+                }
+                api={nodeApi}
+              />
+            );
+          })}
 
           {/* Insertion caret for a pending section→group drop. Rendered after the
               nodes (later sibling, no z-index — same trick as the connector svg
