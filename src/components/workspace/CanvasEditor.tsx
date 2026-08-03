@@ -161,6 +161,19 @@ const groupMembers = (nodes: CanvasNode[], groupId: string): CanvasNode[] =>
     .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
     .sort((a, b) => a.position - b.position);
 
+/** A lane's slot in the INBOX column. Lanes used to all be created with
+ *  `position: 0`, which left their order to a tie-break (storage insertion order)
+ *  — so it could differ between clients and shuffle on reload. Derived from the
+ *  board id instead: arbitrary but STABLE everywhere, with the "No board"
+ *  catch-all pinned last. Kept well inside the fractional range the drop math
+ *  uses, so a lane can still be re-slotted by hand. */
+const lanePosition = (boardId: string | null): number => {
+  if (boardId === null) return 1000;
+  let h = 0;
+  for (let i = 0; i < boardId.length; i++) h = (h * 31 + boardId.charCodeAt(i)) % 997;
+  return h;
+};
+
 /** How far outside a group's box the drag cursor still counts as "inside" — a
  *  forgiveness band that works both ways: it captures a near-miss drop, and
  *  (since release uses the same test) gives a member free hysteresis so a
@@ -611,7 +624,7 @@ export function CanvasEditor({
         width: NEW_SECTION_SIZE.width,
         height: MIN_SECTION_HEIGHT,
         color: null,
-        position: 0,
+        position: lanePosition(boardId),
         data: {
           inbox: true,
           groupId,
@@ -620,6 +633,29 @@ export function CanvasEditor({
         },
       });
     }
+
+    // RE-ADOPT any lane that has drifted out of the group. Membership lives on
+    // the child (`data.groupId`), and several paths can clear it — deleting the
+    // INBOX group releases its members, and so does dragging a lane out. Nothing
+    // put it back: the loop above only creates lanes that are MISSING, and an
+    // orphaned lane still exists. A non-member is invisible to
+    // `computeGroupLayout`, so it kept stale coordinates forever and piled up on
+    // its neighbours. The reconciler owns these lanes, so it repairs them.
+    const repairs = existingLanes
+      .filter(
+        (n) =>
+          wantedIds.has(n.id) &&
+          (n.data?.groupId !== groupId ||
+            n.position !== lanePosition(laneBoardId(n))),
+      )
+      .map((n) => ({
+        id: n.id,
+        patch: {
+          data: { ...(n.data ?? {}), groupId } as StoredNode["data"],
+          position: lanePosition(laneBoardId(n)),
+        },
+      }));
+    if (repairs.length) patchMany(repairs);
   }, [
     nodesMap,
     nodes,
@@ -629,6 +665,7 @@ export function CanvasEditor({
     boardNames,
     putNode,
     removeMany,
+    patchMany,
   ]);
 
   /** Identity of the section set as far as membership is concerned: which
@@ -943,6 +980,11 @@ export function CanvasEditor({
         if (n?.kind !== "section_group") continue;
         for (const m of groupMembers(nodesRef.current, id)) {
           if (removing.has(m.id)) continue; // being deleted anyway
+          // An INBOX lane is owned by the reconciler, not by the user — releasing
+          // it would strand it outside any group, where nothing lays it out and
+          // nothing puts it back. Leave its `groupId` alone: the reconciler
+          // recreates the group and re-adopts the lane.
+          if (isInboxNode(m)) continue;
           const rest = { ...(m.data ?? {}) };
           delete rest.groupId;
           releases.push({ id: m.id, patch: { data: rest as StoredNode["data"] } });
@@ -1476,6 +1518,11 @@ export function CanvasEditor({
             // peer binding a board, a master toggle).
             const cur = nodesRef.current.find((n) => n.id === node.id) ?? node;
             const currentGid = cur.data?.groupId as string | undefined;
+            // An INBOX lane can be dragged around, but never re-parented: the
+            // reconciler owns which group it belongs to. Dropping it elsewhere (or
+            // outside every group) would strand it where nothing lays it out and
+            // nothing adopts it back — it would just pile up on its neighbours.
+            if (isInboxNode(cur)) return;
             if (g) {
               const siblings = groupMembers(nodesRef.current, g.id).filter(
                 (m) => m.id !== node.id,
