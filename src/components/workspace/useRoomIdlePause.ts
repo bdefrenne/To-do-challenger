@@ -44,12 +44,19 @@ const LOG = "[canvas room]";
 /** Liveblocks' own status words, in plain language. "initial" especially: it's
  *  what the client calls its idle no-socket state, which you see both before the
  *  first connect AND after we disconnect on purpose (the one state the client
- *  never leaves by itself — hence resuming being our job). */
+ *  never leaves by itself — hence resuming being our job).
+ *
+ *  Note there is NO status word for "parked in the background": when the client
+ *  parks a hidden tab's socket itself (backgroundKeepAliveTimeout) it uses an
+ *  internal zombie state that reports as connecting/reconnecting. So a
+ *  connected → connecting → connected run with no `initial` and no "pausing"
+ *  line is the client closing and reopening the socket on its own — which is
+ *  why each line also prints the tab's visibility. */
 const STATUS_NOTE: Record<string, string> = {
-  initial: "no socket — not opened yet, or closed on purpose",
-  connecting: "opening the socket",
+  initial: "no socket — not opened yet, or closed on purpose by the idle pause",
+  connecting: "no live socket — opening one, or parked while the tab is hidden",
   connected: "live — billing realtime minutes",
-  reconnecting: "socket dropped, retrying",
+  reconnecting: "no live socket — dropped or parked, will reopen",
   disconnected: "gave up — a real failure",
 };
 
@@ -82,11 +89,20 @@ export function useRoomIdlePause(): { paused: boolean; resume: () => void } {
   useEffect(() => void (syncRef.current = syncStatus), [syncStatus]);
 
   // Every connection transition, whoever caused it — us, the client's own
-  // hidden-tab parking, or a real network drop.
-  useEffect(
-    () => void console.info(`${LOG} ${status} — ${STATUS_NOTE[status] ?? "?"}`),
-    [status],
-  );
+  // hidden-tab parking, or a real network drop. The tab's visibility and how
+  // long the previous status held are what tell those three apart, since the
+  // status word alone can't (see STATUS_NOTE).
+  const statusSinceRef = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    const held = statusSinceRef.current
+      ? `held ${Math.round((now - statusSinceRef.current) / 1000)}s`
+      : "first";
+    statusSinceRef.current = now;
+    console.info(
+      `${LOG} ${status} — ${STATUS_NOTE[status] ?? "?"} · tab ${document.visibilityState} · prev ${held}`,
+    );
+  }, [status]);
 
   const resumeWith = useCallback(
     (reason: string) => {
