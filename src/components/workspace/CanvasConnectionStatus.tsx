@@ -12,8 +12,13 @@
  *
  * This overlay makes the failure visible instead:
  *   • healthy (connected + storage loaded) → renders nothing
+ *   • paused on purpose (idle, see useRoomIdlePause) → "resume" pill
  *   • connecting / reconnecting            → small non-blocking pill
  *   • hard failure                         → blocking card with the real error
+ *
+ * It also OWNS the idle pause (useRoomIdlePause) — it's already the component
+ * that watches the room's connection, and the paused state is a connection
+ * state like any other here.
  *
  * It must be mounted INSIDE the <RoomProvider> so the room hooks have context.
  * (No Postgres fallback here by design — we only surface the error.)
@@ -24,13 +29,18 @@ import {
   useStatus,
   useErrorListener,
   useLostConnectionListener,
-  useStorage,
+  useStorageRoot,
 } from "@liveblocks/react";
+import { useRoomIdlePause } from "./useRoomIdlePause";
 
 export function CanvasConnectionStatus() {
   const status = useStatus();
-  // useStorage returns null until storage has actually synced from the room.
-  const storageLoaded = useStorage((root) => root.nodes) != null;
+  // Storage root is null until storage has actually synced from the room. (Root
+  // identity — not `root.nodes` — so this component doesn't re-render on every
+  // node change on the canvas.)
+  const [root] = useStorageRoot();
+  const storageLoaded = root != null;
+  const { paused, resume } = useRoomIdlePause();
   const [error, setError] = useState<{ message: string; code?: number } | null>(null);
   const [lost, setLost] = useState<"lost" | "failed" | null>(null);
 
@@ -50,6 +60,29 @@ export function CanvasConnectionStatus() {
   // any stale error/lost flag from an earlier cycle (a genuine re-break fires a
   // fresh error/status change). Avoids resetting state in an effect.
   if (status === "connected" && storageLoaded) return null;
+
+  // Paused on purpose (idle) — checked BEFORE hardFailure: an intentional pause
+  // leaves status "initial" with storage still in hand, and a stale error/lost
+  // flag from an earlier cycle must not turn it into the blocking card. If the
+  // resume itself fails, a fresh error/lost event brings the card back.
+  if (paused) {
+    return (
+      <div className="absolute bottom-3 left-1/2 z-50 -translate-x-1/2">
+        <button
+          type="button"
+          onClick={resume}
+          // Precise on purpose: task cards keep refreshing from Postgres (the
+          // workspace poll doesn't touch Liveblocks), so what's actually frozen
+          // is the canvas layout and where everyone is.
+          title="Paused while you were away, to save realtime minutes. Task cards still refresh; the canvas layout and teammates' cursors don't. Click, or just start editing, to reconnect."
+          className="flex items-center gap-2 rounded-full border border-border bg-surface/90 px-3 py-1 text-xs text-muted shadow-sm backdrop-blur transition-colors hover:text-fg"
+        >
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-faint" />
+          Live sync paused — click to resume
+        </button>
+      </div>
+    );
+  }
 
   const hardFailure =
     error != null || lost === "failed" || status === "disconnected";

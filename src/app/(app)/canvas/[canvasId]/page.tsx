@@ -18,6 +18,19 @@ import { CanvasConnectionStatus } from "@/components/workspace/CanvasConnectionS
 import type { StoredNode } from "@/liveblocks.config";
 import type { Canvas, CanvasNode } from "@/lib/types";
 
+/**
+ * Liveblocks bills *connection minutes* — wall-clock time a client holds an open
+ * socket, idle or not. A canvas tab left in the background used to hold its
+ * socket forever. With this set, a hidden tab with nothing pending parks the
+ * socket (`@idle.zombie`) and the client re-opens it by itself when the tab is
+ * shown again. Must stay a module constant: LiveblocksProvider freezes its
+ * options into a single `createClient` on first render.
+ *
+ * The visible-but-untouched case (canvas parked on a second monitor) is NOT
+ * covered here — the client only parks hidden tabs. See `useRoomIdlePause`.
+ */
+const BACKGROUND_KEEP_ALIVE_MS = 60_000;
+
 function toStored(n: CanvasNode): StoredNode {
   return {
     id: n.id,
@@ -116,10 +129,13 @@ export default function CanvasPage() {
             <p className="text-sm text-faint">Loading canvas…</p>
           </div>
         ) : (
-          <LiveblocksProvider authEndpoint="/api/liveblocks-auth">
+          <LiveblocksProvider
+            authEndpoint="/api/liveblocks-auth"
+            backgroundKeepAliveTimeout={BACKGROUND_KEEP_ALIVE_MS}
+          >
             <RoomProvider
               id={`canvas:${canvasId}`}
-              initialPresence={{ cursor: null, selection: [], editing: null }}
+              initialPresence={{ cursor: null, selection: [], editing: null, view: null }}
               initialStorage={initialStorage}
             >
               <CanvasEditor canvasId={canvasId} canvasName={name} />

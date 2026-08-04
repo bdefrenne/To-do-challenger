@@ -19,6 +19,8 @@ import type {
   NoteType,
   TaskCommit,
 } from "@/lib/types";
+import { compareTaskOrder, insertRelative } from "@/lib/task-order";
+import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
 
 /*
   ====================================================================
@@ -62,6 +64,10 @@ export interface TaskNode {
   status: TaskStatus;
   statusSince: string; // ISO — when it entered the current status
   position: number;
+  /** Creation time — the tiebreak that makes `position` a total order. Carried
+   *  on the node so any list can be sorted with `compareTaskOrder` without
+   *  reaching into `taskMap`. */
+  createdAt: string; // ISO
 }
 
 interface WorkspaceContextValue {
@@ -224,6 +230,10 @@ interface WorkspaceContextValue {
   /** Force-reload tasks + projects now (e.g. after a canvas Section commits a
    *  batch of tasks directly via /api/tasks/bulk, bypassing the mutate layer). */
   refresh: () => Promise<void>;
+  /** Send a batch to /api/tasks/bulk. Chunks past the server's cap, reports any
+   *  op that failed, and returns results index-aligned with the ops you passed.
+   *  Use this rather than fetching the endpoint directly. */
+  bulk: (operations: unknown[]) => Promise<OpResult[]>;
   /** Subscribe to LOCAL task-data mutations (the canvas Liveblocks bridge uses
    *  this to broadcast a "tasks-changed" ping to peers). Returns an unsubscribe. */
   subscribeLocalChange: (cb: (s: ChangeSignal) => void) => () => void;
@@ -497,6 +507,7 @@ export function WorkspaceProvider({
           status: t.status,
           statusSince: t.statusSince,
           position: t.position,
+          createdAt: t.createdAt,
         })),
       );
       // Re-apply unconfirmed live edits (Phase 2) so a deferred DB write or an
@@ -670,10 +681,15 @@ export function WorkspaceProvider({
         opts?.onSuccess?.(result);
       } catch (e) {
         console.error("[workspace] mutation failed", e);
-        // Optimistic-concurrency conflict: another writer changed the task
-        // first. The finally-refetch below pulls their version; tell the user.
-        if (e instanceof ApiError && e.status === 409)
-          setNotice("This task changed elsewhere — reloaded with the latest version.");
+        // Never fail silently: the finally-refetch below reverts the optimistic
+        // update, and a card sliding back with no explanation is indistinguishable
+        // from the app losing your change. A 409 gets the specific story (another
+        // writer won); everything else gets the generic one.
+        setNotice(
+          e instanceof ApiError && e.status === 409
+            ? "This task changed elsewhere — reloaded with the latest version."
+            : "Couldn’t save that — reloaded the latest.",
+        );
       } finally {
         inflight.current--;
         // Only the last op in a burst reconciles (fewer fetches); the guard in
@@ -691,6 +707,51 @@ export function WorkspaceProvider({
     [fetchAll, refreshVersion, emitLocalChange],
   );
 
+  /**
+   * POST a batch to `/api/tasks/bulk` — the ONE way this app sends bulk ops.
+   *
+   * `bulkApply` is best-effort by design: it runs each op independently, reports
+   * per-op failures as `{ok:false}` in `results`, and answers 200 either way (the
+   * MCP and Telegram callers read that body). Two traps come with it, and this
+   * helper is where they're handled once instead of at every call site:
+   *
+   *   • **Silent truncation.** Anything past `MAX_BULK_OPS` is dropped with no
+   *     `results` entry at all. Restamping a big section, or moving a deep
+   *     subtree across boards, can exceed it. So the batch is CHUNKED here —
+   *     sequentially, because ops read the state earlier ops wrote (`nextPosition`,
+   *     parent existence), so the order has to hold.
+   *   • **Silent partial failure.** A 200 with `ok:false` entries never throws, so
+   *     callers saw success. Now it tells the user.
+   *
+   * Returns every result, INDEX-ALIGNED with `operations` — callers rely on that
+   * to match a created task's new id back to the row that asked for it. Ops that
+   * failed keep their slot (`ok:false`), so alignment survives a partial batch.
+   */
+  const bulk = useCallback(async (operations: unknown[]): Promise<OpResult[]> => {
+    const results: OpResult[] = [];
+    for (let i = 0; i < operations.length; i += MAX_BULK_OPS) {
+      const { results: chunk, truncated } = await api<{
+        results: OpResult[];
+        truncated: boolean;
+      }>("/api/tasks/bulk", {
+        method: "POST",
+        body: JSON.stringify({ operations: operations.slice(i, i + MAX_BULK_OPS) }),
+      });
+      results.push(...(chunk ?? []));
+      // Chunking is sized to the server's cap, so this can't happen — if it ever
+      // does the cap moved, and ops are being dropped on the floor again.
+      if (truncated) console.error("[workspace] bulk truncated despite chunking");
+    }
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length) {
+      console.error("[workspace] bulk ops failed", failed);
+      setNotice(
+        `${failed.length} of ${results.length} change${results.length === 1 ? "" : "s"} didn’t save — reloaded the latest.`,
+      );
+    }
+    return results;
+  }, []);
+
   /** Like `mutate`, but for project/board changes — reconciles the sidebar. */
   const mutateProjects = useCallback(
     async (serverCall: () => Promise<unknown>) => {
@@ -700,6 +761,7 @@ export function WorkspaceProvider({
         await serverCall();
       } catch (e) {
         console.error("[workspace] project mutation failed", e);
+        setNotice("Couldn’t save that — reloaded the latest.");
       } finally {
         inflight.current--;
         if (inflight.current === 0) {
@@ -854,8 +916,11 @@ export function WorkspaceProvider({
       await Promise.all(edits.map(([id, patch]) => patchTask(id, patch)));
     } catch (e) {
       console.error("[workspace] edit flush failed", e);
-      if (e instanceof ApiError && e.status === 409)
-        setNotice("This task changed elsewhere — reloaded with the latest version.");
+      setNotice(
+        e instanceof ApiError && e.status === 409
+          ? "This task changed elsewhere — reloaded with the latest version."
+          : "Couldn’t save your edit — reloaded the latest.",
+      );
     } finally {
       inflight.current--;
       await fetchAll(); // overlay reconciles: confirmed patches drop out
@@ -1008,35 +1073,75 @@ export function WorkspaceProvider({
       return;
     }
 
-    // before/after: same parent as target, adopt its status, fractional pos.
-    const status = target.status;
-    const siblings = nodes
-      .filter((n) => n.id !== dragId && n.parentId === target.parentId && n.status === status)
-      .sort((a, b) => a.position - b.position);
-    const ti = siblings.findIndex((s) => s.id === targetId);
-    let position: number;
-    if (pos === "before") {
-      const prev = siblings[ti - 1];
-      position = prev ? (prev.position + target.position) / 2 : target.position - 1;
-    } else {
-      const next = siblings[ti + 1];
-      position = next ? (target.position + next.position) / 2 : target.position + 1;
-    }
+    // before/after: land the card at the drop index by RESTAMPING the run it was
+    // dropped into with dense positions — not by interpolating a gap, which ties
+    // make degenerate (see `insertRelative`).
+    //
+    // Which run depends on the surface, and it must be the one on SCREEN:
+    //   • canvas — the target's section members at this parent. A section mixes
+    //     statuses, so a same-status list would be neighbours the user can't see.
+    //   • table  — same-parent, same-status rows, as rendered under its status
+    //     headers.
+    // That split also decides status: the table's rows ARE grouped into status
+    // columns, so dropping into one means "put it in this column". A section is
+    // not a status container, so a reorder there must leave status alone —
+    // otherwise dragging a card past a Done one silently completes it.
+    const section = placement?.sectionOf(targetId) ?? null;
+    const members = section ? placement?.membersOf(section) : null;
+    const adoptStatus = members ? undefined : target.status;
+    const run = nodes
+      .filter(
+        (n) =>
+          n.parentId === target.parentId &&
+          (members ? members.has(n.id) : n.status === target.status),
+      )
+      .sort(compareTaskOrder);
+
+    const currentIds = run.map((n) => n.id);
+    const orderedIds = insertRelative(currentIds, dragId, targetId, pos);
+    // Nothing to do: same sequence, same parent, same status (dropping a card
+    // right back where it already sits).
+    if (
+      orderedIds.join() === currentIds.join() &&
+      drag.parentId === target.parentId &&
+      (adoptStatus === undefined || drag.status === adoptStatus)
+    )
+      return;
+    const posById = new Map(orderedIds.map((id, i) => [id, i]));
+    const byId = new Map(run.map((n) => [n.id, n]));
+    // Only the cards that actually shift are written. A run restamped once is
+    // already dense, so later reorders touch just the span that moved.
+    const ops = orderedIds
+      .filter((id) => id === dragId || byId.get(id)?.position !== posById.get(id))
+      .map((id) => ({
+        op: "move",
+        id,
+        target:
+          id === dragId
+            ? {
+                position: posById.get(id),
+                parentId: target.parentId,
+                ...(adoptStatus ? { status: adoptStatus } : {}),
+              }
+            : { position: posById.get(id) },
+      }));
 
     mutate(
       () =>
         setNodes((prev) =>
-          prev.map((n) =>
-            n.id === dragId
-              ? { ...n, parentId: target.parentId, status, position }
-              : n,
-          ),
+          prev.map((n) => {
+            const position = posById.get(n.id);
+            if (position === undefined) return n;
+            return {
+              ...n,
+              position,
+              ...(n.id === dragId
+                ? { parentId: target.parentId, ...(adoptStatus ? { status: adoptStatus } : {}) }
+                : {}),
+            };
+          }),
         ),
-      () =>
-        api(`/api/tasks/${dragId}/move`, {
-          method: "POST",
-          body: JSON.stringify({ parentId: target.parentId, status, position }),
-        }),
+      () => bulk(ops),
     );
   }
 
@@ -1085,10 +1190,15 @@ export function WorkspaceProvider({
     const sectionSiblings = (parentId: string | null) =>
       nodes
         .filter((n) => !inSubtree.has(n.id) && n.parentId === parentId && inTarget(n.id))
-        .sort((a, b) => a.position - b.position);
+        .sort(compareTaskOrder);
 
     let parentId: string | null;
     let position: number;
+    // `restamp` carries the target run's new dense positions when the drop was
+    // aimed BETWEEN two cards. Appends don't need it — the end of a run is
+    // unambiguous — but an insert does: interpolating a gap is degenerate
+    // whenever the neighbours tie, which is routine here (see `insertRelative`).
+    let restamp: Map<string, number> | null = null;
     if (rel?.pos === "inside") {
       parentId = rel.targetId;
       const sibs = sectionSiblings(parentId);
@@ -1098,14 +1208,14 @@ export function WorkspaceProvider({
       if (!target) return;
       parentId = target.parentId;
       const sibs = sectionSiblings(parentId);
-      const ti = sibs.findIndex((s) => s.id === rel.targetId);
-      if (rel.pos === "before") {
-        const prev = sibs[ti - 1];
-        position = prev ? (prev.position + target.position) / 2 : target.position - 1;
-      } else {
-        const next = sibs[ti + 1];
-        position = next ? (target.position + next.position) / 2 : target.position + 1;
-      }
+      const orderedIds = insertRelative(
+        sibs.map((n) => n.id),
+        dragId,
+        rel.targetId,
+        rel.pos,
+      );
+      restamp = new Map(orderedIds.map((id, i) => [id, i]));
+      position = restamp.get(dragId)!;
     } else {
       parentId = null;
       const sibs = sectionSiblings(null);
@@ -1122,7 +1232,13 @@ export function WorkspaceProvider({
     // and nothing for a concurrent writer to clobber. Only the root is re-pinned;
     // descendants follow it by inheritance, so any pin THEY carry from an earlier
     // drag is cleared to keep them with their parent.
-    const ops: unknown[] = [{ op: "update", id: dragId, patch: { canvasSectionId: targetPin } }];
+    //
+    // The root's pin rides on its own `move` op below rather than a separate
+    // `update`: `moveTask` CLEARS the pin when the board changes unless the call
+    // states one, so a pin written by an earlier op in the batch was undone by the
+    // move that followed it — a cross-board drop landed in the INBOX lane instead
+    // of the section it was dropped on. One op, whole intent.
+    const ops: unknown[] = [];
     for (const id of subtree) {
       if (id === dragId) continue;
       if ((taskMap[id]?.canvasSectionId ?? null) !== null)
@@ -1140,8 +1256,24 @@ export function WorkspaceProvider({
     ops.push({
       op: "move",
       id: dragId,
-      target: { parentId, position, ...(boardChanged ? { boardId: targetBoardId } : {}) },
+      target: {
+        parentId,
+        position,
+        canvasSectionId: targetPin,
+        ...(boardChanged ? { boardId: targetBoardId } : {}),
+      },
     });
+    // Restamp the rest of the target run, so the index the card was dropped at is
+    // a real position rather than a tie. Only cards that actually shift are
+    // written; a run restamped once is dense, so later inserts touch only the
+    // span that moved.
+    if (restamp) {
+      for (const [id, p] of restamp) {
+        if (id === dragId) continue;
+        if (nodes.find((n) => n.id === id)?.position === p) continue;
+        ops.push({ op: "move", id, target: { position: p } });
+      }
+    }
 
     mutate(
       () => {
@@ -1163,15 +1295,13 @@ export function WorkspaceProvider({
             if (n.id === dragId)
               return { ...n, parentId, position, ...(boardChanged ? { boardId: targetBoardId } : {}) };
             if (boardChanged && inSubtree.has(n.id)) return { ...n, boardId: targetBoardId };
+            const restamped = restamp?.get(n.id);
+            if (restamped !== undefined) return { ...n, position: restamped };
             return n;
           }),
         );
       },
-      () =>
-        api("/api/tasks/bulk", {
-          method: "POST",
-          body: JSON.stringify({ operations: ops }),
-        }),
+      () => bulk(ops),
     );
   }
 
@@ -1374,7 +1504,7 @@ export function WorkspaceProvider({
         }));
         setNodes((prev) => [
           ...prev,
-          { id: tempId, parentId: null, boardId, status, statusSince: now, position: maxPos + 1 },
+          { id: tempId, parentId: null, boardId, status, statusSince: now, position: maxPos + 1, createdAt: now },
         ]);
       },
       () =>
@@ -1451,7 +1581,7 @@ export function WorkspaceProvider({
         }));
         setNodes((prev) => [
           ...prev,
-          { id: tempId, parentId, boardId, status: "backlog", statusSince: now, position: maxPos + 1 },
+          { id: tempId, parentId, boardId, status: "backlog", statusSince: now, position: maxPos + 1, createdAt: now },
         ]);
       },
       () =>
@@ -1683,7 +1813,7 @@ export function WorkspaceProvider({
   }
 
   const childrenOf = (id: string | null) =>
-    nodes.filter((n) => n.parentId === id).sort((a, b) => a.position - b.position);
+    nodes.filter((n) => n.parentId === id).sort(compareTaskOrder);
   const nodeById = (id: string) => nodes.find((n) => n.id === id);
 
   return (
@@ -1741,6 +1871,7 @@ export function WorkspaceProvider({
           await refreshVersion();
           emitLocalChange();
         },
+        bulk,
         archiveAllDone,
         subscribeLocalChange,
         applyRemotePatch,

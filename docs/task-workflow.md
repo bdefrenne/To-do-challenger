@@ -80,6 +80,16 @@ prompt, or — as a backstop — the first real mutation. A "real" task can neve
 exist without a locked code, and in practice you only ever paste a code that's
 already frozen.
 
+The handoff also **assigns the human** who took it (merged, so anyone already on
+the task stays). The same is true of the status spine: entering **Analyzing** or
+**Building** from any agent surface — Claude over MCP, a bearer-token script, the
+Telegram bot — records the acting user, whichever tool did it (`update_task`,
+`move_task`, `bulk_update`, `bulk_apply`, or a task created straight into a work
+status). The rule lives at the service-layer chokepoint and reads the surface off
+the ambient request context, so no path can opt out by forgetting to ask. The web
+UI is the deliberate exception — dragging a card across a column isn't claiming
+it — and every implicit assignment says so on the activity timeline.
+
 > **The protocol lives in the MCP layer, not the UI.** Because Path B has no
 > board in the loop, every lifecycle rule below (lock, set timestamps, log
 > decisions, reconcile at finish) is taught by the MCP **tool and prompt

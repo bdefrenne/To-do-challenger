@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import type { Board, Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
+import { compareTaskOrder } from "@/lib/task-order";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskCard, TASK_DND_MIME } from "./TaskCard";
 import { BoardModal } from "./BoardModal";
@@ -206,7 +207,7 @@ function BoardColumn({
                 n.parentId === null &&
                 n.status === status,
             )
-            .sort((a, b) => a.position - b.position);
+            .sort(compareTaskOrder);
           return (
             <StatusSection
               key={status}

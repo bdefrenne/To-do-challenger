@@ -15,6 +15,7 @@
 
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
+import { isInboxNode, isThisWeekGroup } from "@/lib/sections";
 
 /** How a group arranges its members: a vertical column ("portrait", the
  *  default) or a horizontal row ("landscape" / paysage). */
@@ -76,6 +77,7 @@ export function SectionGroupNode({
   onStopEditing,
   onRemove,
   onToggleLayout,
+  onSetThisWeek,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -92,10 +94,15 @@ export function SectionGroupNode({
   onRemove?: () => void;
   /** Flip portrait ⇄ landscape; the editor re-derives the arrangement. */
   onToggleLayout?: (layout: GroupLayout) => void;
+  /** Mark/unmark this group as THIS WEEK — one per canvas; the editor demotes
+   *  any other when this one is marked. */
+  onSetThisWeek?: (thisWeek: boolean) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const layout = groupLayoutOf(node);
   const landscape = layout === "landscape";
+  const isInbox = isInboxNode(node);
+  const thisWeek = isThisWeekGroup(node);
 
   // Focus + select the name when entering edit mode, so a fresh group (or a
   // re-edit) lets you type the name straight away.
@@ -165,6 +172,42 @@ export function SectionGroupNode({
             {title || <span className="text-faint">Untitled group</span>}
           </span>
         )}
+        {/* Readable at canvas zoom, where the star below is a few pixels wide. */}
+        {thisWeek && !editing ? (
+          <span className="shrink-0 rounded-md bg-accent-soft px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-accent">
+            This week
+          </span>
+        ) : null}
+        {/* THIS WEEK star — the group-level twin of a section's master star.
+            Marks the one group agents file this week's work into (see
+            resolveThisWeekSection). Hidden on the INBOX tray: it's the OTHER
+            destination, the pile of things nobody has scheduled. */}
+        {onSetThisWeek && !isInbox ? (
+          <button
+            type="button"
+            title={
+              thisWeek
+                ? "THIS WEEK — new tasks marked “this week” are filed here (click to unset)"
+                : "Make this the THIS WEEK board — where agents file work for this week"
+            }
+            aria-label={thisWeek ? "Unset as this week's board" : "Make this the this-week board"}
+            aria-pressed={thisWeek}
+            onPointerDown={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSetThisWeek(!thisWeek);
+            }}
+            className={[
+              "shrink-0 rounded-md border px-1.5 py-1 text-sm leading-none transition-colors",
+              thisWeek
+                ? "border-accent bg-accent-soft text-accent"
+                : "border-border text-faint hover:border-accent hover:text-accent",
+            ].join(" ")}
+          >
+            {thisWeek ? "★" : "☆"}
+          </button>
+        ) : null}
         {onToggleLayout ? (
           <button
             type="button"

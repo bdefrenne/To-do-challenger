@@ -264,6 +264,7 @@ export interface TaskLogEntry {
   author?: string;
   /** The real acting user's account id (absent on legacy rows). */
   actorId?: string;
-  /** Which surface produced the event: web UI, API/script, or Claude (MCP). */
-  source?: "ui" | "api" | "mcp";
+  /** Which surface produced the event: web UI, API/script, Claude (MCP), or the
+   *  Telegram bot. */
+  source?: "ui" | "api" | "mcp" | "telegram";
 }

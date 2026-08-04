@@ -29,7 +29,22 @@ different people/AIs, or by you end to end.
 
 Moving a task into **Analyzing or Building auto-assigns it to you** (the user
 you're working with), so the board records who's on it — no need to assign
-yourself by hand. Existing assignees are kept.
+yourself by hand. Existing assignees are kept. This holds for **every** tool
+that sets the status — \`update_task\`, \`create_task\`, \`move_task\`,
+\`bulk_update\`, \`bulk_apply\` — so you can't start work without the board
+recording who it's for. Taking a handoff assigns you too (\`work_on_task\`,
+\`lock_task\`, or the human clicking Copy prompt), even when the status hasn't
+moved yet.
+
+**Where a task lands on the canvas.** New tasks go to their board's **INBOX**
+lane — the pile of things for later. When something is meant to be done **this
+week**, or you're **starting on it now**, it belongs on the **THIS WEEK** board
+instead: pass \`thisWeek: true\` to \`create_task\` / \`update_task\`. Setting the
+status to Analyzing or beyond already does this for a task nobody has filed by
+hand, so the normal "create it, then start work" flow needs nothing extra. Pass
+\`thisWeek: false\` when the user says it's for later — that's what keeps INBOX
+meaningful. (If nobody has flagged a THIS WEEK group on the canvas, everything
+just stays in INBOX.)
 
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The

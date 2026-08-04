@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
+import { compareTaskOrder } from "@/lib/task-order";
 import { useWorkspace } from "./WorkspaceContext";
 import { TaskCard, TASK_DND_MIME } from "./TaskCard";
 
@@ -21,7 +22,7 @@ export function KanbanBoard({ boardId }: { boardId: string }) {
           .filter(
             (n) => n.boardId === boardId && n.parentId === null && n.status === status,
           )
-          .sort((a, b) => a.position - b.position);
+          .sort(compareTaskOrder);
         return (
           <KanbanColumn
             key={status}

@@ -23,7 +23,9 @@ export const sameCanvasNode = (a: CanvasNode, b: CanvasNode): boolean =>
   a.height === b.height &&
   a.color === b.color &&
   a.position === b.position &&
-  // `data` is free-form (boardId, groupId, master, layout, linkedTaskIds, …).
+  // `data` is free-form (boardId, groupId, master, thisWeek, layout,
+  // linkedTaskIds, …) — a deep compare here is what makes a group's THIS WEEK
+  // star and a section's master star re-render without their own props.
   // Reference check first — Liveblocks keeps it stable when untouched — so the
   // common per-pointermove path never serializes.
   (a.data === b.data || JSON.stringify(a.data ?? {}) === JSON.stringify(b.data ?? {}));

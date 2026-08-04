@@ -289,7 +289,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects).",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). PLACEMENT — where the task lands on the canvas: by default it goes to its board's INBOX lane, the pile of things for later. Pass `thisWeek: true` when it's to be done THIS WEEK, or when you're about to start on it — it's then filed on the canvas's THIS WEEK board instead. Creating it at analyzing/building already implies `thisWeek`. Pass `thisWeek: false` to force it to INBOX regardless (e.g. the user said \"later\").",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -305,16 +305,22 @@ const handler = createMcpHandler(
         description: z.string().max(10_000).optional(),
         parentId: taskHandle.optional(),
         boardId: z.string().nullable().optional(),
+        thisWeek: z
+          .boolean()
+          .optional()
+          .describe(
+            "true = file it on the canvas's THIS WEEK board (do it this week, or you're starting now); false = force it to INBOX (for later). Omit to let the status decide.",
+          ),
       },
+      // A task born into analyzing/building is assigned to the acting user by
+      // the service layer (see ASSIGNING_SOURCES — "mcp" is an agent surface).
       async (input) =>
-        // assignActor=true: a task born into analyzing/building is assigned to
-        // the acting user (the agent is starting work on it).
-        text({ task: await createTask(input, currentUser(), AI_AUTHOR, true) }),
+        text({ task: await createTask(input, currentUser(), AI_AUTHOR) }),
     );
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `thisWeek: true` moves the task onto the canvas's THIS WEEK board, `false` sends it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review does the former automatically for a task nobody has filed by hand.",
       {
         id: taskHandle,
         title: z.string().min(1).max(500).optional(),
@@ -332,6 +338,12 @@ const handler = createMcpHandler(
         analysisSummary: z.string().max(20_000).nullable().optional(),
         plan: z.string().max(20_000).nullable().optional(),
         summary: z.string().max(20_000).nullable().optional(),
+        thisWeek: z
+          .boolean()
+          .optional()
+          .describe(
+            "true = move it onto the canvas's THIS WEEK board; false = send it back to its board's INBOX lane. Omit to let the status decide.",
+          ),
         expectedUpdatedAt: z
           .string()
           .optional()
@@ -346,15 +358,14 @@ const handler = createMcpHandler(
           );
         }
         try {
+          // Moving into analyzing/building assigns the acting user — handled by
+          // the service layer for every agent surface, not passed per call.
           const task = await updateTask(
             id,
             patch,
             currentUser(),
             AI_AUTHOR,
             expectedUpdatedAt,
-            // assignActor=true: moving a task into analyzing/building assigns
-            // the acting user (the agent is starting work on it).
-            true,
           );
           return task ? text({ task }) : text({ error: "Task not found" });
         } catch (e) {
@@ -367,13 +378,16 @@ const handler = createMcpHandler(
 
     server.tool(
       "move_task",
-      "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), and/or position.",
+      "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), canvasSectionId (pin to a canvas Section, or null to unpin), and/or position. Moving into analyzing or building assigns you (existing assignees are kept) and locks the code, exactly as update_task does.",
       {
         id: taskHandle,
         status: statusEnum.optional(),
         parentId: taskHandle.nullable().optional(),
         boardId: z.string().nullable().optional(),
         position: z.number().optional(),
+        // Changing board CLEARS the pin unless one is stated here, so a move that
+        // means to keep the card in a Section has to say so.
+        canvasSectionId: z.string().nullable().optional(),
       },
       async ({ id, ...target }) => {
         const task = await moveTask(id, target, currentUser(), AI_AUTHOR);
@@ -468,7 +482,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "lock_task",
-      "Lock (freeze) a task's human code so it's stable to cite in commits — e.g. GH-20* becomes GH-20. Idempotent: locking an already-locked task just returns it. Normally you don't call this directly — the work_on_task prompt locks on handoff — but call it if you're about to commit work referencing a task whose code is still soft (ends with *).",
+      "Lock (freeze) a task's human code so it's stable to cite in commits — e.g. GH-20* becomes GH-20. Taking the handoff also assigns you (existing assignees are kept). Idempotent: locking an already-locked task just returns it. Normally you don't call this directly — the work_on_task prompt locks on handoff — but call it if you're about to commit work referencing a task whose code is still soft (ends with *).",
       { id: taskHandle },
       async ({ id }) => {
         const task = await mintRef(id, currentUser(), AI_AUTHOR);
@@ -826,7 +840,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "bulk_update",
-      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). Tasks you don't own are silently skipped and returned in `skipped`.",
+      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). A patch that sets analyzing or building assigns you on each task and locks its code, as update_task does. Tasks you don't own are silently skipped and returned in `skipped`.",
       { ids: z.array(taskHandle).min(1).max(500), patch: updateTaskSchema },
       async ({ ids, patch }) =>
         text(await bulkUpdate(currentUser(), ids, patch, AI_AUTHOR)),
@@ -834,7 +848,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "bulk_apply",
-      "Run an ORDERED list of mixed operations in one call — the power tool for real reorganization (build a roadmap, move some, complete a sprint). Each op is one of create/update/move/complete/comment/delete. Best-effort: a failing op is reported in `results` and the batch continues, so partial failure is visible. Capped at 200 ops (extra are dropped and flagged via `truncated`).",
+      "Run an ORDERED list of mixed operations in one call — the power tool for real reorganization (build a roadmap, move some, complete a sprint). Each op is one of create/update/move/complete/comment/delete. Ops that set analyzing or building assign you and lock the code, as the single-task tools do. Best-effort: a failing op is reported in `results` and the batch continues, so partial failure is visible. Capped at 200 ops (extra are dropped and flagged via `truncated`).",
       { operations: z.array(bulkOpSchema).min(1) },
       async ({ operations }) =>
         text(await bulkApply(currentUser(), operations, AI_AUTHOR)),
@@ -853,7 +867,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes. A node is either a `text` block (markdown in `content`) or a `section` (a titled board container whose `content` is its label). Positions/sizes are in canvas coordinates.",
+      "Get one canvas by id with all its nodes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Two groups are special: `data.inbox` marks the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere; `data.thisWeek` marks the THIS WEEK board — the group the user flagged as this week's work, and where create_task/update_task put anything you pass `thisWeek: true` (or move into analyzing/building).",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);

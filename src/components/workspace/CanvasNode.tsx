@@ -113,6 +113,7 @@ export function CanvasNode({
   onRemove,
   groupMemberCount = 0,
   groupDropActive = false,
+  onSetThisWeek,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -156,6 +157,8 @@ export function CanvasNode({
   groupMemberCount?: number;
   /** section_group-only: a section is being dragged over it right now. */
   groupDropActive?: boolean;
+  /** section_group-only: mark/unmark this group as the THIS WEEK board. */
+  onSetThisWeek?: (thisWeek: boolean) => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
@@ -271,6 +274,7 @@ export function CanvasNode({
             ? (layout) => onPatch({ data: { ...node.data, layout } })
             : undefined
         }
+        onSetThisWeek={onSetThisWeek}
       />
     );
   }

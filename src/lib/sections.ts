@@ -44,6 +44,44 @@ export const inboxGroupId = (canvasId: string): string => `inbox-${canvasId}`;
 export const inboxLaneId = (canvasId: string, boardId: string | null): string =>
   `inbox-${canvasId}-${boardId ?? "noboard"}`;
 
+/* ---------------------------- THIS WEEK ----------------------------
+ * The group-level twin of a section's `master` star. One `section_group` per
+ * canvas can be flagged THIS WEEK (`data.thisWeek`), naming the board an agent
+ * should drop work onto when it's for this week — or when the agent is starting
+ * on it right now. Everything else stays unpinned and shows up in INBOX.
+ *
+ * Unlike INBOX, this group is HAND-CURATED: the user makes it, names it, and
+ * arranges its sections. The only machine part is materialising a lane for a
+ * board the group doesn't cover yet (see `boardsNeedingWeekLane`), and even then
+ * the lane is an ordinary section afterwards — renameable, movable, deletable,
+ * and never auto-removed when it empties. */
+
+/** The `data` flag marking the one group that is "this week". */
+export const isThisWeekGroup = (n: Pick<CanvasNode, "kind" | "data">): boolean =>
+  n.kind === "section_group" && n.data?.thisWeek === true;
+
+/** The canvas's THIS WEEK group, or null. Ties break on node id so every client
+ *  agrees even if two groups somehow carry the flag. */
+export const thisWeekGroupId = (
+  canvasNodes: readonly CanvasNode[],
+): string | null => {
+  const flagged = canvasNodes.filter(isThisWeekGroup).map((n) => n.id).sort();
+  return flagged[0] ?? null;
+};
+
+/**
+ * Stable id for one board's lane inside the THIS WEEK group.
+ *
+ * Derived for the same reason INBOX lane ids are — but here it also lets the
+ * SERVER pin a task to a lane that doesn't exist yet. Canvas nodes live in
+ * Liveblocks storage, so a row the server inserts is invisible to an open canvas
+ * until storage re-hydrates; tasks, which poll, are not. So the server pins to
+ * the id the lane WILL have and the canvas materialises it on the next poll
+ * (`boardsNeedingWeekLane`), which makes the placement show up live.
+ */
+export const weekLaneId = (groupId: string, boardId: string | null): string =>
+  `wk-${groupId}-${boardId ?? "noboard"}`;
+
 /**
  * The Section a task is pinned to, or null for "not placed".
  *
@@ -161,6 +199,33 @@ export function boardsNeedingInbox(
   for (const id of unplaced) {
     const t = byId.get(id);
     if (t) boards.add(t.boardId);
+  }
+  return boards;
+}
+
+/**
+ * Which boards need a lane materialised in the THIS WEEK group: those with a
+ * task pinned to the lane's derived id (`weekLaneId`) where no such node exists.
+ *
+ * Only ever true for a pin the SERVER wrote, and only until the next reconcile:
+ * when the group already covers a board, `resolveThisWeekSection` pins to that
+ * existing section's real id instead, which never matches this pattern. A pin
+ * whose board has since changed simply stops matching and the task falls back to
+ * INBOX — the same rule as any pin that can't be resolved.
+ */
+export function boardsNeedingWeekLane(
+  canvasNodes: readonly CanvasNode[],
+  tasks: readonly PlaceableTask[],
+  taskMap: Record<string, Task>,
+): Set<string | null> {
+  const groupId = thisWeekGroupId(canvasNodes);
+  if (!groupId) return new Set();
+  const nodeIds = new Set(canvasNodes.map((n) => n.id));
+  const boards = new Set<string | null>();
+  for (const t of tasks) {
+    const pin = pinnedSectionId(taskMap[t.id]);
+    if (!pin || nodeIds.has(pin)) continue;
+    if (pin === weekLaneId(groupId, t.boardId)) boards.add(t.boardId);
   }
   return boards;
 }

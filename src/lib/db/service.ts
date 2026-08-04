@@ -37,8 +37,10 @@ import { STATUS_LABEL } from "@/lib/statuses";
 import type { PublicUser } from "./users";
 import { ConflictError, ValidationError } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
-import { currentLogContext } from "./log-context";
+import { currentLogContext, type LogSource } from "./log-context";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
+import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
+import { weekLaneId } from "@/lib/sections";
 import type {
   Task,
   TaskStatus,
@@ -260,14 +262,126 @@ const LOCKING_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "done",
 ]);
 
-/** The two *active-work* states. When an agent enters one of these it's saying
- *  "I'm on this now", so (for MCP/agent writes only — see the `assignActor`
- *  flag on createTask/updateTask) the acting user is auto-added to the
- *  assignees. Excludes the resting states (analyzed/review/done). */
+/** The two *active-work* states. Entering one is a claim — "I'm on this now" —
+ *  so it records the acting user as an assignee (see `claimsWork`). Excludes
+ *  the resting states (analyzed/review/done). */
 const WORK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "analyzing",
   "building",
 ]);
+
+/** Statuses that mean "this is in flight" — entering one auto-places the task in
+ *  the canvas's THIS WEEK group, because an agent moving a task here is doing it
+ *  NOW. Excludes `done`: finishing something is no reason to drag it onto this
+ *  week's board. Only applies to a task nobody has pinned by hand — see
+ *  `resolveThisWeekSection`. */
+const THIS_WEEK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "analyzing",
+  "analyzed",
+  "building",
+  "review",
+]);
+
+/**
+ * Where a "this week" task goes: the section for `boardId` inside the canvas's
+ * THIS WEEK group (the group flagged `data.thisWeek`), or null if no group is
+ * flagged — in which case the caller leaves the task unpinned and it shows up in
+ * INBOX as usual.
+ *
+ * An EXISTING member section for that board always wins, so the user's own lanes
+ * ("Platform", "Racing", …) are what agents drop work into. Only when the group
+ * doesn't cover the board yet do we return the DERIVED lane id (`weekLaneId`) —
+ * a node the canvas will materialise inside the group on its next reconcile.
+ * Writing the node here instead would be invisible to any open canvas, since
+ * nodes live in Liveblocks storage, not in the row we'd insert.
+ *
+ * Reads `data` straight out of jsonb: the flag is a canvas-editor toggle whose
+ * writes reach Postgres on the editor's debounced save, so it can lag a few
+ * seconds behind the star being clicked. Nothing else depends on it being
+ * instant.
+ */
+export async function resolveThisWeekSection(
+  boardId: string | null,
+): Promise<string | null> {
+  const groups = await db
+    .select({ id: canvasNodes.id, canvasId: canvasNodes.canvasId })
+    .from(canvasNodes)
+    .where(
+      and(
+        eq(canvasNodes.kind, "section_group"),
+        sql`${canvasNodes.data}->>'thisWeek' = 'true'`,
+      ),
+    )
+    .orderBy(asc(canvasNodes.id));
+  const group = groups[0];
+  if (!group) return null;
+
+  const [existing] = await db
+    .select({ id: canvasNodes.id })
+    .from(canvasNodes)
+    .where(
+      and(
+        eq(canvasNodes.canvasId, group.canvasId),
+        eq(canvasNodes.kind, "section"),
+        sql`${canvasNodes.data}->>'groupId' = ${group.id}`,
+        boardId === null
+          ? sql`${canvasNodes.data}->>'boardId' is null`
+          : sql`${canvasNodes.data}->>'boardId' = ${boardId}`,
+      ),
+    )
+    .orderBy(asc(canvasNodes.position), asc(canvasNodes.id))
+    .limit(1);
+
+  return existing?.id ?? weekLaneId(group.id, boardId);
+}
+
+/**
+ * WORK-ENTRY ASSIGNMENT — who gets recorded when a task starts moving.
+ *
+ * Surfaces where the writer is an agent acting FOR the user (Claude over MCP, a
+ * bearer-token script, the Telegram bot): entering a work status means "I'm on
+ * this now", so the actor joins the assignees and the board records who it's
+ * for. The web UI is deliberately absent — a human dragging a card across a
+ * column isn't claiming it (cf. TD-15, where forcing self-assignment on create
+ * was itself the bug); they have the picker and the SPACE shortcut.
+ *
+ * Read from the ambient request context rather than a per-call flag, for the
+ * same reason log attribution is (see log-context.ts): it's one per-request
+ * fact that ~5 mutators need, and a defaulted boolean makes every future
+ * mutator and route silently wrong. This way policy lives at the chokepoint and
+ * new code inherits it. Outside a request (seed/backfill scripts) there's no
+ * context, so nothing is assigned — fails safe.
+ */
+const ASSIGNING_SOURCES: ReadonlySet<LogSource> = new Set<LogSource>([
+  "api",
+  "mcp",
+  "telegram",
+]);
+
+/** Add the acting user to an assignee list — idempotent, order-preserving. */
+const withActor = (list: string[], userId: string) =>
+  list.includes(userId) ? list : [...list, userId];
+
+/** Does writing `status` from the current surface claim the task for its actor?
+ *  No transition check: writing "building" onto an already-building task
+ *  back-fills the actor, which is what you want when an agent picks up
+ *  something already parked in Building. */
+function claimsWork(status?: TaskStatus | null): boolean {
+  if (status == null || !WORK_STATUSES.has(status)) return false;
+  const source = currentLogContext()?.source;
+  return source !== undefined && ASSIGNING_SOURCES.has(source);
+}
+
+/** Does writing `status` from the current surface also FILE the task on THIS
+ *  WEEK's board? Same surface rule as `claimsWork`, for the same reason: an agent
+ *  moving a task into work is telling us it's this week's, while a human dragging
+ *  a card across a Kanban column would be startled to find it re-filed on the
+ *  canvas. An explicit `thisWeek` still works from every surface. */
+function statusImpliesThisWeek(status?: TaskStatus | null): boolean {
+  if (status == null || !THIS_WEEK_STATUSES.has(status)) return false;
+  const source = currentLogContext()?.source;
+  return source !== undefined && ASSIGNING_SOURCES.has(source);
+}
 
 /**
  * Compute the fields that freeze a task's soft code into a locked `ref`
@@ -290,9 +404,16 @@ async function computeLockFields(
 
 /**
  * Lock a task's code (idempotent). Freezes the current soft code into `ref`.
- * Triggered on handoff (work_on_task / Copy prompt) or automatically when a
- * task's status enters the working part of the spine (see `updateTask`), so a
- * "real" task never lacks a locked code.
+ * Triggered on handoff (work_on_task / lock_task / Copy prompt) or automatically
+ * when a task's status enters the working part of the spine (see `updateTask`),
+ * so a "real" task never lacks a locked code.
+ *
+ * A handoff also ASSIGNS the acting user (merged, never clobbering) — handing a
+ * task to Claude is starting work on it, so the board should say who it's for.
+ * Unlike the status-driven claim in `claimsWork`, this applies on every surface:
+ * Copy prompt is a web-UI click and must still assign. And it applies whether or
+ * not the code needed locking — the second Copy-prompt click on an
+ * already-locked task is the common case, and it used to write nothing at all.
  */
 export async function mintRef(
   handle: string,
@@ -306,8 +427,23 @@ export async function mintRef(
   )[0];
   if (!current) return null;
   const ctx = await codeCtx(userId);
+  const assigneeIds = withActor(current.assigneeIds, userId);
+  const autoAssigned = assigneeIds.length > current.assigneeIds.length;
   const lock = await computeLockFields(current, userId, ctx);
-  if (!lock) return rowToTask(current, 0, [], ctx);
+
+  // Already locked: nothing to freeze, but the handoff may still need to record
+  // the assignee — so this is only a true no-op when there's nothing to add.
+  if (!lock) {
+    if (!autoAssigned) return rowToTask(current, 0, [], ctx);
+    const [row] = await db
+      .update(tasks)
+      .set({ assigneeIds, updatedAt: new Date() })
+      .where(eq(tasks.id, id))
+      .returning();
+    if (!row) return rowToTask(current, 0, [], ctx);
+    await log(id, "updated", await autoAssignNote(userId), author);
+    return rowToTask(row, 0, [], ctx);
+  }
 
   const [row] = await db
     .update(tasks)
@@ -316,6 +452,7 @@ export async function mintRef(
       refLocked: true,
       lockedAt: lock.lockedAt,
       seq: lock.seq,
+      assigneeIds,
       updatedAt: lock.lockedAt,
     })
     .where(and(eq(tasks.id, id), eq(tasks.refLocked, false)))
@@ -325,7 +462,13 @@ export async function mintRef(
     const fresh = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
     return fresh ? rowToTask(fresh, 0, [], ctx) : null;
   }
-  await log(id, "updated", `🔒 Locked as ${lock.ref}`, author);
+  await log(
+    id,
+    "updated",
+    `🔒 Locked as ${lock.ref}` +
+      (autoAssigned ? ` · ${await autoAssignNote(userId)}` : ""),
+    author,
+  );
   return rowToTask(row, 0, [], ctx);
 }
 
@@ -581,6 +724,20 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
   return and(...conds);
 }
 
+/**
+ * The canonical task ordering — `position`, then `createdAt`, then `id`.
+ *
+ * `position` alone is NOT a total order: it's allocated per (status, parent)
+ * group by `nextPosition` and never renumbered on a status change, so any view
+ * mixing statuses holds ties. Without a tiebreak those ties resolve to the scan
+ * order Postgres happened to feed the Sort — unspecified, and it shifts as the
+ * table changes, so deleting one task re-permutes tasks nobody touched.
+ *
+ * Mirrored client-side by `compareTaskOrder` (`@/lib/task-order`); the two must
+ * stay in lockstep.
+ */
+const TASK_ORDER = [asc(tasks.position), asc(tasks.createdAt), asc(tasks.id)];
+
 /** All of a user's tasks as a nested tree, ordered by status then position. */
 export async function listTasks(
   userId: string,
@@ -591,7 +748,7 @@ export async function listTasks(
       .select()
       .from(tasks)
       .where(taskWhere(userId, filter))
-      .orderBy(asc(tasks.position)),
+      .orderBy(...TASK_ORDER),
     commentCounts(userId),
     attachmentsByTask(userId),
     codeCtx(userId),
@@ -609,7 +766,7 @@ export async function listTasksFlat(
       .select()
       .from(tasks)
       .where(taskWhere(userId, filter))
-      .orderBy(asc(tasks.position)),
+      .orderBy(...TASK_ORDER),
     commentCounts(userId),
     attachmentsByTask(userId),
     codeCtx(userId),
@@ -651,7 +808,7 @@ async function tasksByIds(userId: string, ids: string[]): Promise<TaskDTO[]> {
       .select()
       .from(tasks)
       .where(inArray(tasks.id, ids))
-      .orderBy(asc(tasks.position)),
+      .orderBy(...TASK_ORDER),
     commentCounts(userId),
     codeCtx(userId),
   ]);
@@ -682,7 +839,7 @@ export async function getTask(
       db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(asc(taskAttachments.createdAt)),
       db.select().from(taskNotes).where(eq(taskNotes.taskId, id)).orderBy(asc(taskNotes.createdAt)),
       db.select().from(taskCommits).where(eq(taskCommits.taskId, id)).orderBy(asc(taskCommits.createdAt)),
-      db.select().from(tasks).where(eq(tasks.parentId, id)).orderBy(asc(tasks.position)),
+      db.select().from(tasks).where(eq(tasks.parentId, id)).orderBy(...TASK_ORDER),
       codeCtx(userId),
     ]);
   const cCount = logRows.filter((l) => l.kind === "comment").length;
@@ -766,6 +923,11 @@ export interface CreateTaskInput {
    *  unpinned tasks in their board's INBOX lane, so only the canvas's own
    *  composers (which know which section you typed into) should set this. */
   canvasSectionId?: string | null;
+  /** "This is for this week": place the task in the canvas's THIS WEEK group
+   *  instead of leaving it in INBOX. Implied by a status in
+   *  `THIS_WEEK_STATUSES` — a task born into Analyzing is being worked on now.
+   *  Ignored when `canvasSectionId` names a section explicitly. */
+  thisWeek?: boolean;
   value?: FibPoints;
   difficulty?: FibPoints;
   importance?: Importance;
@@ -823,14 +985,22 @@ export async function resolveAssignees(tokens: string[]): Promise<string[]> {
   return out;
 }
 
+/** Activity-trail fragment for an assignment nobody asked for explicitly. An
+ *  implicit write has to be explicable — otherwise "why is this mine?" has no
+ *  answer on the timeline. Falls back to the id if the account is gone. */
+async function autoAssignNote(userId: string): Promise<string> {
+  const [u] = await db
+    .select({ name: users.name })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  return `👤 Assigned to ${u?.name ?? userId}`;
+}
+
 export async function createTask(
   input: CreateTaskInput,
   userId: string,
   author = "You",
-  /** MCP/agent path only: when the task is born into a work status
-   *  (analyzing/building), add the acting `userId` to the assignees so the
-   *  board records who's on it. Off for web/REST. */
-  assignActor = false,
 ): Promise<TaskDTO> {
   const status = input.status ?? "backlog";
   // Nest under any parent that exists (tasks are team-wide); else top-level.
@@ -873,11 +1043,25 @@ export async function createTask(
     ref = `${prefix}-${seq}`;
     lockedAt = new Date();
   }
-  let assigneeIds = await resolveAssignees(input.assigneeIds ?? []);
-  // Starting work on it = you own it. `userId` is already a canonical account id.
-  if (assignActor && WORK_STATUSES.has(status) && !assigneeIds.includes(userId)) {
-    assigneeIds = [...assigneeIds, userId];
-  }
+  // Canvas placement. An explicit pin (a canvas composer knows the section you
+  // typed into) always wins; otherwise "this week" — asked for, or implied by
+  // being born straight into work — routes it to the THIS WEEK group, and
+  // anything else stays unpinned and surfaces in its board's INBOX lane.
+  const wantsThisWeek = input.thisWeek ?? statusImpliesThisWeek(status);
+  const canvasSectionId =
+    input.canvasSectionId !== undefined && input.canvasSectionId !== null
+      ? input.canvasSectionId
+      : wantsThisWeek
+        ? await resolveThisWeekSection(boardId)
+        : null;
+  const explicitAssignees = await resolveAssignees(input.assigneeIds ?? []);
+  // Born straight into work = you own it. `userId` is already a canonical id.
+  const assigneeIds = claimsWork(status)
+    ? withActor(explicitAssignees, userId)
+    : explicitAssignees;
+  // Only "auto" if the merge actually added the actor — if the caller named them
+  // explicitly there's nothing implicit to explain on the timeline.
+  const autoAssigned = assigneeIds.length > explicitAssignees.length;
   const [row] = await db
     .insert(tasks)
     .values({
@@ -890,7 +1074,7 @@ export async function createTask(
       recurrence: input.recurrence,
       dependsOn: input.dependsOn ?? [],
       customFields: input.customFields ?? {},
-      canvasSectionId: input.canvasSectionId ?? null,
+      canvasSectionId,
       value: input.value,
       difficulty: input.difficulty,
       importance: clampImportance(input.importance ?? 0),
@@ -909,7 +1093,8 @@ export async function createTask(
   await log(
     row.id,
     "created",
-    `Created in ${STATUS_LABEL[status]}${ref ? ` · 🔒 Locked as ${ref}` : ""}`,
+    `Created in ${STATUS_LABEL[status]}${ref ? ` · 🔒 Locked as ${ref}` : ""}` +
+      (autoAssigned ? ` · ${await autoAssignNote(userId)}` : ""),
     author,
   );
   return rowToTask(row, 0, [], ctx);
@@ -929,6 +1114,11 @@ export interface UpdateTaskInput {
    *  back to its board's INBOX lane. Unlike `customFields` this is a single
    *  scalar, so re-pinning never has to read-modify-write a shared bag. */
   canvasSectionId?: string | null;
+  /** Move the task into the canvas's THIS WEEK group (`true`) or back to its
+   *  board's INBOX lane (`false`). Implied by a status transition into
+   *  `THIS_WEEK_STATUSES`, but only for a task nobody has pinned by hand.
+   *  Ignored when `canvasSectionId` is passed alongside it. */
+  thisWeek?: boolean;
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
   importance?: Importance;
@@ -951,10 +1141,6 @@ export async function updateTask(
    * writer changed the row in the meantime. Omit it for last-write-wins.
    */
   expectedUpdatedAt?: string,
-  /** MCP/agent path only: when this update moves the task into a work status
-   *  (analyzing/building), ensure the acting `userId` is among the assignees
-   *  (merge, don't clobber). Off for web/REST. */
-  assignActor = false,
 ): Promise<TaskDTO | null> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return null;
@@ -971,20 +1157,18 @@ export async function updateTask(
   const now = new Date();
   const values: Record<string, unknown> = { updatedAt: now };
   if (patch.title !== undefined) values.title = patch.title;
-  // Assignees: fold together an explicit set and the agent auto-assign rule.
-  // If moving into a work status via the MCP/agent path, ensure the acting
-  // user is present — starting from the explicit list if given, else the
-  // current one (merge, never clobber other assignees).
-  const targetIsWork =
-    patch.status !== undefined && WORK_STATUSES.has(patch.status);
-  if (patch.assigneeIds !== undefined || (assignActor && targetIsWork)) {
-    let next =
+  // Assignees: fold together an explicit set and the work-entry claim. Start
+  // from the explicit list if given, else the current one, so the actor is
+  // merged in and never clobbers whoever is already on it.
+  const claimed = claimsWork(patch.status);
+  let autoAssigned = false;
+  if (patch.assigneeIds !== undefined || claimed) {
+    const base =
       patch.assigneeIds !== undefined
         ? await resolveAssignees(patch.assigneeIds)
         : current.assigneeIds;
-    if (assignActor && targetIsWork && !next.includes(userId)) {
-      next = [...next, userId];
-    }
+    const next = claimed ? withActor(base, userId) : base;
+    autoAssigned = next.length > base.length;
     values.assigneeIds = next;
   }
   if (patch.startDate !== undefined) values.startDate = patch.startDate;
@@ -1031,6 +1215,31 @@ export async function updateTask(
     }
   }
 
+  // THIS WEEK placement. An explicit `canvasSectionId` wins outright; otherwise
+  // an explicit `thisWeek` moves the task either way, and entering a work status
+  // moves an UNPINNED task there — never one the user parked in a section by
+  // hand, because an agent starting work is no reason to yank a card out of the
+  // group it was filed in. Recorded so the timeline explains the move.
+  let placedThisWeek: boolean | null = null;
+  if (patch.canvasSectionId === undefined) {
+    if (patch.thisWeek !== undefined) placedThisWeek = patch.thisWeek;
+    else if (
+      statusChanged &&
+      statusImpliesThisWeek(patch.status) &&
+      current.canvasSectionId === null
+    )
+      placedThisWeek = true;
+  }
+  if (placedThisWeek === true) {
+    const target = await resolveThisWeekSection(current.boardId);
+    // No flagged group, or it's already there: nothing to move or announce.
+    if (target && target !== current.canvasSectionId) values.canvasSectionId = target;
+    else placedThisWeek = null;
+  } else if (placedThisWeek === false) {
+    if (current.canvasSectionId === null) placedThisWeek = null;
+    else values.canvasSectionId = null;
+  }
+
   const [row] = await db
     .update(tasks)
     .set(values)
@@ -1064,6 +1273,9 @@ export async function updateTask(
       `Status: ${STATUS_LABEL[current.status]} → ${STATUS_LABEL[patch.status!]}`,
     );
   if (autoLocked) logParts.push(`🔒 Locked as ${autoLocked}`);
+  if (autoAssigned) logParts.push(await autoAssignNote(userId));
+  if (placedThisWeek !== null)
+    logParts.push(placedThisWeek ? "📅 Moved to THIS WEEK" : "📥 Moved back to INBOX");
   const patchMsg = describeBulkPatch(patch);
   if (patchMsg) logParts.push(patchMsg);
   if (logParts.length)
@@ -1176,12 +1388,31 @@ export async function moveTask(
 
   // An explicit pin wins; otherwise a board change drops the stale one, because
   // the Section it pointed at belongs to the board we just left.
-  const canvasSectionId =
+  let canvasSectionId =
     target.canvasSectionId !== undefined
       ? target.canvasSectionId
       : boardChanged
         ? null
         : current.canvasSectionId;
+  // …and an agent moving the task into work files it on THIS WEEK's board, the
+  // same rule `updateTask` applies — but only if nothing else claimed it, so a
+  // card the user filed by hand (or a fresh pin above) stays where it is.
+  let movedToThisWeek = false;
+  if (
+    canvasSectionId === null &&
+    statusChanged &&
+    statusImpliesThisWeek(status)
+  ) {
+    canvasSectionId = await resolveThisWeekSection(boardId);
+    movedToThisWeek = canvasSectionId !== null;
+  }
+
+  // Same work-entry claim as updateTask: a move that parks the task in
+  // Analyzing/Building from an agent surface records who's on it.
+  const assigneeIds = claimsWork(target.status)
+    ? withActor(current.assigneeIds, userId)
+    : current.assigneeIds;
+  const autoAssigned = assigneeIds.length > current.assigneeIds.length;
 
   const [row] = await db
     .update(tasks)
@@ -1191,6 +1422,7 @@ export async function moveTask(
       boardId,
       projectId,
       canvasSectionId,
+      assigneeIds,
       seq,
       ref,
       refLocked,
@@ -1207,7 +1439,12 @@ export async function moveTask(
     })
     .where(eq(tasks.id, id))
     .returning();
-  if (autoLocked) await log(id, "updated", `🔒 Locked as ${autoLocked}`, author);
+  const moveNotes = [
+    ...(autoLocked ? [`🔒 Locked as ${autoLocked}`] : []),
+    ...(autoAssigned ? [await autoAssignNote(userId)] : []),
+    ...(movedToThisWeek ? ["📅 Moved to THIS WEEK"] : []),
+  ];
+  if (moveNotes.length) await log(id, "updated", moveNotes.join(" · "), author);
 
   if (target.parentId !== undefined && target.parentId !== current.parentId) {
     const parentTitle = target.parentId
@@ -1358,8 +1595,9 @@ export async function addComment(
 }
 
 /** Delete a task (cascades to its logs + attachment rows; subtasks are
- *  re-parented to top). Blob objects are cleaned up first, since the DB
- *  cascade drops the rows but not the files in Vercel Blob. */
+ *  re-parented to top, and re-positioned at the end of their new root group).
+ *  Blob objects are cleaned up first, since the DB cascade drops the rows but
+ *  not the files in Vercel Blob. */
 export async function deleteTask(handle: string, userId: string): Promise<boolean> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return false;
@@ -1370,10 +1608,33 @@ export async function deleteTask(handle: string, userId: string): Promise<boolea
   if (attachmentRows.length) {
     await delBlobs(attachmentRows.map((a) => a.url));
   }
-  await db
-    .update(tasks)
-    .set({ parentId: null })
-    .where(eq(tasks.parentId, id));
+  // Subtasks outlive their parent, but a subtask's `position` was allocated
+  // INSIDE the parent's group — it means "3rd under that parent", nothing at all
+  // at root level. Promoting it as-is drops the orphan into the middle of its
+  // section's ordering, next to unrelated tasks. So re-stamp each one at the end
+  // of the root group it's joining; positions are per (status, parent), hence a
+  // separate running counter per status.
+  const orphans = await db
+    .select({ id: tasks.id, status: tasks.status })
+    .from(tasks)
+    .where(eq(tasks.parentId, id))
+    .orderBy(...TASK_ORDER);
+  if (orphans.length) {
+    const nextByStatus = new Map<TaskStatus, number>();
+    for (const status of new Set(orphans.map((o) => o.status)))
+      nextByStatus.set(status, await nextPosition(userId, status, null));
+    const [first, ...rest] = orphans.map((o) => {
+      const position = nextByStatus.get(o.status)!;
+      nextByStatus.set(o.status, position + 1);
+      return db
+        .update(tasks)
+        .set({ parentId: null, position })
+        .where(eq(tasks.id, o.id));
+    });
+    // One atomic HTTP transaction (the neon-http driver has no interactive
+    // ones), so a partial promotion can't leave orphans on a stale position.
+    await db.batch([first, ...rest]);
+  }
   const res = await db
     .delete(tasks)
     .where(eq(tasks.id, id))
@@ -1391,6 +1652,10 @@ export type MoveTarget = {
   status?: TaskStatus;
   position?: number;
   boardId?: string | null;
+  /** Canvas Section pin. State it to place the card; omitting it on a board
+   *  change means "clear it" (see `moveTask`) — which is exactly why a
+   *  cross-board drop has to say what it wants. */
+  canvasSectionId?: string | null;
 };
 
 /** One step in a `bulkApply` batch. Executed in array order. */
@@ -1402,19 +1667,10 @@ export type BulkOp =
   | { op: "comment"; id: string; message: string }
   | { op: "delete"; id: string };
 
-/** Outcome of a single op — so a partial failure is visible, not silent. */
-export interface OpResult {
-  op: BulkOp["op"];
-  ok: boolean;
-  /** The affected task id (the new id for a successful `create`). */
-  id?: string;
-  /** Present when `ok` is false. */
-  error?: string;
-}
-
-/** Hard cap on how many ops one `bulkApply` batch runs; the rest are dropped
- *  (and reported via `truncated`) rather than silently ignored. */
-export const MAX_BULK_OPS = 200;
+// The per-op result shape and the batch cap live in `@/lib/bulk` — the browser
+// needs both (to chunk, and to spot failed ops) and must not import this module.
+// Re-exported here so existing `db/service` importers keep working.
+export { MAX_BULK_OPS, type OpResult };
 
 /** Human summary of the constant (per-batch) part of a bulk patch — the
  *  per-task status transition is appended separately by `bulkUpdate`. */
@@ -1480,10 +1736,19 @@ export async function bulkUpdate(
   const resolved = await Promise.all(ids.map((h) => resolveTaskId(h, userId)));
   const skipped = ids.filter((_, i) => !resolved[i]);
   const resolvedIds = resolved.filter((x): x is string => x !== null);
-  // Grab prior status for the activity log (resolution already scoped to user).
+  // Grab prior status + assignees for the activity log (resolution already
+  // scoped to user); the assignees tell us which rows the claim below touched.
   const owned = resolvedIds.length
     ? await db
-        .select({ id: tasks.id, status: tasks.status })
+        .select({
+          id: tasks.id,
+          status: tasks.status,
+          assigneeIds: tasks.assigneeIds,
+          // For THIS WEEK placement below: the target depends on each task's own
+          // board, and the status-implied move only applies to unpinned tasks.
+          boardId: tasks.boardId,
+          canvasSectionId: tasks.canvasSectionId,
+        })
         .from(tasks)
         .where(inArray(tasks.id, resolvedIds))
     : [];
@@ -1512,6 +1777,19 @@ export async function bulkUpdate(
     values.completedAt = patch.status === "done" ? now : null;
     // Leaving "done" un-archives (an archived task is always done).
     if (patch.status !== "done") values.archivedAt = null;
+  }
+  // Same work-entry claim as updateTask/moveTask. With an explicit list the
+  // merge is a constant; without one each row keeps its OWN assignees, so the
+  // merge has to happen per-row — expressed in SQL to stay inside the single
+  // bulk UPDATE below rather than degenerating into a write per task.
+  const claimed = claimsWork(patch.status);
+  if (claimed) {
+    values.assigneeIds =
+      patch.assigneeIds !== undefined
+        ? withActor(values.assigneeIds as string[], userId)
+        : sql`CASE WHEN ${userId} = ANY(${tasks.assigneeIds})
+                   THEN ${tasks.assigneeIds}
+                   ELSE array_append(${tasks.assigneeIds}, ${userId}) END`;
   }
 
   // 3. One UPDATE for the whole owned set.
@@ -1547,9 +1825,60 @@ export async function bulkUpdate(
     }
   }
 
+  // 3c. THIS WEEK placement — the same rules as `updateTask`: an explicit
+  //     `canvasSectionId` wins, else `thisWeek` moves it either way, else
+  //     entering a work status moves the tasks nobody pinned by hand. Can't ride
+  //     the bulk UPDATE either: the target section is per BOARD, so it's one
+  //     write per distinct board (bounded by the board count, not the task
+  //     count) — and only for the tasks that actually need moving.
+  /** Task id → its new pin, for the trail rows and the returned shape (the bulk
+   *  UPDATE's `rows` were read before these writes). */
+  const placed = new Map<string, string | null>();
+  if (patch.canvasSectionId === undefined) {
+    const statusImplies =
+      patch.thisWeek === undefined && statusImpliesThisWeek(patch.status);
+    if (patch.thisWeek === true || statusImplies) {
+      // The status-implied move spares anything already filed in a section.
+      const movable = owned.filter(
+        (r) => patch.thisWeek === true || r.canvasSectionId === null,
+      );
+      const byBoard = new Map<string | null, string[]>();
+      for (const r of movable) {
+        const list = byBoard.get(r.boardId);
+        if (list) list.push(r.id);
+        else byBoard.set(r.boardId, [r.id]);
+      }
+      for (const [boardId, taskIds] of byBoard) {
+        const target = await resolveThisWeekSection(boardId);
+        if (!target) continue; // no group flagged — leave them in INBOX
+        const stale = movable.filter(
+          (r) => taskIds.includes(r.id) && r.canvasSectionId !== target,
+        );
+        if (!stale.length) continue;
+        await db
+          .update(tasks)
+          .set({ canvasSectionId: target })
+          .where(inArray(tasks.id, stale.map((r) => r.id)));
+        for (const r of stale) placed.set(r.id, target);
+      }
+    } else if (patch.thisWeek === false) {
+      const pinned = owned.filter((r) => r.canvasSectionId !== null).map((r) => r.id);
+      if (pinned.length) {
+        await db
+          .update(tasks)
+          .set({ canvasSectionId: null })
+          .where(inArray(tasks.id, pinned));
+        for (const id of pinned) placed.set(id, null);
+      }
+    }
+  }
+
   // 4. One batched INSERT into the activity log — a trail row per task.
   const constMsg = describeBulkPatch(patch);
   const priorStatus = new Map(owned.map((r) => [r.id, r.status]));
+  const priorAssignees = new Map(owned.map((r) => [r.id, r.assigneeIds]));
+  // Resolved once, not per row — every row names the same actor.
+  const assignNote = claimed ? await autoAssignNote(userId) : null;
   const ctx = currentLogContext();
   const logRows = rows.map((r) => {
     const parts: string[] = [];
@@ -1560,6 +1889,14 @@ export async function bulkUpdate(
     if (constMsg) parts.push(constMsg);
     const ref = relocked.get(r.id)?.ref;
     if (ref) parts.push(`🔒 Locked as ${ref}`);
+    // Only the rows the claim actually added the actor to.
+    if (
+      assignNote &&
+      r.assigneeIds.length > (priorAssignees.get(r.id)?.length ?? 0)
+    )
+      parts.push(assignNote);
+    if (placed.has(r.id))
+      parts.push(placed.get(r.id) ? "📅 Moved to THIS WEEK" : "📥 Moved back to INBOX");
     return {
       taskId: r.id,
       kind: "updated" as const,
@@ -1578,9 +1915,16 @@ export async function bulkUpdate(
   return {
     updated: rows.length,
     skipped,
-    tasks: rows.map((r) =>
-      rowToTask(relocked.get(r.id) ?? r, counts.get(r.id) ?? 0, [], codes),
-    ),
+    tasks: rows.map((r) => {
+      const row = relocked.get(r.id) ?? r;
+      // 3c ran after both UPDATEs read their rows, so fold its pin back in.
+      return rowToTask(
+        placed.has(r.id) ? { ...row, canvasSectionId: placed.get(r.id)! } : row,
+        counts.get(r.id) ?? 0,
+        [],
+        codes,
+      );
+    }),
   };
 }
 

@@ -379,8 +379,9 @@ export const logKind = pgEnum("log_kind", [
 ]);
 
 /** Which surface produced an activity event: the web UI (session cookie), a
- *  raw API/script call (bearer token), or Claude via the MCP server. */
-export const logSource = pgEnum("log_source", ["ui", "api", "mcp"]);
+ *  raw API/script call (bearer token), Claude via the MCP server, or the
+ *  Telegram bot's post-confirmation executor. */
+export const logSource = pgEnum("log_source", ["ui", "api", "mcp", "telegram"]);
 
 /* ---- Tasks ----
    Flat table with self-referential parentId for nesting (matches the
@@ -718,8 +719,12 @@ export const canvasNodes = pgTable(
     color: text("color"),
     /** Fractional z-order (higher = on top). */
     position: doublePrecision("position").notNull().default(0),
-    /** Free-form extras: font size; a section's bound `boardId` and optional own
-     *  `name`; a group's `layout`. */
+    /** Free-form extras: font size; a section's bound `boardId`, optional own
+     *  `name`, and `master` (its board's Send target); a group's `layout`; the
+     *  two flags that name a group's ROLE for task placement — `inbox` (the
+     *  machine-managed tray of unfiled tasks, set on the group and each of its
+     *  lanes) and `thisWeek` (the one group agents file this week's work into —
+     *  see `resolveThisWeekSection`). */
     data: jsonb("data").notNull().default(sql`'{}'::jsonb`),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

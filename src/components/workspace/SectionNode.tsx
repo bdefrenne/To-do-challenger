@@ -36,6 +36,7 @@ import type { TaskStatus, Importance } from "@/lib/types";
 import { useWorkspace, type DropPos } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
 import { isInboxNode } from "@/lib/sections";
+import { compareTaskOrder } from "@/lib/task-order";
 import { TaskCardBody } from "./TaskCardBody";
 import { useCardShortcut } from "./useCardShortcut";
 import { IMPORTANCE_CARD } from "@/lib/importance";
@@ -72,7 +73,7 @@ function useSectionUnits(sectionId: string): TaskUnit[] {
     );
     const build = (rows: typeof nodes): TaskUnit[] =>
       [...rows]
-        .sort((a, b) => a.position - b.position)
+        .sort(compareTaskOrder)
         .map((n) => {
           const t = taskMap[n.id];
           return {
@@ -396,17 +397,11 @@ export function SectionNode({
   };
 
   /* ---------------- commit: rows → tasks (up to 3 bulk batches) ------------- */
-  const bulk = async (operations: unknown[]) => {
-    const res = await fetch("/api/tasks/bulk", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ operations }),
-    });
-    if (!res.ok) throw new Error(`bulk failed (${res.status})`);
-    return (await res.json()) as {
-      results: { op: string; ok: boolean; id?: string }[];
-    };
-  };
+  // `ws.bulk`, not a local fetch: it chunks past the server's per-batch cap
+  // (an outline this size can exceed it), reports any op that didn't apply, and
+  // guarantees the results line up index-for-index with the ops — which is what
+  // makes pairing a created task's id back to its row safe.
+  const bulk = ws.bulk;
 
   // Persist the current outline → tasks. Runs on a debounce while you type (and
   // on demand via flush). Guarded so saves never overlap; a save requested mid-
@@ -463,9 +458,15 @@ export function SectionNode({
             ...(n.parent ? {} : { canvasSectionId: pin }),
           },
         }));
-        const { results } = await bulk(ops);
-        let k = 0;
-        for (const r of results) if (r.op === "create" && r.ok && r.id) level[k++].unit.taskId = r.id;
+        // Pair each new id back to the row that asked for it BY INDEX. A cursor
+        // that only advanced on success would, after one failed create, hand every
+        // later id to the wrong row — stamping a failed row with another task's
+        // identity and orphaning the task that was really created (which the next
+        // save would then create again).
+        const results = await bulk(ops);
+        results.forEach((r, i) => {
+          if (r.op === "create" && r.ok && r.id) level[i].unit.taskId = r.id;
+        });
       }
 
       // 2. ONE final batch carrying ONLY what actually changed: content updates,
@@ -546,7 +547,7 @@ export function SectionNode({
         void save();
       }
     }
-  }, [boardId, ws, pin, siblingIds]);
+  }, [boardId, ws, bulk, pin, siblingIds]);
 
   /** Save now, cancelling any pending debounce (used on toggle / Esc / unmount). */
   const flush = useCallback(() => {
@@ -710,7 +711,7 @@ export function SectionNode({
     } finally {
       setSaving(false);
     }
-  }, [boardId, masterSection, ws, onRemove, siblingIds, bySection]);
+  }, [boardId, masterSection, ws, bulk, onRemove, siblingIds, bySection]);
 
   /* =================================================================== */
   /* Render                                                              */

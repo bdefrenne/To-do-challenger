@@ -40,6 +40,7 @@ const SOURCE_LABEL: Record<NonNullable<TaskLogEntry["source"]>, string> = {
   ui: "UI",
   api: "API",
   mcp: "Claude",
+  telegram: "Telegram",
 };
 
 const LOG_COLOR: Record<TaskLogEntry["kind"], string> = {

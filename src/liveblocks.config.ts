@@ -9,7 +9,8 @@
   - Storage  — the shared, conflict-free source of truth: a LiveMap of nodes,
     each a LiveObject so two people editing different fields merge cleanly.
   - Presence — ephemeral per-user state: live cursor (in CANVAS coordinates so
-    it's viewport-independent) and the ids they currently have selected.
+    it's viewport-independent), the ids they currently have selected, and where
+    their screen is pointed (so you can click a peer and adopt their view).
   - UserMeta — identity attached at auth time, used to label cursors.
 */
 
@@ -39,6 +40,12 @@ declare global {
       cursor: { x: number; y: number } | null;
       /** Node ids this user currently has selected. */
       selection: string[];
+      /** What this user's screen is pointed at: the canvas point at the CENTRE
+       *  of their viewport, plus their zoom. Peers click their avatar to adopt
+       *  it. Centre + scale rather than the raw pan offsets, which depend on
+       *  window size — a laptop and a large monitor sharing offsets would land
+       *  on different content. null until their first broadcast. */
+      view: { cx: number; cy: number; scale: number } | null;
       /** The task field this user is currently editing (a soft field-lock), or
        *  null. Peers highlight it and disable that input so two people don't
        *  clobber the same field. Ephemeral — auto-released on disconnect. */

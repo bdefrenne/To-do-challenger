@@ -29,6 +29,7 @@ import {
   useHistory,
   useBroadcastEvent,
   useEventListener,
+  useStatus,
 } from "@liveblocks/react";
 import type { CanvasNode, CanvasNodeKind } from "@/lib/types";
 import type { StoredNode } from "@/liveblocks.config";
@@ -58,11 +59,15 @@ import { MIN_SECTION_HEIGHT } from "./SectionNode";
 import { SectionMembershipProvider } from "./SectionMembershipContext";
 import {
   boardsNeedingInbox,
+  boardsNeedingWeekLane,
   buildSectionMembership,
   inboxGroupId,
   inboxLaneId,
   isInboxNode,
+  isThisWeekGroup,
   laneBoardId,
+  thisWeekGroupId,
+  weekLaneId,
 } from "@/lib/sections";
 
 type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
@@ -79,6 +84,9 @@ interface Viewport {
 
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 3;
+/** How long it takes to glide onto a peer's view. Long enough to read as travel
+ *  (so you keep your bearings), short enough not to feel like waiting. */
+const JUMP_MS = 320;
 /** Longest edge (canvas units) a freshly pasted/dropped image is scaled to. */
 const MAX_PLACE = 480;
 const uid = () => crypto.randomUUID();
@@ -339,14 +347,76 @@ const computeGroupLayout = (
   return patches;
 };
 
-const loadViewport = (canvasId: string): Viewport => {
+/** This user's saved view of `canvasId`, plus whether there WAS one. A canvas
+ *  you've never opened has no saved view, and its content is rarely near the
+ *  origin — `restored: false` is what tells the editor to zoom-to-fit instead of
+ *  dumping you on empty grid at (0,0). */
+const loadViewport = (canvasId: string): { viewport: Viewport; restored: boolean } => {
   try {
     const raw = localStorage.getItem(`canvas-vp:${canvasId}`);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const vp = JSON.parse(raw);
+      if (
+        typeof vp?.x === "number" &&
+        typeof vp?.y === "number" &&
+        typeof vp?.scale === "number"
+      ) {
+        return { viewport: vp, restored: true };
+      }
+    }
   } catch {
     /* ignore */
   }
-  return { x: 0, y: 0, scale: 1 };
+  return { viewport: { x: 0, y: 0, scale: 1 }, restored: false };
+};
+
+interface Bounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+/** The box enclosing `nodes` in canvas coords, or null if there are none.
+ *  Every kind counts — the INBOX tray included — so a fit really does show
+ *  everything. Auto-height nodes (text cards, sections) mirror their measured
+ *  height back into `node.height`, so stored geometry tracks what's rendered. */
+const boundsOf = (nodes: CanvasNode[]): Bounds | null => {
+  if (!nodes.length) return null;
+  let minX = Infinity,
+    minY = Infinity,
+    maxX = -Infinity,
+    maxY = -Infinity;
+  for (const n of nodes) {
+    if (n.x < minX) minX = n.x;
+    if (n.y < minY) minY = n.y;
+    if (n.x + n.width > maxX) maxX = n.x + n.width;
+    if (n.y + n.height > maxY) maxY = n.y + n.height;
+  }
+  return { minX, minY, maxX, maxY };
+};
+
+/** Screen margin (px) left around the content when fitting. */
+const FIT_PAD = 64;
+
+/** The viewport that centres `b` in a `width`×`height` container. Zoom is capped
+ *  at 1: fitting never MAGNIFIES, or framing one small note would slam you to
+ *  300% — it only ever zooms out far enough to show the box. */
+const fitViewport = (b: Bounds, width: number, height: number): Viewport => {
+  const bw = Math.max(1, b.maxX - b.minX);
+  const bh = Math.max(1, b.maxY - b.minY);
+  const scale = Math.min(
+    1,
+    Math.max(
+      MIN_SCALE,
+      Math.min((width - 2 * FIT_PAD) / bw, (height - 2 * FIT_PAD) / bh),
+    ),
+  );
+  return {
+    scale,
+    x: width / 2 - (b.minX + bw / 2) * scale,
+    y: height / 2 - (b.minY + bh / 2) * scale,
+  };
 };
 
 interface Pen {
@@ -376,6 +446,13 @@ export function CanvasEditor({
 }) {
   const nodesMap = useStorage((root) => root.nodes);
   const others = useOthers();
+  // Presence only means something while the socket is up. Liveblocks does NOT
+  // clear `others` when the room is disconnected on purpose (see
+  // useRoomIdlePause), and lags ~5s behind a real drop — so peers would
+  // otherwise sit frozen on screen looking live. Dim them instead of hiding
+  // them: they're the last known truth, just not current.
+  const peersStale = useStatus() !== "connected";
+  const staleOpacity = peersStale ? 0.35 : 1;
   // My auth user id (from liveblocks-auth prepareSession) — stamps who created
   // a section so its board-picker stays private to that user.
   const myId = useSelf((me) => me.id);
@@ -403,7 +480,13 @@ export function CanvasEditor({
 
   // This editor only mounts client-side (after the canvas fetch resolves), so
   // reading localStorage in the initializer is safe — no SSR/hydration mismatch.
-  const [viewport, setViewport] = useState<Viewport>(() => loadViewport(canvasId));
+  const [saved] = useState(() => loadViewport(canvasId));
+  const [viewport, setViewport] = useState<Viewport>(saved.viewport);
+  // First visit to this canvas (nothing saved): frame the content once it has
+  // settled, instead of opening on empty grid at (0,0). Cleared once the fit
+  // lands — or as soon as you pan/zoom/click, so we never yank the view out
+  // from under you. State, not just a ref: it also hides the pre-fit frame.
+  const [pendingFit, setPendingFit] = useState(!saved.restored);
   const [tool, setTool] = useState<Tool>("select");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -463,6 +546,8 @@ export function CanvasEditor({
   // document-level paste listener, so without this the canvas would ALSO drop a
   // node behind the modal on the same ⌘V that attaches the image to the task.
   const modalOpenRef = useRef(false);
+  // Mirror of `pendingFit` for the pointer/wheel handlers, which are bound once.
+  const pendingFitRef = useRef(pendingFit);
   useEffect(() => void (nodesRef.current = nodes), [nodes]);
   useEffect(() => void (vpRef.current = viewport), [viewport]);
   useEffect(() => void (toolRef.current = tool), [tool]);
@@ -470,12 +555,39 @@ export function CanvasEditor({
   useEffect(() => void (editingRef.current = editingId), [editingId]);
   useEffect(() => void (penRef.current = pen), [pen]);
   useEffect(() => void (modalOpenRef.current = openTaskIds.length > 0), [openTaskIds]);
+  useEffect(() => void (pendingFitRef.current = pendingFit), [pendingFit]);
+
+  /** Drop a not-yet-run first-visit fit — the user is driving the view now. */
+  const cancelPendingFit = useCallback(() => {
+    if (!pendingFitRef.current) return;
+    pendingFitRef.current = false;
+    setPendingFit(false);
+  }, []);
+
+  // The in-flight "jump to a peer's view" animation (0 = none). Declared up here
+  // with cancelPendingFit because the camera moves further down (zoomAt, fitTo)
+  // need `cancelJump` in their dep arrays — naming a later const there would be a
+  // temporal-dead-zone error at render.
+  const jumpRef = useRef(0);
+  /** Abandon an in-flight jump — you're driving now, and two things moving the
+   *  camera at once reads as a fight. */
+  const cancelJump = useCallback(() => {
+    if (!jumpRef.current) return;
+    cancelAnimationFrame(jumpRef.current);
+    jumpRef.current = 0;
+  }, []);
+  useEffect(() => () => cancelAnimationFrame(jumpRef.current), []);
 
   // Persist this user's own viewport (per-user, not shared with the room).
   // DEBOUNCED: zoom and pan fire continuously, and localStorage.setItem is a
   // synchronous main-thread write — doing it per wheel tick stalls the frame.
   // Only the resting position matters, so settle for 200ms first.
+  //
+  // Held off while a first-visit fit is pending: writing the placeholder (0,0)
+  // viewport would mark the canvas "visited" and cancel the very fit we're
+  // waiting on.
   useEffect(() => {
+    if (pendingFit) return;
     const t = setTimeout(() => {
       try {
         localStorage.setItem(`canvas-vp:${canvasId}`, JSON.stringify(viewport));
@@ -484,7 +596,38 @@ export function CanvasEditor({
       }
     }, 200);
     return () => clearTimeout(t);
-  }, [viewport, canvasId]);
+  }, [viewport, canvasId, pendingFit]);
+
+  // Share where our screen is pointed, so peers can click our avatar and land on
+  // the same content at the same zoom. We publish the canvas point at the CENTRE
+  // of the viewport plus the scale — not the raw pan offsets, which depend on
+  // window size and would drop a laptop and a large monitor on different content.
+  //
+  // DEBOUNCED like the write above, and for a sharper reason: this one goes
+  // outward. `useOthers()` here is unfiltered, so every presence update re-renders
+  // each peer's whole editor (see the warning in SectionNode) — and pan/zoom fire
+  // continuously. Only the resting view is worth sending. Held off while a
+  // first-visit fit is pending so we never advertise the placeholder (0,0) frame.
+  //
+  // Reads the rect live rather than through the cached `containerRect` helper:
+  // that's declared further down the component, so naming it in this dep array
+  // would be a temporal-dead-zone error at render. Once per 200ms settle, a
+  // layout read is cheap (`zoomAtCenter` and `placementPoint` do the same).
+  useEffect(() => {
+    if (pendingFit) return;
+    const t = setTimeout(() => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect?.width || !rect.height) return;
+      updateMyPresence({
+        view: {
+          cx: (rect.width / 2 - viewport.x) / viewport.scale,
+          cy: (rect.height / 2 - viewport.y) / viewport.scale,
+          scale: viewport.scale,
+        },
+      });
+    }, 200);
+    return () => clearTimeout(t);
+  }, [viewport, pendingFit, updateMyPresence]);
 
   // Persist the chosen pen (per-user, like the viewport).
   useEffect(() => {
@@ -667,6 +810,52 @@ export function CanvasEditor({
     removeMany,
     patchMany,
   ]);
+
+  /* ---- THIS WEEK: materialise the lane an agent's placement is waiting on ---- */
+
+  /**
+   * When something files a task on the THIS WEEK group for a board the group
+   * doesn't cover yet, the pin names the lane's DERIVED id (`weekLaneId`) and
+   * this creates the node — the client half of `resolveThisWeekSection`.
+   *
+   * It has to happen here rather than server-side because nodes live in
+   * Liveblocks storage: a row the server inserted wouldn't reach an open canvas
+   * until storage re-hydrated, whereas tasks arrive on the ≤2s poll. So the
+   * server pins to the id the lane WILL have, and the placement shows up live.
+   *
+   * Unlike the INBOX reconciler above, this only ever CREATES. The group is
+   * hand-curated, so once a lane exists it's an ordinary section the user owns —
+   * renameable, movable, deletable, and never auto-removed when it empties.
+   */
+  useEffect(() => {
+    if (!nodesMap) return;
+    const groupId = thisWeekGroupId(nodes);
+    if (!groupId) return;
+    const missing = boardsNeedingWeekLane(nodes, taskNodes, taskMap);
+    if (!missing.size) return;
+    // Append after the group's current members, so a new lane never shoves its
+    // way into the middle of an arrangement the user built by hand.
+    let next =
+      Math.max(0, ...groupMembers(nodes, groupId).map((m) => m.position)) + 1;
+    for (const boardId of missing) {
+      putNode({
+        id: weekLaneId(groupId, boardId),
+        kind: "section",
+        content: boardId ? (boardNames.get(boardId) ?? "") : "",
+        // computeGroupLayout owns the real position; these are just a first frame.
+        x: 0,
+        y: 0,
+        width: NEW_SECTION_SIZE.width,
+        height: MIN_SECTION_HEIGHT,
+        color: null,
+        position: next++,
+        data: {
+          groupId,
+          ...(boardId ? { boardId } : { name: "No board" }),
+        },
+      });
+    }
+  }, [nodesMap, nodes, taskNodes, taskMap, boardNames, putNode]);
 
   /** Identity of the section set as far as membership is concerned: which
    *  sections exist and which board each INBOX lane serves. Deliberately excludes
@@ -1212,6 +1401,7 @@ export function CanvasEditor({
       // Cached rect: a wheel-driven zoom fires continuously, and reading it live
       // forces a layout flush per tick right after the transform changed.
       const rect = containerRect();
+      cancelJump();
       setViewport((vp) => {
         const mx = clientX - rect.left;
         const my = clientY - rect.top;
@@ -1220,14 +1410,114 @@ export function CanvasEditor({
         return { scale: next, x: mx - (mx - vp.x) * k, y: my - (my - vp.y) * k };
       });
     },
-    [containerRect],
+    [containerRect, cancelJump],
   );
+
+  /* -------- fit to content -------- */
+  /** Frame `ids` (or everything, when omitted/empty) in the viewport. */
+  const fitTo = useCallback(
+    (ids?: Iterable<string>) => {
+      const wanted = ids ? new Set(ids) : null;
+      const subject = wanted?.size
+        ? nodesRef.current.filter((n) => wanted.has(n.id))
+        : nodesRef.current;
+      const b = boundsOf(subject);
+      if (!b) return;
+      const rect = containerRect();
+      if (!rect.width || !rect.height) return;
+      cancelJump();
+      setViewport(fitViewport(b, rect.width, rect.height));
+    },
+    [containerRect, cancelJump],
+  );
+
+  /* -------- jump to a peer's view -------- */
+  /** Adopt someone else's view: put `view`'s centre at the centre of our own
+   *  container, at their zoom. The inverse of the centre maths we broadcast.
+   *
+   *  Animated rather than snapped — a jump across the canvas is otherwise
+   *  indistinguishable from the canvas being swapped out, and you lose your
+   *  bearings. */
+  const jumpTo = useCallback(
+    (view: { cx: number; cy: number; scale: number }) => {
+      const rect = containerRect();
+      if (!rect.width || !rect.height) return;
+      cancelPendingFit();
+      cancelJump();
+      const from = vpRef.current;
+      const toScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, view.scale));
+      // Where WE are pointed, in the same centre+scale terms they broadcast.
+      const fromCx = (rect.width / 2 - from.x) / from.scale;
+      const fromCy = (rect.height / 2 - from.y) / from.scale;
+      // Already looking at it — don't spend 320ms of renders to say so. Compared
+      // in screen pixels, so the threshold means the same thing at every zoom.
+      if (
+        Math.abs(fromCx - view.cx) * toScale < 1 &&
+        Math.abs(fromCy - view.cy) * toScale < 1 &&
+        Math.abs(from.scale - toScale) < 0.01
+      )
+        return;
+      const zoomRatio = toScale / from.scale;
+      const t0 = performance.now();
+      const step = () => {
+        const p = Math.min(1, (performance.now() - t0) / JUMP_MS);
+        const k = 1 - (1 - p) ** 3; // ease-out cubic
+        // Interpolate the CENTRE POINT and derive the pan from it, rather than
+        // lerping x/y directly: x/y are scale-dependent, so tweening them
+        // alongside a changing zoom lets the focal point wander off mid-flight.
+        // Zoom itself is multiplicative, hence geometric — a linear lerp from
+        // 30% to 200% would spend most of the animation near the top and land
+        // as a lurch.
+        const scale = from.scale * zoomRatio ** k;
+        const cx = fromCx + (view.cx - fromCx) * k;
+        const cy = fromCy + (view.cy - fromCy) * k;
+        setViewport({
+          scale,
+          x: rect.width / 2 - cx * scale,
+          y: rect.height / 2 - cy * scale,
+        });
+        jumpRef.current = p < 1 ? requestAnimationFrame(step) : 0;
+      };
+      jumpRef.current = requestAnimationFrame(step);
+    },
+    [containerRect, cancelPendingFit, cancelJump],
+  );
+
+  /** What the fit depends on — geometry only, and rounded, so this doesn't churn
+   *  on sub-pixel height corrections. */
+  const boundsKey = useMemo(() => {
+    const b = boundsOf(nodes);
+    return b
+      ? `${Math.round(b.minX)},${Math.round(b.minY)},${Math.round(b.maxX)},${Math.round(b.maxY)}`
+      : "";
+  }, [nodes]);
+
+  // First-visit auto-fit. Deliberately NOT on the first storage snapshot: the
+  // INBOX reconciler adds its group + lanes (to the LEFT of everything) once
+  // task data lands, and auto-height nodes only report their real heights after
+  // a render — fitting immediately would frame a half-built canvas. So wait for
+  // the bounds to hold still, with a hard cap in case something keeps nudging
+  // them.
+  const fitDeadlineRef = useRef(0);
+  useEffect(() => {
+    if (!pendingFit) return;
+    if (!nodesMap) return; // still connecting — nothing to frame yet
+    if (!fitDeadlineRef.current) fitDeadlineRef.current = performance.now() + 2000;
+    const wait = Math.max(0, Math.min(250, fitDeadlineRef.current - performance.now()));
+    const t = setTimeout(() => {
+      if (boundsKey) fitTo(); // empty canvas: nothing to frame, just reveal it
+      setPendingFit(false);
+    }, wait);
+    return () => clearTimeout(t);
+  }, [pendingFit, nodesMap, boundsKey, fitTo]);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      cancelPendingFit();
+      cancelJump();
       if (e.ctrlKey || e.metaKey) {
         zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.01));
       } else {
@@ -1236,7 +1526,7 @@ export function CanvasEditor({
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [zoomAt]);
+  }, [zoomAt, cancelPendingFit, cancelJump]);
 
   /* -------- keyboard -------- */
   useEffect(() => {
@@ -1290,6 +1580,12 @@ export function CanvasEditor({
         case "V":
           setTool("select");
           break;
+        case "f":
+        case "F":
+          // Frame what you've got selected; with nothing selected, the whole
+          // canvas — the way back to the overview.
+          fitTo(selectedRef.current);
+          break;
         case "Escape":
           setTool("select");
           setSelected(new Set());
@@ -1335,7 +1631,7 @@ export function CanvasEditor({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [history, deleteSelected, nudge, undoDelete]);
+  }, [history, deleteSelected, nudge, undoDelete, fitTo]);
 
   /* -------- paste an image (⌘/Ctrl+V) -------- */
   // Where a pasted image lands: under the cursor if we've seen it, else the
@@ -1560,6 +1856,10 @@ export function CanvasEditor({
   /* -------- pointer: background (pan / create / marquee) -------- */
   const onBackgroundPointerDown = useCallback(
     (e: ReactPointerEvent) => {
+      // You're driving now — neither a pending first-visit fit nor a jump onto
+      // someone else's view may move the camera mid-interaction.
+      cancelPendingFit();
+      cancelJump();
       if (e.button === 1 || spaceRef.current) {
         const startX = e.clientX;
         const startY = e.clientY;
@@ -1672,7 +1972,7 @@ export function CanvasEditor({
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     },
-    [toCanvas, createNode, createDrawNode, removeMany],
+    [toCanvas, createNode, createDrawNode, removeMany, cancelPendingFit, cancelJump],
   );
 
   /* -------- live cursor broadcast -------- */
@@ -1731,6 +2031,25 @@ export function CanvasEditor({
               updates.push({
                 id: other.id,
                 patch: { data: { ...other.data, master: false } },
+              });
+            }
+          }
+        }
+        patchMany(updates);
+      },
+      setThisWeek: (node, thisWeek) => {
+        const updates: { id: string; patch: Partial<StoredNode> }[] = [
+          { id: node.id, patch: { data: { ...node.data, thisWeek } } },
+        ];
+        // One THIS WEEK group per canvas: marking this one demotes any other.
+        // Server-side resolution picks a single group, so two flagged groups
+        // would silently make one of them a decoy.
+        if (thisWeek) {
+          for (const other of nodesRef.current) {
+            if (other.id !== node.id && isThisWeekGroup(other)) {
+              updates.push({
+                id: other.id,
+                patch: { data: { ...other.data, thisWeek: false } },
               });
             }
           }
@@ -1857,18 +2176,40 @@ export function CanvasEditor({
         ) : null}
       </div>
 
-      {/* Presence: who's here */}
-      <div className="absolute right-3 top-3 z-20 flex items-center -space-x-1.5">
-        {others.slice(0, 6).map((o) => (
-          <span
-            key={o.connectionId}
-            title={o.info?.name ?? "Someone"}
-            className="grid h-7 w-7 place-items-center rounded-full border-2 border-surface text-[11px] font-semibold text-white shadow-sm"
-            style={{ backgroundColor: o.info?.color ?? "#7b68ee" }}
-          >
-            {(o.info?.name ?? "?").slice(0, 1).toUpperCase()}
-          </span>
-        ))}
+      {/* Presence: who's here. Click someone to land on their view — same spot,
+          same zoom — so "look at this over here" stops being a treasure hunt.
+          Disabled until they've broadcast a view (they've only just joined). */}
+      <div
+        className={`absolute right-3 top-3 z-20 flex items-center -space-x-1.5 transition-opacity ${
+          peersStale ? "opacity-40 saturate-50" : ""
+        }`}
+      >
+        {others.slice(0, 6).map((o) => {
+          const name = o.info?.name ?? "Someone";
+          const view = o.presence?.view ?? null;
+          // Jumping is purely local, so it still works while stale — but say so,
+          // since where they were may no longer be where they are.
+          const stale = peersStale ? " (not live — last known position)" : "";
+          return (
+            <button
+              key={o.connectionId}
+              type="button"
+              disabled={!view}
+              onClick={() => view && jumpTo(view)}
+              title={
+                view ? `Jump to ${name}'s view${stale}` : `${name} — no view yet${stale}`
+              }
+              aria-label={view ? `Jump to ${name}'s view` : name}
+              // `relative` so the hover lift wins the stacking order: the row
+              // overlaps via negative margin, so a static element can't z-index
+              // itself above the avatar to its right.
+              className="relative grid h-7 w-7 place-items-center rounded-full border-2 border-surface text-[11px] font-semibold text-white shadow-sm transition-transform enabled:cursor-pointer enabled:hover:z-10 enabled:hover:scale-110 disabled:cursor-default"
+              style={{ backgroundColor: o.info?.color ?? "#7b68ee" }}
+            >
+              {name.slice(0, 1).toUpperCase()}
+            </button>
+          );
+        })}
       </div>
 
       <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-md bg-surface/80 px-2 py-1 text-[11px] text-faint shadow-sm backdrop-blur">
@@ -1882,7 +2223,7 @@ export function CanvasEditor({
               ? "Drag to draw · pick colour & width on the left"
               : tool === "erase"
                 ? "Drag across a stroke to erase it"
-                : "T text · B board · P draw · E erase · paste/drop an image · space-drag to pan · ⌘-scroll to zoom"}
+                : "T text · B board · P draw · E erase · F fit · paste/drop an image · space-drag to pan · ⌘-scroll to zoom"}
       </div>
 
       {/* Image upload in progress (paste / drop). */}
@@ -1903,6 +2244,12 @@ export function CanvasEditor({
           {Math.round(viewport.scale * 100)}%
         </button>
         <ToolBtn onClick={() => zoomAtCenter(1.25)} title="Zoom in">+</ToolBtn>
+        <ToolBtn
+          onClick={() => fitTo(selected)}
+          title="Fit — frame the selection, or the whole canvas (F)"
+        >
+          ⤢
+        </ToolBtn>
       </div>
 
       {/* Canvas surface */}
@@ -1934,6 +2281,12 @@ export function CanvasEditor({
           style={{
             transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
             transformOrigin: "0 0",
+            // Hide the pre-fit frame on a first visit, so you never see the
+            // content flash at (0,0) before it's framed. Opacity, not display:
+            // the nodes must still lay out, since the fit reads the heights
+            // they measure. Always cleared with `pendingFit` (which has its own
+            // deadline), so this can't leave the canvas blank.
+            opacity: pendingFit ? 0 : undefined,
           }}
         >
           {ordered.map((node) => {
@@ -2082,6 +2435,7 @@ export function CanvasEditor({
                   height: node.height,
                   outline: `2px solid ${color}`,
                   outlineOffset: 2,
+                  opacity: staleOpacity,
                   // Glide the ring's box too, so it stays glued to a remote
                   // node whose height changes as its text reflows.
                   transition:
@@ -2099,8 +2453,10 @@ export function CanvasEditor({
                 className="pointer-events-none absolute left-0 top-0 z-30"
                 style={{
                   transform: `translate(${o.presence.cursor.x}px, ${o.presence.cursor.y}px)`,
-                  // Glide between the ~100ms-throttled presence updates.
-                  transition: "transform 110ms linear",
+                  opacity: staleOpacity,
+                  // Glide between the ~100ms-throttled presence updates. Nothing
+                  // is moving while stale, so don't animate the last position.
+                  transition: peersStale ? undefined : "transform 110ms linear",
                 }}
               >
                 <div style={{ transform: `scale(${1 / viewport.scale})`, transformOrigin: "0 0" }}>
