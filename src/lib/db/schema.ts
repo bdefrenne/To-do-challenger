@@ -546,6 +546,63 @@ export const taskLogs = pgTable(
   ],
 );
 
+/* ---- Status events ----
+   The RECORD of who work belongs to. One row per status transition,
+   APPEND-ONLY: a transition happened at a time and never changes, so there
+   is no lifecycle here to leak or fall out of sync with the task. Work
+   stints (how long someone spent Analyzing) are DERIVED from consecutive
+   rows, never stored.
+
+   Distinct from `task_logs`, which is a human timeline: prose, deliberately
+   noise-suppressed (title edits and re-sorts aren't logged at all), and
+   never queried for facts. This table is the queryable one.
+
+   Two attribution columns on purpose — collapsing "who clicked" and "whose
+   work it is" into one field is what made every earlier standup wrong. */
+export const taskStatusEvents = pgTable(
+  "task_status_events",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    /** Status left behind. Null when the task was created at `toStatus`. */
+    fromStatus: taskStatus("from_status"),
+    toStatus: taskStatus("to_status").notNull(),
+    at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
+    /** Which surface produced it — the input to the crediting rule below. */
+    source: logSource("source"),
+    /** Who PERFORMED the transition (who clicked). Null outside a request. */
+    actorId: text("actor_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * Whose WORK this is — the standup's key. Resolved once, at write time:
+     * the actor on agent surfaces (the agent works under that account, and
+     * auto-assign has already put them on the task), the ASSIGNEE from the
+     * web UI (moving a card is scheduling, not doing — which is why `ui` is
+     * excluded from ASSIGNING_SOURCES in the first place).
+     *
+     * Null means genuinely unknown: nobody assigned, and not someone
+     * hand-entering a work status. A digest reports those as closed with no
+     * owner rather than crediting whoever happened to press the button.
+     */
+    creditedTo: text("credited_to").references(() => users.id, {
+      onDelete: "set null",
+    }),
+  },
+  (t) => [
+    /* "What did X do between two dates" — the digest's only scan. */
+    index("task_status_events_credited_at_idx").on(t.creditedTo, t.at),
+    /* One task's transitions in order — derives its stints. */
+    index("task_status_events_task_at_idx").on(t.taskId, t.at),
+    /* "What reached done in this window". */
+    index("task_status_events_to_status_at_idx").on(t.toStatus, t.at),
+  ],
+);
+
 /* ---- Image attachments ----
    Images pasted or uploaded onto a task. Bytes live in Vercel Blob; we
    store only the metadata + public URL here. Cascade-deletes with the
@@ -765,6 +822,8 @@ export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
 export type TaskLogRow = typeof taskLogs.$inferSelect;
 export type NewTaskLogRow = typeof taskLogs.$inferInsert;
+export type TaskStatusEventRow = typeof taskStatusEvents.$inferSelect;
+export type NewTaskStatusEventRow = typeof taskStatusEvents.$inferInsert;
 export type TaskAttachmentRow = typeof taskAttachments.$inferSelect;
 export type NewTaskAttachmentRow = typeof taskAttachments.$inferInsert;
 export type UserRow = typeof users.$inferSelect;

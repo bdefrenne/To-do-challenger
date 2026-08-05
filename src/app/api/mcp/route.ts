@@ -34,6 +34,7 @@ import {
   listToday,
   searchTasks,
   countTasks,
+  activityDigest,
   TASK_FILTER_KEYS,
   getTask,
   createTask,
@@ -61,7 +62,6 @@ import {
   listNotes,
   resolveNote,
   linkCommit,
-  standup,
   listCanvases,
   getCanvas,
   createCanvas,
@@ -656,42 +656,68 @@ const handler = createMcpHandler(
 
     server.tool(
       "standup",
-      "Assemble a standup digest for a date window: notes (grouped by type — includes decisions) and tasks finished in the window with their summaries. Dates are ISO/YYYY-MM-DD and BOTH ENDS COUNT — from = to is a valid single-day window covering that whole day. `finished` is scoped to who did the work (the activity log), defaulting to you; pass `actor` for a teammate, or `actor: \"team\"` for everyone.",
+      "Assemble a standup digest for a date window. Dates are ISO/YYYY-MM-DD and BOTH ENDS COUNT — from = to is a valid single-day window covering that whole day.\n" +
+        "\n" +
+        "Work is attributed to WHOSE WORK IT IS, recorded when each status change happened: the assignee when a card was moved in the web UI (moving a card is scheduling, not doing), the actor on agent surfaces. So a task someone else closed on your behalf is NOT yours, and one you built but someone else closed still is. Defaults to you; pass `credited` for a teammate or `\"team\"` for everyone.\n" +
+        "\n" +
+        "Four disjoint lists: `shipped` (reached done, and you worked a stage on it), `handled` (reached done with no working stage — non-code work taken straight to done; say \"handled\", never \"built\"), `worked` (still in flight, with the stage stints you did), and `closedUnattributed` (reached done with nobody creditable — `closedBy` says who pressed the button, which is on the record but is NOT their work). Plus `notes` for the window. An `attribution` field, when present, means the window predates the record — treat it as missing data, not an empty day.",
       {
         from: z.string().min(1).max(40).describe("start of window (inclusive)"),
         to: z.string().min(1).max(40).describe("end of window (inclusive)"),
-        actor: z
+        credited: z
           .string()
           .max(120)
           .optional()
-          .describe('whose finished work — id, email, name, "me" (default), or "team" for everyone'),
+          .describe('whose work — id, email, name, "me" (default), or "team" for everyone'),
       },
-      async ({ from, to, actor }) => {
-        const who = /^(team|all|everyone|\*)$/i.test(actor?.trim() ?? "")
-          ? null
-          : actor
-            ? (await resolveFilter({ actor })).actor
-            : undefined;
-        const data = await standup(currentUser(), from, to, who);
+      async ({ from, to, credited }) => {
+        // Absent means ME, not "everyone" — only an explicit "team" widens it.
+        const who =
+          credited === undefined
+            ? currentUser()
+            : /^(team|all|everyone|\*)$/i.test(credited.trim())
+              ? null
+              : ((await resolveFilter({ actor: credited })).actor ?? NO_SUCH_USER);
+        const [digest, notes] = await Promise.all([
+          activityDigest(currentUser(), { from, to, credited: who }),
+          listNotes(currentUser(), { from, to }),
+        ]);
+        // A digest wants "what shipped", which is the `summary`. Carrying each
+        // task's plan + analysis + description as well multiplies the payload
+        // several times over for material nobody reads here.
+        const entry = (e: {
+          task: TaskDTO;
+          stints: unknown[];
+          moves: unknown[];
+        }) => ({
+          ...projectTask(e.task, "compact"),
+          summary: e.task.summary,
+          // `stints` = time actively working (analyzing/building only).
+          // `moves` = every credited transition, so "handed the analysis over"
+          // is visible even though it has no work time of its own.
+          stints: e.stints,
+          moves: e.moves,
+        });
         return text(
           {
             from,
             to,
-            actor: who === null ? "team" : (who ?? "me"),
-            notes: data.notes,
-            // A digest wants "what shipped", which is the `summary`. Carrying
-            // each task's plan + analysis + description as well multiplies the
-            // payload several times over for material nobody reads here.
-            finished: data.finished.map((t) => ({
-              ...projectTask(t, "compact"),
-              summary: t.summary,
+            credited: who === null ? "team" : who,
+            ...(digest.attribution ? { attribution: digest.attribution } : {}),
+            notes,
+            shipped: digest.shipped.map(entry),
+            handled: digest.handled.map(entry),
+            worked: digest.worked.map(entry),
+            closedUnattributed: digest.closedUnattributed.map((c) => ({
+              ...projectTask(c.task, "compact"),
+              closedBy: c.closedBy,
             })),
           },
           {
-            // Finished tasks carry their full summaries, so a wide window is
-            // the one read that reliably runs long. Cut those before the notes.
-            items: "finished",
-            narrow: ["from", "to", "actor"],
+            // Shipped tasks carry their full summaries, so a wide window is the
+            // one read that reliably runs long. Cut those before the notes.
+            items: "shipped",
+            narrow: ["from", "to", "credited"],
           },
         );
       },
@@ -1372,11 +1398,14 @@ const handler = createMcpHandler(
         argsSchema: { from: z.string(), to: z.string() },
       },
       async ({ from, to }) => {
-        const data = await standup(currentUser(), from, to);
+        const [digest, notes] = await Promise.all([
+          activityDigest(currentUser(), { from, to, credited: currentUser() }),
+          listNotes(currentUser(), { from, to }),
+        ]);
         return await promptMsg(
           `Here's the raw material for a standup covering ${from} → ${to}:\n\n` +
-            `${JSON.stringify(data, null, 2)}\n\n` +
-            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, **Questions**, and **To review** (review-type notes still open); list what shipped (finished tasks + one-line summaries); and call out any notable decisions. Keep it tight enough to paste into a team channel.`,
+            `${JSON.stringify({ ...digest, notes }, null, 2)}\n\n` +
+            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, **Questions**, and **To review** (review-type notes still open); list what shipped (with one-line summaries), and keep \`handled\` items separate from \`shipped\` ones — say "handled", never "built". Mention \`closedUnattributed\` as tasks cleared off the board, never as someone's work. Call out any notable decisions. Keep it tight enough to paste into a team channel.`,
         );
       },
     );

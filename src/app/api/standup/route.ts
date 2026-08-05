@@ -6,7 +6,7 @@
 
 import { NextRequest } from "next/server";
 import { route, json, type AuthedCtx } from "@/lib/api";
-import { standup, resolveAssignees } from "@/lib/db/service";
+import { activityDigest, listNotes, resolveAssignees } from "@/lib/db/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,14 +16,17 @@ export const GET = route(async (req: NextRequest, { userId }: AuthedCtx) => {
   const to = sp.get("to") ?? new Date().toISOString();
   const from =
     sp.get("from") ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  // ?actor=<id|email|name> whose finished work; ?actor=team for everyone.
-  // Absent => the caller's own (standup's default).
-  const raw = sp.get("actor");
-  const actor = !raw
-    ? undefined
+  // ?credited=<id|email|name> whose work; ?credited=team for everyone.
+  // Absent => the caller's own.
+  const raw = sp.get("credited") ?? sp.get("actor");
+  const credited = !raw
+    ? userId
     : /^(team|all|everyone|\*)$/i.test(raw.trim())
       ? null
       : (await resolveAssignees([raw]))[0] ?? "__no_such_user__";
-  const data = await standup(userId, from, to, actor);
-  return json({ from, to, actor: actor === null ? "team" : (actor ?? userId), ...data });
+  const [digest, notes] = await Promise.all([
+    activityDigest(userId, { from, to, credited, tz: sp.get("tz") ?? undefined }),
+    listNotes(userId, { from, to }),
+  ]);
+  return json({ ...digest, notes });
 });

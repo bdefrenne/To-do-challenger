@@ -15,6 +15,7 @@ import { db } from "./client";
 import {
   tasks,
   taskLogs,
+  taskStatusEvents,
   taskAttachments,
   taskNotes,
   taskCommits,
@@ -25,6 +26,8 @@ import {
   canvases,
   canvasNodes,
   type TaskRow,
+  type TaskStatusEventRow,
+  type NewTaskStatusEventRow,
   type TaskAttachmentRow,
   type TaskNoteRow,
   type TaskCommitRow,
@@ -503,6 +506,80 @@ const ASSIGNING_SOURCES: ReadonlySet<LogSource> = new Set<LogSource>([
 /** Add the acting user to an assignee list — idempotent, order-preserving. */
 const withActor = (list: string[], userId: string) =>
   list.includes(userId) ? list : [...list, userId];
+
+/* -------------------------------------------------------------------- */
+/* Status events — the record of WHOSE WORK a transition is              */
+/* -------------------------------------------------------------------- */
+
+/**
+ * Who a transition should be CREDITED to — resolved once, here, at write time,
+ * so no reader ever has to guess. Returns one entry per credited person, or a
+ * single `null` when nobody can honestly be credited.
+ *
+ * The rule follows what each surface MEANS:
+ *
+ * - **Agent surfaces** (`api`/`mcp`/`telegram`) — the actor is the worker: they
+ *   drove the change through their own account, and `claimsWork` has already
+ *   put them on the task. Credit the actor.
+ * - **The web UI** — moving a card is scheduling, not doing. Credit the
+ *   task's ASSIGNEES: Ben dragging Antho's card into Building is recording that
+ *   *Antho* is building it. This is the same reasoning that keeps `ui` out of
+ *   `ASSIGNING_SOURCES`, applied to attribution.
+ * - **Nobody assigned** — hand-entering a work status means you're picking it up
+ *   yourself, so credit the actor. Any other status with no assignee is
+ *   genuinely unattributable: `null`, which a digest reports as "closed, owner
+ *   unknown" rather than crediting whoever pressed the button.
+ *
+ * Outside a request (seed/backfill scripts) there's no actor, so this credits
+ * the assignees or nobody — it never invents one. Same fail-safe as the
+ * assignment policy.
+ */
+function creditFor(
+  to: TaskStatus,
+  assigneeIds: string[],
+  actorId: string | undefined,
+  source: LogSource | undefined,
+): (string | null)[] {
+  if (source && ASSIGNING_SOURCES.has(source) && actorId) return [actorId];
+  if (assigneeIds.length) return [...assigneeIds];
+  if (WORK_STATUSES.has(to) && actorId) return [actorId];
+  return [null];
+}
+
+/** The append-only row(s) for one status transition — one per credited person.
+ *  Pure, so the bulk path can batch many transitions into a single INSERT. */
+function statusEventRows(input: {
+  taskId: string;
+  from: TaskStatus | null;
+  to: TaskStatus;
+  assigneeIds: string[];
+  at: Date;
+}): NewTaskStatusEventRow[] {
+  const ctx = currentLogContext();
+  return creditFor(input.to, input.assigneeIds, ctx?.actorId, ctx?.source).map(
+    (creditedTo) => ({
+      taskId: input.taskId,
+      fromStatus: input.from,
+      toStatus: input.to,
+      at: input.at,
+      source: ctx?.source,
+      actorId: ctx?.actorId,
+      creditedTo,
+    }),
+  );
+}
+
+/** Record one status transition. Fire-and-forget: nothing to close, nothing to
+ *  keep in sync — which is the whole reason this is events and not spans. */
+async function recordStatusEvent(input: {
+  taskId: string;
+  from: TaskStatus | null;
+  to: TaskStatus;
+  assigneeIds: string[];
+  at: Date;
+}): Promise<void> {
+  await db.insert(taskStatusEvents).values(statusEventRows(input));
+}
 
 /** Does writing `status` from the current surface claim the task for its actor?
  *  No transition check: writing "building" onto an already-building task
@@ -1373,6 +1450,15 @@ export async function createTask(
       (autoAssigned ? ` · ${await autoAssignNote(userId)}` : ""),
     author,
   );
+  // Birth is a transition too (from nothing), so a task created straight into
+  // Building has an event to credit, same as one that got there by a move.
+  await recordStatusEvent({
+    taskId: row.id,
+    from: null,
+    to: status,
+    assigneeIds: row.assigneeIds,
+    at: row.createdAt,
+  });
   return rowToTask(row, 0, [], ctx);
 }
 
@@ -1544,6 +1630,17 @@ export async function updateTask(
     )[0];
     throw new ConflictError(fresh ? rowToTask(fresh, 0) : null);
   }
+
+  if (statusChanged)
+    await recordStatusEvent({
+      taskId: id,
+      from: current.status,
+      to: patch.status!,
+      // Post-update assignees: `claimsWork` may have just added the actor, and
+      // the credit rule must read the list as it stands AFTER the write.
+      assigneeIds: row.assigneeIds,
+      at: now,
+    });
 
   // One activity row summarizing what changed (mirrors bulkUpdate): the status
   // transition and/or the field edits, joined with " · ". Kind stays "status"
@@ -1729,6 +1826,14 @@ export async function moveTask(
     })
     .where(eq(tasks.id, id))
     .returning();
+  if (statusChanged)
+    await recordStatusEvent({
+      taskId: id,
+      from: current.status,
+      to: status,
+      assigneeIds: row.assigneeIds,
+      at: now,
+    });
   const moveNotes = [
     ...(autoLocked ? [`🔒 Locked as ${autoLocked}`] : []),
     ...(autoAssigned ? [await autoAssignNote(userId)] : []),
@@ -2195,6 +2300,26 @@ export async function bulkUpdate(
   });
   if (logRows.length) await db.insert(taskLogs).values(logRows);
 
+  // 4b. One batched INSERT of status events, for the rows whose status actually
+  //     moved. Same crediting rule as the single-task paths — it reads each
+  //     row's OWN post-update assignees, which is why the per-row SQL merge in
+  //     step 2 matters here: a bulk "move these to Building" credits each task
+  //     to whoever is on it, not all of them to the caller.
+  if (patch.status !== undefined) {
+    const eventRows = rows
+      .filter((r) => patch.status !== priorStatus.get(r.id))
+      .flatMap((r) =>
+        statusEventRows({
+          taskId: r.id,
+          from: priorStatus.get(r.id)!,
+          to: patch.status!,
+          assigneeIds: r.assigneeIds,
+          at: now,
+        }),
+      );
+    if (eventRows.length) await db.insert(taskStatusEvents).values(eventRows);
+  }
+
   // 5. Shape the refreshed tasks (comment counts, like updateTask), preferring
   //     the post-lock row for anything 3b froze. `codes` is passed so soft codes
   //     resolve their prefix — without it every `code` came back undefined.
@@ -2547,43 +2672,238 @@ export async function linkCommit(
 /* Standup digest                                                        */
 /* -------------------------------------------------------------------- */
 
-/** Everything the standup prompt/view needs for a date window, in one call.
- *  Notes now carry decisions too (type "decision"), so there's no separate
- *  decisions list. */
-export interface StandupData {
-  notes: Note[];
-  finished: TaskDTO[];
+/** One person's work on one task inside a window. Both lists are DERIVED from
+ *  consecutive events, never stored — so they can't drift from the task's status. */
+export interface WorkEntry {
+  task: TaskDTO;
+  /**
+   * Time spent actively working, per stage — open-ended while still in it.
+   * Only `analyzing`/`building`: sitting in `analyzed` or `review` is waiting
+   * for the next person, and billing that as work time would be a lie.
+   */
+  stints: { status: TaskStatus; from: string; to: string | null; minutes: number | null }[];
+  /** Every credited transition in the window, so a person whose whole
+   *  contribution was "handed the analysis over" still has something to show. */
+  moves: { to: TaskStatus; at: string }[];
 }
 
-/**
- * The digest for a window. `actor` is who did the work — the activity log's
- * `actorId`, defaulting to the caller, so "what did I ship?" is exact. Pass
- * `actor: null` for the whole team.
- *
- * Built on `listTasksFlat` rather than its own query, so it inherits the
- * half-open window (a single-day `from = to` used to return nothing) and the
- * team-wide visibility every other task read already has.
- */
-export async function standup(
-  userId: string,
-  from: string,
-  to: string,
-  actor?: string | null,
-): Promise<StandupData> {
-  const [notes, finished] = await Promise.all([
-    listNotes(userId, { from, to }),
-    listTasksFlat(userId, {
-      status: ["done"],
-      completedFrom: from,
-      completedTo: to,
-      // A task archived right after being finished still shipped.
-      includeArchived: true,
-      actor: actor === null ? undefined : (actor ?? userId),
-      sort: "recent",
-    }),
-  ]);
-  return { notes, finished };
+/** A window's work, attributed per person. Every list is disjoint: a task lands
+ *  in exactly one of them for a given viewer. */
+export interface ActivityDigest {
+  from: string;
+  to: string;
+  /** Whose digest this is — a user id, or "team" when unfiltered. */
+  credited: string | "team";
+  /** Reached done in the window, with a working stage credited to this person. */
+  shipped: WorkEntry[];
+  /** Their other credited transitions in the window (still in flight). */
+  worked: WorkEntry[];
+  /** Reached done credited to them with NO prior working stage — non-code work
+   *  taken straight to Done. Rendered "handled", never "built". */
+  handled: WorkEntry[];
+  /** Reached done with nobody creditable. `closedBy` is who pressed the button:
+   *  on the record, but not counted as their work. */
+  closedUnattributed: { task: TaskDTO; closedBy: string | null }[];
+  /** Set when the window predates the event log — attribution isn't knowable
+   *  there, and saying so beats reconstructing it from prose. */
+  attribution?: string;
 }
+
+/** Reaching any of these counts as having WORKED the task — including the
+ *  handoff states, since "I analyzed it and handed it on" is work even though
+ *  the person never touched `building`. */
+const WORKED_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "analyzing",
+  "analyzed",
+  "building",
+  "review",
+]);
+
+/** …but only these are ACTIVE work, so only these produce a timed stint. A task
+ *  parked in Review for three days says nothing about how long anyone worked. */
+const ACTIVE_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  "analyzing",
+  "building",
+]);
+
+/**
+ * Work in a window, attributed by `credited_to` — who the work belongs to, as
+ * resolved at write time by `creditFor`. Pass `credited` for one person, omit it
+ * for the whole team.
+ *
+ * Reads `task_status_events` (append-only) and derives each stint from the gap
+ * to that task's next event, so nothing here can disagree with the task's real
+ * status. Deliberately NOT built on `task_logs`: that's a human timeline, and
+ * the facts a digest needs were never in it.
+ */
+export async function activityDigest(
+  userId: string,
+  // `credited` is REQUIRED and explicit: a user id for one person, `null` for
+  // the whole team. It was optional once, and the one caller that omitted it got
+  // an unfiltered team digest labelled "me" — every other person's work
+  // presented as yours. An ambiguous default here is worse than a verbose call.
+  opts: { from: string; to: string; credited: string | null; tz?: string },
+): Promise<ActivityDigest> {
+  const w = dateWindow(opts.from, opts.to, opts.tz);
+  const conds: (SQL | undefined)[] = [...inWindow(taskStatusEvents.at, w)];
+  // One person's digest = their credited work, PLUS anything they closed that
+  // nobody can be credited for. You should see the stale tasks you cleared —
+  // they're just listed as cleared rather than counted as work.
+  if (opts.credited)
+    conds.push(
+      or(
+        eq(taskStatusEvents.creditedTo, opts.credited),
+        and(
+          isNull(taskStatusEvents.creditedTo),
+          eq(taskStatusEvents.actorId, opts.credited),
+        ),
+      ),
+    );
+
+  // Events in the window, plus — for stint ends — each one's successor on the
+  // same task, and — for "did they ever work it" — every event on those tasks.
+  const inWindowRows = await db
+    .select()
+    .from(taskStatusEvents)
+    .where(and(...conds))
+    .orderBy(asc(taskStatusEvents.at));
+
+  const taskIds = [...new Set(inWindowRows.map((r) => r.taskId))];
+  if (!taskIds.length)
+    return {
+      from: opts.from,
+      to: opts.to,
+      credited: opts.credited ?? "team",
+      shipped: [],
+      worked: [],
+      handled: [],
+      closedUnattributed: [],
+      ...(await attributionCaveat(w)),
+    };
+
+  const [allRows, tasksById] = await Promise.all([
+    db
+      .select()
+      .from(taskStatusEvents)
+      .where(inArray(taskStatusEvents.taskId, taskIds))
+      .orderBy(asc(taskStatusEvents.at)),
+    tasksByIds(userId, taskIds).then(
+      (ts) => new Map(ts.map((t) => [t.id, t])),
+    ),
+  ]);
+
+  /** taskId → its events in order, for deriving stint ends. */
+  const timeline = new Map<string, TaskStatusEventRow[]>();
+  for (const r of allRows) {
+    const list = timeline.get(r.taskId);
+    if (list) list.push(r);
+    else timeline.set(r.taskId, [r]);
+  }
+  /** When did this event's stage end? The next event on the task, or open. */
+  const endOf = (r: TaskStatusEventRow): Date | null => {
+    const list = timeline.get(r.taskId) ?? [];
+    const next = list.find((o) => o.at > r.at);
+    return next ? next.at : null;
+  };
+
+  const shipped: WorkEntry[] = [];
+  const worked: WorkEntry[] = [];
+  const handled: WorkEntry[] = [];
+  const closedUnattributed: ActivityDigest["closedUnattributed"] = [];
+
+  // Group the window's events by (credited person, task) so one task yields one
+  // entry per person, carrying all of their stints on it.
+  const byPerson = new Map<string, TaskStatusEventRow[]>();
+  for (const r of inWindowRows) {
+    const key = `${r.creditedTo ?? ""} ${r.taskId}`;
+    const list = byPerson.get(key);
+    if (list) list.push(r);
+    else byPerson.set(key, [r]);
+  }
+
+  for (const [key, events] of byPerson) {
+    const [credited, taskId] = key.split(" ");
+    const task = tasksById.get(taskId);
+    if (!task) continue; // deleted, or outside this viewer's reach
+
+    const closedHere = events.some((e) => e.toStatus === "done");
+
+    if (!credited) {
+      // Nobody creditable. Only surface the close itself — an unattributable
+      // "moved to review" is noise, but an unattributable ship is a fact.
+      if (closedHere)
+        closedUnattributed.push({
+          task,
+          closedBy: events.find((e) => e.toStatus === "done")?.actorId ?? null,
+        });
+      continue;
+    }
+
+    const stints = events
+      .filter((e) => ACTIVE_STATUSES.has(e.toStatus))
+      .map((e) => {
+        const end = endOf(e);
+        return {
+          status: e.toStatus,
+          from: iso(e.at)!,
+          to: iso(end) ?? null,
+          minutes: end
+            ? Math.round((end.getTime() - e.at.getTime()) / 60_000)
+            : null,
+        };
+      });
+    const moves = events.map((e) => ({ to: e.toStatus, at: iso(e.at)! }));
+    const workedHere = events.some((e) => WORKED_STATUSES.has(e.toStatus));
+
+    const entry: WorkEntry = { task, stints, moves };
+
+    if (closedHere) {
+      // Did this person ever work a stage on it — in this window or before? If
+      // so it's theirs; if not, they took it straight to done (non-code work).
+      const everWorked = (timeline.get(taskId) ?? []).some(
+        (e) => e.creditedTo === credited && WORKED_STATUSES.has(e.toStatus),
+      );
+      (everWorked ? shipped : handled).push(entry);
+    } else if (workedHere) {
+      worked.push(entry);
+    }
+  }
+
+  return {
+    from: opts.from,
+    to: opts.to,
+    credited: opts.credited ?? "team",
+    shipped,
+    worked,
+    handled,
+    closedUnattributed,
+    ...(await attributionCaveat(w)),
+  };
+}
+
+/** Warn when a window starts before the event log did, so an empty or thin
+ *  digest reads as "not recorded yet" instead of "you did nothing". */
+async function attributionCaveat(w: {
+  start?: Date;
+  end?: Date;
+}): Promise<{ attribution?: string }> {
+  if (!w.start) return {};
+  const [first] = await db
+    .select({ at: taskStatusEvents.at })
+    .from(taskStatusEvents)
+    .orderBy(asc(taskStatusEvents.at))
+    .limit(1);
+  if (!first || first.at <= w.start) return {};
+  return {
+    attribution: `unavailable-before-${iso(first.at)} — attribution wasn't recorded before then, so anything earlier is missing rather than empty`,
+  };
+}
+
+/* `standup()` is gone: it wrapped `activityDigest` in a flat `finished` list,
+   which is the very conflation this task removed — a task you shipped and one
+   someone else closed off the board are different facts and now have different
+   homes. Callers (the MCP tool, the standup prompt, /api/standup) read the
+   digest directly and pair it with `listNotes`. */
 
 /* -------------------------------------------------------------------- */
 /* Projects & Boards                                                     */
