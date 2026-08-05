@@ -97,7 +97,7 @@ export function DailyFocus() {
                     <span className="text-buff">✓</span>
                     <button
                       onClick={() => openTask(n.id)}
-                      className="text-faint line-through hover:text-fg"
+                      className="text-faint hover:text-fg"
                     >
                       {taskMap[n.id]?.title}
                     </button>

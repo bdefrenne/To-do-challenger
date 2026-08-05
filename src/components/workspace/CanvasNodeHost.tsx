@@ -40,7 +40,6 @@ export interface NodeApi {
   patch: (id: string, patch: Record<string, unknown>) => void;
   resizeStart: () => void;
   resizeEnd: () => void;
-  setMaster: (node: CanvasNodeT, master: boolean) => void;
   setThisWeek: (node: CanvasNodeT, thisWeek: boolean) => void;
   remove: (id: string) => void;
   linkStart: (e: ReactPointerEvent, node: CanvasNodeT) => void;
@@ -97,7 +96,6 @@ function CanvasNodeHostInner({
       onPatch={(patch) => api.patch(node.id, patch)}
       onResizeStart={api.resizeStart}
       onResizeEnd={api.resizeEnd}
-      onSetMaster={(v) => api.setMaster(node, v)}
       onSetThisWeek={
         node.kind === "section_group" ? (v) => api.setThisWeek(node, v) : undefined
       }

@@ -590,7 +590,7 @@ function DayCell({
               title={`${t.title} · ${STATUS_LABEL[t.status]}`}
             >
               <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
-              <span className={`truncate ${t.status === "done" ? "line-through opacity-70" : ""}`}>
+              <span className={`truncate ${t.status === "done" ? "opacity-70" : ""}`}>
                 {t.title}
               </span>
             </button>

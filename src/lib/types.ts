@@ -18,6 +18,29 @@ export type TaskStatus =
   | "review"
   | "done";
 
+/**
+ * Where a task sits on the canvas — its triage bucket, an axis entirely
+ * independent of `status`. Writers name one of these and the service resolves it
+ * to a `canvasSectionId` pin (see `resolvePlacementSection`); nothing stores the
+ * word itself.
+ *
+ *   inbox         untriaged — no pin, so it surfaces in its board's INBOX lane
+ *   thisWeek      scheduled for this week — the starred group's lane for its board
+ *   backlog       triaged, not scheduled
+ *   later         deliberately deferred
+ *   doneThisWeek  finished this week, not yet swept
+ *
+ * Note `backlog` here is the *place*, unrelated to the `backlog` TaskStatus: a
+ * task can be Building and still parked in the LATER group, and moving a card
+ * between groups never touches its status.
+ */
+export type TaskPlacement =
+  | "inbox"
+  | "thisWeek"
+  | "backlog"
+  | "later"
+  | "doneThisWeek";
+
 /** How often a task repeats. */
 export type Recurrence = "none" | "daily" | "weekly" | "monthly";
 

@@ -44,7 +44,7 @@ export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
         }}
         className={[
           "block w-full whitespace-normal break-words text-left text-sm font-semibold",
-          done ? "text-buff line-through" : "text-fg",
+          done ? "text-buff" : "text-fg",
         ].join(" ")}
       >
         {task.title}

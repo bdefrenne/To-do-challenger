@@ -20,13 +20,21 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { requireUser, AuthError } from "@/lib/auth";
 import { withLogContext } from "@/lib/db/log-context";
-import { ConflictError, bulkOpSchema, updateTaskSchema } from "@/lib/api";
+import {
+  ConflictError,
+  bulkOpSchema,
+  updateTaskSchema,
+  taskFilterShape,
+  taskDetailSchema,
+} from "@/lib/api";
 import { daysAgo } from "@/lib/format";
 import {
   listTasks,
   listTasksFlat,
   listToday,
   searchTasks,
+  countTasks,
+  TASK_FILTER_KEYS,
   getTask,
   createTask,
   updateTask,
@@ -71,6 +79,7 @@ import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
 import { WORKFLOW } from "@/lib/workflow";
 import { langSuffix } from "@/lib/prompts";
+import { capped, type CapOpts } from "@/lib/mcp-response";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -98,6 +107,15 @@ const statusEnum = z.enum([
   "done",
 ]);
 const recurrenceEnum = z.enum(["none", "daily", "weekly", "monthly"]);
+/** Which canvas group a task is filed in — its triage bucket, independent of
+ *  status. Mirrors `placementSchema` in api.ts. */
+const placementEnum = z.enum([
+  "inbox",
+  "thisWeek",
+  "backlog",
+  "later",
+  "doneThisWeek",
+]);
 /** Fibonacci points for value (payoff) and difficulty (effort). */
 const fibEnum = z.union([
   z.literal(1),
@@ -185,27 +203,98 @@ function membersToPublic(
     .map((u) => ({ id: u.id, name: u.name, email: u.email }));
 }
 
-const text = (data: unknown) => ({
-  content: [
-    {
-      type: "text" as const,
-      text: typeof data === "string" ? data : JSON.stringify(data, null, 2),
-    },
-  ],
+/**
+ * Every tool result goes out through here, so the response budget
+ * (`@/lib/mcp-response`) is enforced in exactly one place — including for
+ * tools added later, which is the point.
+ */
+const text = (data: unknown, opts?: CapOpts) => ({
+  content: [{ type: "text" as const, text: capped(data, opts) }],
 });
 
-/** Strip the free-text working fields (analysisSummary, plan, summary) from a
- *  task and, recursively, its subtasks. These carry file paths and code detail,
- *  so multi-task listings omit them — an AI must NOT infer where code lives from
- *  another task's notes; read the code directly (or `get_task` /
- *  `list_tasks_full_details` when it genuinely needs one task's own detail). */
-function slimTask(t: TaskDTO): TaskDTO {
-  const rest: TaskDTO = { ...t };
-  delete rest.analysisSummary;
-  delete rest.plan;
-  delete rest.summary;
-  if (rest.subtasks) rest.subtasks = rest.subtasks.map(slimTask);
-  return rest;
+/** No real account resolves to this, so an unresolvable name filters to
+ *  nothing rather than silently matching everyone. */
+const NO_SUCH_USER = "__no_such_user__";
+
+/** Resolve the human-shaped fields of a task filter to account ids: `assignee`
+ *  (who it's for) and `actor` (who touched it) both accept an id, email or
+ *  display name, plus "me" for the calling user. */
+async function resolveFilter<T extends { assignee?: string; actor?: string }>(
+  filter: T,
+): Promise<T> {
+  const out = { ...filter };
+  const resolve = async (token: string) =>
+    /^(me|myself|self)$/i.test(token.trim())
+      ? currentUser()
+      : (await resolveAssignees([token]))[0] ?? NO_SUCH_USER;
+  if (out.assignee) out.assignee = await resolve(out.assignee);
+  if (out.actor) out.actor = await resolve(out.actor);
+  return out;
+}
+
+/** Tasks in a payload, counting nested subtasks — `rows.length` alone counts
+ *  only roots, which would under-report a tree read. */
+const countNodes = (ts: TaskDTO[]): number =>
+  ts.reduce((n, t) => n + 1 + countNodes(t.subtasks ?? []), 0);
+
+/**
+ * How much of each task a multi-task listing returns.
+ *
+ * - `compact` (the default) — what you need to FIND a task and see where it
+ *   stands. No description, no timestamp noise: those are what make a
+ *   whole-board read too big to send.
+ * - `standard` — everything except the free-text working fields.
+ * - `full` — those three fields too. Rarely right: they carry file paths and
+ *   code detail for how ANOTHER task was built, and an AI must never infer
+ *   where code lives from them. Read the code directly, or `get_task` the one
+ *   task you actually care about.
+ */
+type TaskDetail = "compact" | "standard" | "full";
+
+/** Fields kept at `compact`. Everything else is dropped. */
+const COMPACT_FIELDS = [
+  "id",
+  "code",
+  "ref",
+  "title",
+  "status",
+  "statusSince",
+  "assigneeIds",
+  "boardId",
+  "projectId",
+  "parentId",
+  "dueDate",
+  "startDate",
+  "value",
+  "difficulty",
+  "importance",
+  "completedAt",
+  "archivedAt",
+  "dependsOn",
+] as const;
+
+function projectTask(t: TaskDTO, detail: TaskDetail): TaskDTO {
+  let out: TaskDTO;
+  if (detail === "compact") {
+    const src = t as unknown as Record<string, unknown>;
+    const picked: Record<string, unknown> = {};
+    for (const k of COMPACT_FIELDS) {
+      const v = src[k];
+      // Drop nulls and empty arrays: on a compact read they're pure overhead.
+      if (v != null && !(Array.isArray(v) && v.length === 0)) picked[k] = v;
+    }
+    out = picked as unknown as TaskDTO;
+  } else {
+    out = { ...t };
+    if (detail === "standard") {
+      delete out.analysisSummary;
+      delete out.plan;
+      delete out.summary;
+    }
+  }
+  if (t.subtasks?.length)
+    out.subtasks = t.subtasks.map((s) => projectTask(s, detail));
+  return out;
 }
 
 /** An image content block (base64) — how an AI actually "sees" an attachment. */
@@ -240,23 +329,45 @@ const handler = createMcpHandler(
   (server) => {
     server.tool(
       "list_tasks",
-      "List every task on the board — the nested tree with stable ids, statuses, assignees, start/due dates, value/difficulty points, recurrence, dependencies and subtasks. Deliberately OMITS the free-text working fields (analysisSummary, plan, summary): those describe how another task was built and must NOT be used to infer where code lives — read the code directly, or `get_task` a specific task for its own detail. (Use `list_tasks_full_details` only if you truly need every task's analysis/plan/summary at once.) Use format:'markdown' for a compact, skimmable view.",
-      { format: z.enum(["json", "markdown"]).optional().default("json") },
-      async ({ format }) => {
-        const tree = await listTasks(currentUser());
+      "Read tasks — FILTER FIRST, never download the board. Every filter is optional and they AND together; `detail` controls how much of each task comes back and `limit` caps the rows.\n" +
+        "\n" +
+        "Activity windows answer the questions that used to need the whole board: `statusChangedFrom`/`To` = what MOVED in a date range, `completedFrom`/`To` = what shipped, `updatedFrom`/`To` = what was touched. A bare YYYY-MM-DD means that whole day, and from = to is a legitimate single-day window. `actor` narrows to who actually DID the work (the activity log), which is what \"what did I do today\" means — not `assignee`, which is who it's for.\n" +
+        "\n" +
+        "Defaults: done tasks are hidden (`includeDone: true` to see them), archived excluded, `detail: 'compact'`, nested tree. `detail: 'standard'` adds descriptions and the rest of the metadata; `detail: 'full'` also returns the free-text working fields (analysisSummary/plan/summary) — rarely right, and NEVER a source for where code lives: those describe how another task was built, so read the code directly or `get_task` the one task you care about. Use format:'markdown' for a skimmable board.",
+      {
+        ...taskFilterShape,
+        includeDone: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("include done tasks (hidden by default — ask for them)"),
+        detail: taskDetailSchema.optional().default("compact"),
+        shape: z
+          .enum(["tree", "flat"])
+          .optional()
+          .default("tree")
+          .describe("`tree` nests subtasks; `flat` is one row per task"),
+        format: z.enum(["json", "markdown"]).optional().default("json"),
+      },
+      async ({ format, detail, shape, ...filter }) => {
+        const f = await resolveFilter(filter);
+        const [rows, total] = await Promise.all([
+          shape === "flat"
+            ? listTasksFlat(currentUser(), f)
+            : listTasks(currentUser(), f),
+          countTasks(currentUser(), f),
+        ]);
+        if (format === "markdown")
+          return text(toMarkdown(rows, await userNameMap()));
         return text(
-          format === "markdown"
-            ? toMarkdown(tree, await userNameMap())
-            : { tasks: tree.map(slimTask) },
+          {
+            count: countNodes(rows),
+            total,
+            tasks: rows.map((t) => projectTask(t, detail)),
+          },
+          { items: "tasks", total, narrow: TASK_FILTER_KEYS },
         );
       },
-    );
-
-    server.tool(
-      "list_tasks_full_details",
-      "Like list_tasks, but INCLUDES every task's free-text working fields (analysisSummary, plan, summary) in the nested tree. Rarely needed — prefer list_tasks. Even here, treat another task's analysis/plan as background only: never infer file paths or code layout from it; read the actual code (or the specific task via get_task) before acting.",
-      {},
-      async () => text({ tasks: await listTasks(currentUser()) }),
     );
 
     server.tool(
@@ -289,7 +400,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). PLACEMENT — where the task lands on the canvas: by default it goes to its board's INBOX lane, the pile of things for later. Pass `thisWeek: true` when it's to be done THIS WEEK, or when you're about to start on it — it's then filed on the canvas's THIS WEEK board instead. Creating it at analyzing/building already implies `thisWeek`. Pass `thisWeek: false` to force it to INBOX regardless (e.g. the user said \"later\").",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). PLACEMENT — which canvas group the task lands in, an axis independent of status: it defaults to `inbox` (untriaged), and creating it at analyzing/building implies `thisWeek`. Pass `placement: \"thisWeek\"` when it's to be done this week or you're about to start on it, `\"backlog\"` when it's triaged but not scheduled, `\"later\"` when the user said later, `\"inbox\"` to force it back to untriaged.",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -305,11 +416,16 @@ const handler = createMcpHandler(
         description: z.string().max(10_000).optional(),
         parentId: taskHandle.optional(),
         boardId: z.string().nullable().optional(),
+        placement: placementEnum
+          .optional()
+          .describe(
+            "Which canvas group to file it in: 'inbox' (untriaged, the default), 'thisWeek' (do it this week, or you're starting now), 'backlog' (triaged, not scheduled), 'later' (deferred), 'doneThisWeek' (finished, awaiting a sweep). Omit to let the status decide.",
+          ),
         thisWeek: z
           .boolean()
           .optional()
           .describe(
-            "true = file it on the canvas's THIS WEEK board (do it this week, or you're starting now); false = force it to INBOX (for later). Omit to let the status decide.",
+            "Deprecated — use `placement`. true = thisWeek, false = inbox.",
           ),
       },
       // A task born into analyzing/building is assigned to the acting user by
@@ -320,7 +436,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `thisWeek: true` moves the task onto the canvas's THIS WEEK board, `false` sends it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review does the former automatically for a task nobody has filed by hand.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `placement` moves the task between the canvas's groups — 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review files it on THIS WEEK automatically, but only for a task nobody has filed by hand. Placement never changes status, and status never changes placement beyond that one rule.",
       {
         id: taskHandle,
         title: z.string().min(1).max(500).optional(),
@@ -338,11 +454,16 @@ const handler = createMcpHandler(
         analysisSummary: z.string().max(20_000).nullable().optional(),
         plan: z.string().max(20_000).nullable().optional(),
         summary: z.string().max(20_000).nullable().optional(),
+        placement: placementEnum
+          .optional()
+          .describe(
+            "Move it to a canvas group: 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Omit to let the status decide.",
+          ),
         thisWeek: z
           .boolean()
           .optional()
           .describe(
-            "true = move it onto the canvas's THIS WEEK board; false = send it back to its board's INBOX lane. Omit to let the status decide.",
+            "Deprecated — use `placement`. true = thisWeek, false = inbox.",
           ),
         expectedUpdatedAt: z
           .string()
@@ -434,42 +555,27 @@ const handler = createMcpHandler(
 
     server.tool(
       "search_tasks",
-      "Query your tasks by any combination of filters — PREFER this over list_tasks for targeted questions like 'what's overdue?', 'urgent work tasks', or 'what's assigned to Simon?'. All filters are optional and AND together. Returns a flat list. Like list_tasks, it OMITS the free-text working fields (analysisSummary, plan, summary) — get_task a specific task for those, and never infer code locations from another task's notes.",
+      "The FLAT-list twin of list_tasks — same filters, one row per task, no nesting. Good for targeted questions ('what's overdue?', \"what's assigned to Simon?\", 'what did I finish last week?'). Unlike list_tasks it includes done tasks unless you pass includeDone:false, since search is often looking for finished work. Defaults to detail:'compact'; it never returns the free-text working fields unless you ask for detail:'full', and those must not be used to infer where code lives.",
       {
-        status: z.array(statusEnum).optional(),
-        assignee: z
-          .string()
-          .max(120)
-          .optional()
-          .describe("a user id, email, or display name — matches one of a task's assignees"),
-        text: z.string().max(200).optional().describe("substring of title or description"),
-        dueBefore: ymd.optional(),
-        dueAfter: ymd.optional(),
-        overdue: z.boolean().optional().describe("past due and not done"),
-        boardId: z.string().optional(),
-        projectId: z.string().optional(),
-        includeArchived: z
-          .boolean()
-          .optional()
-          .describe("also include archived tasks (excluded by default)"),
-        archivedOnly: z
-          .boolean()
-          .optional()
-          .describe("return ONLY archived tasks (the Archived view)"),
+        ...taskFilterShape,
+        detail: taskDetailSchema.optional().default("compact"),
         format: z.enum(["json", "markdown"]).optional().default("json"),
       },
-      async ({ format, ...filter }) => {
-        // Assignees are stored as account ids; resolve a human name/email to an
-        // id so the filter matches. Unresolvable → a sentinel that matches none.
-        if (filter.assignee) {
-          filter.assignee =
-            (await resolveAssignees([filter.assignee]))[0] ?? "__no_such_user__";
-        }
-        const result = await searchTasks(currentUser(), filter);
+      async ({ format, detail, ...filter }) => {
+        const f = await resolveFilter(filter);
+        const [result, total] = await Promise.all([
+          searchTasks(currentUser(), f),
+          countTasks(currentUser(), f),
+        ]);
+        if (format === "markdown")
+          return text(toMarkdown(result, await userNameMap()));
         return text(
-          format === "markdown"
-            ? toMarkdown(result, await userNameMap())
-            : { count: result.length, tasks: result.map(slimTask) },
+          {
+            count: result.length,
+            total,
+            tasks: result.map((t) => projectTask(t, detail)),
+          },
+          { items: "tasks", total, narrow: TASK_FILTER_KEYS },
         );
       },
     );
@@ -550,12 +656,45 @@ const handler = createMcpHandler(
 
     server.tool(
       "standup",
-      "Assemble a standup digest for a date window: notes (grouped by type — includes decisions) and tasks finished in the window with their summaries. Dates are ISO/YYYY-MM-DD (inclusive).",
+      "Assemble a standup digest for a date window: notes (grouped by type — includes decisions) and tasks finished in the window with their summaries. Dates are ISO/YYYY-MM-DD and BOTH ENDS COUNT — from = to is a valid single-day window covering that whole day. `finished` is scoped to who did the work (the activity log), defaulting to you; pass `actor` for a teammate, or `actor: \"team\"` for everyone.",
       {
         from: z.string().min(1).max(40).describe("start of window (inclusive)"),
         to: z.string().min(1).max(40).describe("end of window (inclusive)"),
+        actor: z
+          .string()
+          .max(120)
+          .optional()
+          .describe('whose finished work — id, email, name, "me" (default), or "team" for everyone'),
       },
-      async ({ from, to }) => text(await standup(currentUser(), from, to)),
+      async ({ from, to, actor }) => {
+        const who = /^(team|all|everyone|\*)$/i.test(actor?.trim() ?? "")
+          ? null
+          : actor
+            ? (await resolveFilter({ actor })).actor
+            : undefined;
+        const data = await standup(currentUser(), from, to, who);
+        return text(
+          {
+            from,
+            to,
+            actor: who === null ? "team" : (who ?? "me"),
+            notes: data.notes,
+            // A digest wants "what shipped", which is the `summary`. Carrying
+            // each task's plan + analysis + description as well multiplies the
+            // payload several times over for material nobody reads here.
+            finished: data.finished.map((t) => ({
+              ...projectTask(t, "compact"),
+              summary: t.summary,
+            })),
+          },
+          {
+            // Finished tasks carry their full summaries, so a wide window is
+            // the one read that reliably runs long. Cut those before the notes.
+            items: "finished",
+            narrow: ["from", "to", "actor"],
+          },
+        );
+      },
     );
 
     /* ----------------------------------------------------------------- */
@@ -848,7 +987,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "bulk_apply",
-      "Run an ORDERED list of mixed operations in one call — the power tool for real reorganization (build a roadmap, move some, complete a sprint). Each op is one of create/update/move/complete/comment/delete. Ops that set analyzing or building assign you and lock the code, as the single-task tools do. Best-effort: a failing op is reported in `results` and the batch continues, so partial failure is visible. Capped at 200 ops (extra are dropped and flagged via `truncated`).",
+      "Run an ORDERED list of mixed operations in one call — the power tool for real reorganization (build a roadmap, move some, complete a sprint). Each op is one of create/update/move/complete/comment/archive/delete. `archive` cascades to the subtree and only accepts a done task, so complete it earlier in the same batch (ops run in array order). Ops that set analyzing or building assign you and lock the code, as the single-task tools do. Best-effort: a failing op is reported in `results` and the batch continues, so partial failure is visible. Capped at 200 ops (extra are dropped and flagged via `truncated`).",
       { operations: z.array(bulkOpSchema).min(1) },
       async ({ operations }) =>
         text(await bulkApply(currentUser(), operations, AI_AUTHOR)),
@@ -867,7 +1006,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Two groups are special: `data.inbox` marks the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere; `data.thisWeek` marks the THIS WEEK board — the group the user flagged as this week's work, and where create_task/update_task put anything you pass `thisWeek: true` (or move into analyzing/building).",
+      "Get one canvas by id with all its nodes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. `data.thisWeek` marks the THIS WEEK board — the one group the USER makes and stars, where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button.",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);
@@ -1001,12 +1140,14 @@ const handler = createMcpHandler(
       {
         title: "My board (JSON)",
         description:
-          "Nested task tree with ids, statuses, dates, points, subtasks. Omits the free-text working fields (analysisSummary, plan, summary) — get_task a task for those; don't infer code locations from another task's notes.",
+          "Nested task tree of the ACTIVE board (done tasks excluded — use list_tasks with a window for those), one compact row per task. Omits descriptions and the free-text working fields (analysisSummary, plan, summary) — get_task a task for those; don't infer code locations from another task's notes.",
         mimeType: "application/json",
       },
       async (uri) =>
         json(uri.href, {
-          tasks: (await listTasks(currentUser())).map(slimTask),
+          tasks: (
+            await listTasks(currentUser(), { includeDone: false })
+          ).map((t) => projectTask(t, "compact")),
         }),
     );
 

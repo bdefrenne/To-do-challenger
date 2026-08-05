@@ -32,12 +32,17 @@ import {
   flattenUnits,
   type TaskUnit,
 } from "@/lib/outline";
-import type { TaskStatus, Importance } from "@/lib/types";
+import type { TaskStatus, Importance, TaskPlacement } from "@/lib/types";
 import { useWorkspace, type DropPos } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
-import { isInboxNode } from "@/lib/sections";
+import {
+  isInboxNode,
+  systemGroupOf,
+  type SystemGroup,
+} from "@/lib/sections";
 import { compareTaskOrder } from "@/lib/task-order";
 import { TaskCardBody } from "./TaskCardBody";
+import { AnchoredPopover } from "./AnchoredPopover";
 import { useCardShortcut } from "./useCardShortcut";
 import { IMPORTANCE_CARD } from "@/lib/importance";
 import { STATUS_TONE, STATUS_CANVAS_BADGE } from "@/lib/statuses";
@@ -50,6 +55,17 @@ export const NEW_SECTION_SIZE = { width: 420, height: 320 };
 export const MIN_SECTION_HEIGHT = 140;
 
 const SECTION_DND_MIME = "application/x-section-task";
+
+/** How each machine-managed tray labels itself in its header. */
+const TRAY_GLYPH: Record<SystemGroup, { icon: string; hint: string }> = {
+  inbox: { icon: "⇥", hint: "Inbox — untriaged, nobody has filed these yet" },
+  backlog: { icon: "☰", hint: "Backlog — triaged, not scheduled" },
+  later: { icon: "⏱", hint: "Later — deliberately deferred" },
+  doneThisWeek: {
+    icon: "✓",
+    hint: "Done this week — finished, delete again to archive",
+  },
+};
 
 type Mode = "naming" | "authoring" | "committed";
 
@@ -96,7 +112,6 @@ export function SectionNode({
   onResize,
   isMaster = false,
   masterSection = null,
-  onSetMaster,
   onRemove,
 }: {
   node: CanvasNodeT;
@@ -112,12 +127,11 @@ export function SectionNode({
   onResize?: (height: number) => void;
   /** Present for prop-compatibility with CanvasNode; unused now. */
   canvasName?: string;
-  /** This section is its board's master — the target of siblings' Send buttons. */
+  /** This section is its board's master — the target of siblings' Send buttons.
+   *  Derived from sitting inside the starred THIS WEEK group, not toggled here. */
   isMaster?: boolean;
   /** The master section for this section's board (if any and not this one). */
   masterSection?: { id: string; name: string } | null;
-  /** Mark/unmark this section as its board's master. */
-  onSetMaster?: (master: boolean) => void;
   /** Remove this node from the canvas (used after sending its cards away). */
   onRemove?: () => void;
 }) {
@@ -138,11 +152,21 @@ export function SectionNode({
   // Cards land in it by having no pin, which is why `pin` is null for a lane —
   // pinning to it would immediately take the card out of it again.
   const isInbox = isInboxNode(node);
+  // Which machine-managed tray this is, if any (INBOX / BACKLOG / LATER / DONE
+  // THIS WEEK). The reconciler owns these: they can't be renamed onto a board or
+  // sent away and deleted, because it would just rebuild them.
+  const systemKind = systemGroupOf(node);
   const pin = isInbox ? null : sectionId;
   const { bySection } = useSectionMembership();
   const siblingIds = useMemo(
     () => bySection.get(sectionId) ?? new Set<string>(),
     [bySection, sectionId],
+  );
+  /** Every task node this section holds, all depths — read from the resolved
+   *  membership, so it's the same list whichever view mode is showing. */
+  const sectionNodes = useMemo(
+    () => ws.nodes.filter((n) => siblingIds.has(n.id)),
+    [ws.nodes, siblingIds],
   );
 
   // Soft field-lock (presence): while a user authors this section's outline they
@@ -179,13 +203,14 @@ export function SectionNode({
 
   // An INBOX lane never goes through naming: its board is fixed by the
   // reconciler, and the "No board" lane is legitimately board-less.
-  const [mode, setMode] = useState<Mode>(boardId || isInbox ? "committed" : "naming");
+  const [mode, setMode] = useState<Mode>(boardId || systemKind ? "committed" : "naming");
   // `mode` is seeded from `boardId` only once, so a peer sitting in naming (the
   // placeholder) when the author picks a board would stay stuck on the pre-bind
   // view. Derive the DISPLAYED mode from the live `boardId` instead of mutating
   // state in an effect: once bound, everyone renders committed. The state
   // machine (authoring transitions, saves) still keys off the real `mode`.
-  const viewMode: Mode = (boardId || isInbox) && mode === "naming" ? "committed" : mode;
+  const viewMode: Mode =
+    (boardId || systemKind) && mode === "naming" ? "committed" : mode;
   // Text-mode display preference (session-only): descriptions grow up to 6 rows
   // by default; toggled to unbounded via the header button. Not persisted.
   const [descExpanded, setDescExpanded] = useState(false);
@@ -428,7 +453,6 @@ export function SectionNode({
       const built = rowsToUnits(current);
       // Scoped to the tasks THIS section renders (resolved canvas-wide), never
       // the board — so saving one section never touches another's tasks.
-      const sectionNodes = ws.nodes.filter((n) => siblingIds.has(n.id));
       const surviving = survivingIds(built);
       // Only delete tasks THIS session knows about (baseline + ones it created).
       // A task a peer added to this section meanwhile isn't in knownIds, so our
@@ -547,7 +571,7 @@ export function SectionNode({
         void save();
       }
     }
-  }, [boardId, ws, bulk, pin, siblingIds]);
+  }, [boardId, ws, bulk, pin, sectionNodes]);
 
   /** Save now, cancelling any pending debounce (used on toggle / Esc / unmount). */
   const flush = useCallback(() => {
@@ -666,11 +690,7 @@ export function SectionNode({
   const sendToMaster = useCallback(async () => {
     if (!boardId || !masterSection) return;
 
-    // Every task in this section (all depths), read from the resolved membership
-    // so it's independent of the current view mode.
-    const sectionTaskIds = ws.nodes.filter((n) => siblingIds.has(n.id)).map((n) => n.id);
-
-    const n = sectionTaskIds.length;
+    const n = sectionNodes.length;
     if (
       !confirm(
         n
@@ -711,7 +731,74 @@ export function SectionNode({
     } finally {
       setSaving(false);
     }
-  }, [boardId, masterSection, ws, bulk, onRemove, siblingIds, bySection]);
+  }, [boardId, masterSection, ws, bulk, onRemove, sectionNodes, siblingIds, bySection]);
+
+  /* ---------------- bulk actions on the whole section ---------------- */
+  /** Mark every card in this section done, then archive them. One ordered batch:
+   *  `archive` refuses a task that isn't done, so the completes have to land
+   *  first — and it cascades to subtrees, so only the roots need archiving. */
+  const bulkDoneAndArchive = useCallback(async () => {
+    const n = sectionNodes.length;
+    if (!n) return;
+    if (
+      !confirm(
+        `Mark ${n} card${n === 1 ? "" : "s"} done and archive them? ` +
+          `They move to the Archived view and can be restored later.`,
+      )
+    )
+      return;
+    setSaving(true);
+    try {
+      const ops: unknown[] = [];
+      for (const nd of sectionNodes)
+        if (nd.status !== "done") ops.push({ op: "complete", id: nd.id, done: true });
+      // Roots of this section: a card whose parent isn't here too (or has none).
+      // Archiving one takes its whole subtree with it.
+      for (const nd of sectionNodes)
+        if (nd.parentId === null || !siblingIds.has(nd.parentId))
+          ops.push({ op: "archive", id: nd.id });
+      await bulk(ops);
+      await ws.refresh();
+    } catch (err) {
+      console.error("[section] bulk done+archive failed", err);
+    } finally {
+      setSaving(false);
+    }
+  }, [sectionNodes, siblingIds, bulk, ws]);
+
+  /** Delete every card in this section, for good. Deepest-first, so a parent is
+   *  gone only once its children are — otherwise `deleteTask` would promote them
+   *  to root (its single-task behaviour) before we got to them. */
+  const bulkDelete = useCallback(async () => {
+    const n = sectionNodes.length;
+    if (!n) return;
+    if (
+      !confirm(
+        `Delete ${n} card${n === 1 ? "" : "s"} from this section? This can’t be undone.`,
+      )
+    )
+      return;
+    setSaving(true);
+    try {
+      const byId = new Map(sectionNodes.map((nd) => [nd.id, nd]));
+      const depth = (nd: (typeof sectionNodes)[number]) => {
+        let d = 0;
+        let p = nd.parentId;
+        while (p && byId.has(p)) {
+          d++;
+          p = byId.get(p)!.parentId;
+        }
+        return d;
+      };
+      const ordered = [...sectionNodes].sort((a, b) => depth(b) - depth(a));
+      await bulk(ordered.map((nd) => ({ op: "delete", id: nd.id })));
+      await ws.refresh();
+    } catch (err) {
+      console.error("[section] bulk delete failed", err);
+    } finally {
+      setSaving(false);
+    }
+  }, [sectionNodes, bulk, ws]);
 
   /* =================================================================== */
   /* Render                                                              */
@@ -745,10 +832,10 @@ export function SectionNode({
       }}
       className={[
         "group/section flex flex-col overflow-hidden rounded-xl border-2 shadow-sm",
-        // An INBOX lane reads as a tray, not a workspace: dashed edge and a muted
-        // fill, so untriaged cards are visibly not "placed" anywhere yet.
-        isInbox ? "border-dashed bg-surface-2/70" : "bg-surface",
-        selected ? "border-accent" : isInbox ? "border-border" : "border-border-strong",
+        // A system lane reads as a tray, not a workspace: dashed edge and a muted
+        // fill, so parked cards are visibly not being worked on.
+        systemKind ? "border-dashed bg-surface-2/70" : "bg-surface",
+        selected ? "border-accent" : systemKind ? "border-border" : "border-border-strong",
       ].join(" ")}
     >
       {/* Header = title chip + drag handle + edit affordance */}
@@ -756,9 +843,24 @@ export function SectionNode({
         onPointerDown={onPointerDown}
         className="flex shrink-0 cursor-grab items-start gap-2 border-b border-border bg-surface-2 px-3 py-2 active:cursor-grabbing"
       >
-        <span aria-hidden className="text-faint" title={isInbox ? "Inbox — unplaced tasks" : undefined}>
-          {isInbox ? "⇥" : "▤"}
+        <span
+          aria-hidden
+          className="text-faint"
+          title={systemKind ? TRAY_GLYPH[systemKind].hint : undefined}
+        >
+          {systemKind ? TRAY_GLYPH[systemKind].icon : "▤"}
         </span>
+        {/* Master marker — a STATE, not a control: a section is its board's
+            master because it sits in the starred THIS WEEK group, so it's set by
+            starring the group, not by clicking here. */}
+        {isMaster ? (
+          <span
+            className="shrink-0 text-accent"
+            title="Master section — this board's Send target, because it's in the THIS WEEK group"
+          >
+            ★
+          </span>
+        ) : null}
         {renaming ? (
           <input
             autoFocus
@@ -823,9 +925,12 @@ export function SectionNode({
             ✎ {remoteEditor.name}
           </span>
         ) : null}
-        {/* Send-to-master: shown on non-master sections that have a master on
-            the same board. Hover-revealed, like the canvas-index card's ✕. */}
-        {boardId && !isInbox && !isMaster && masterSection ? (
+        {/* Send-to-master: shown on sections that have a master on the same
+            board — `masterSection` is already null when THIS is the master.
+            Hover-revealed, like the canvas-index card's ✕. Never on a system
+            tray: sending deletes the source section, and the reconciler would
+            just rebuild it. */}
+        {boardId && !systemKind && masterSection ? (
           <button
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
@@ -857,22 +962,20 @@ export function SectionNode({
             {descExpanded ? "↕ All" : "↕ 6"}
           </button>
         ) : null}
-        {boardId || isInbox ? (
+        {/* Bulk actions on every card in the section. Only when there ARE cards,
+            so it's never a dead control. */}
+        {(boardId || systemKind) && sectionNodes.length ? (
+          <BulkMenu
+            count={sectionNodes.length}
+            onDoneAndArchive={bulkDoneAndArchive}
+            onDelete={bulkDelete}
+          />
+        ) : null}
+        {boardId || systemKind ? (
           <div
             onPointerDown={(e) => e.stopPropagation()}
             className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5"
           >
-            {/* An INBOX lane can't be a master: it's a tray tasks pass THROUGH,
-                never a destination siblings should send their cards to. */}
-            {isInbox ? null : (
-              <ViewToggleBtn
-                active={isMaster}
-                onClick={() => onSetMaster?.(!isMaster)}
-                title={isMaster ? "Master section (click to unset)" : "Make this the board's master section"}
-              >
-                {isMaster ? "★" : "☆"}
-              </ViewToggleBtn>
-            )}
             <ViewToggleBtn
               active={mode === "authoring"}
               disabled={locked}
@@ -931,6 +1034,7 @@ export function SectionNode({
             onMove={ws.moveNode}
             onAssignSelf={ws.toggleSelfAssignee}
             onDelete={ws.deleteTask}
+            onSend={ws.sendToPlacement}
             onAddTask={(title) =>
               ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
             }
@@ -945,6 +1049,72 @@ export function SectionNode({
           />
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * "Bulk" header menu — actions that sweep EVERY card in the section at once.
+ * Portaled (via AnchoredPopover) because the section card and the canvas root are
+ * both `overflow-hidden`, which would clip an in-flow dropdown.
+ */
+function BulkMenu({
+  count,
+  onDoneAndArchive,
+  onDelete,
+}: {
+  count: number;
+  onDoneAndArchive: () => void | Promise<void>;
+  onDelete: () => void | Promise<void>;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+
+  const item = (label: string, danger: boolean, run: () => void | Promise<void>) => (
+    <button
+      type="button"
+      onClick={() => {
+        setOpen(false); // close first — both actions confirm() synchronously
+        void run();
+      }}
+      className={[
+        "flex w-full items-center rounded px-2 py-1.5 text-left text-xs hover:bg-surface-2",
+        danger ? "text-red-600" : "text-fg",
+      ].join(" ")}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div ref={rootRef} className="shrink-0" onPointerDown={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        title={`Bulk actions on all ${count} card${count === 1 ? "" : "s"} in this section`}
+        className={[
+          "rounded-md border px-1.5 py-0.5 text-[11px] font-medium transition-colors",
+          open ? "border-accent text-accent" : "border-border text-faint hover:border-accent hover:text-accent",
+        ].join(" ")}
+      >
+        Bulk
+      </button>
+      <AnchoredPopover
+        open={open}
+        anchorRef={rootRef}
+        onClose={() => setOpen(false)}
+        align="right"
+        className="w-44 rounded-lg border border-border bg-surface p-1 shadow-lg"
+      >
+        <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-faint">
+          {count} card{count === 1 ? "" : "s"}
+        </p>
+        {item("Done and archive", false, onDoneAndArchive)}
+        {item("Delete", true, onDelete)}
+      </AnchoredPopover>
     </div>
   );
 }
@@ -1227,6 +1397,8 @@ interface CardHandlers {
   onAssignSelf: (id: string) => void;
   /** Delete the task with an undo window (DELETE hover shortcut). */
   onDelete: (id: string) => void;
+  /** Fling the task into a canvas group (the ↑ / → / ↓ hover shortcuts). */
+  onSend: (id: string, to: TaskPlacement) => void;
   /** Create a subtask under this task (from the hover "+ Subtask" button). */
   onAddSubtask: (parentId: string, title: string) => void;
   dropHint: { id: string; pos: "before" | "after" } | null;
@@ -1255,10 +1427,18 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   // (via useCardShortcut), so it intercepts the canvas space-to-pan only while a
   // card is hovered — space still pans everywhere else.
   useCardShortcut(cardRef, " ", () => id && h.onAssignSelf(id));
-  // DELETE / Backspace removes the task (with a ~5s undo toast). Beats the canvas
+  // DELETE / Backspace removes the task (with a ~5s undo toast), or, for a card
+  // that's DONE, parks it in DONE THIS WEEK — see `deletionOf`. Beats the canvas
   // editor's own Delete (which removes selected NODES) since it's hover-scoped.
   useCardShortcut(cardRef, "delete", () => id && h.onDelete(id));
   useCardShortcut(cardRef, "backspace", () => id && h.onDelete(id));
+  // Arrows triage the hovered card into a group, laid out the way the groups sit
+  // on the canvas: UP to this week's work, RIGHT to the backlog, DOWN to later.
+  // Hover-scoped and fired in capture, so they beat the canvas editor's own
+  // arrow-nudge of selected nodes — the same precedent as SPACE and DELETE.
+  useCardShortcut(cardRef, "arrowup", () => id && h.onSend(id, "thisWeek"));
+  useCardShortcut(cardRef, "arrowright", () => id && h.onSend(id, "backlog"));
+  useCardShortcut(cardRef, "arrowdown", () => id && h.onSend(id, "later"));
   if (!id || !t) return null;
   const ic = IMPORTANCE_CARD[t.importance ?? 0];
   // Status ring + corner badge — canvas only, and only for "started" statuses
@@ -1440,6 +1620,7 @@ function CommittedList({
   onMove,
   onAssignSelf,
   onDelete,
+  onSend,
   onAddTask,
   onAddSubtask,
   onDropIntoSection,
@@ -1454,6 +1635,7 @@ function CommittedList({
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   onAssignSelf: (id: string) => void;
   onDelete: (id: string) => void;
+  onSend: (id: string, to: TaskPlacement) => void;
   onAddTask: (title: string) => void;
   onAddSubtask: (parentId: string, title: string) => void;
   /** Drop a card into THIS section's blank area (or an empty section) — lands it
@@ -1465,7 +1647,7 @@ function CommittedList({
   // draws a dashed ring so it reads as "drop here to move into this section".
   const [overSection, setOverSection] = useState(false);
 
-  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onAddSubtask, dropHint, setDropHint };
+  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onSend, onAddSubtask, dropHint, setDropHint };
   return (
     <div
       // Section-level drop zone. Card drops stopPropagation, so this fires only

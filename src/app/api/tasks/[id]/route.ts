@@ -24,8 +24,11 @@ export const PATCH = route(async (req: NextRequest, ctx: AuthedCtx) => {
   const patch = await body(req, updateTaskSchema);
   // Optional optimistic-concurrency check (see updateTask). A mismatch throws
   // ConflictError, which route() turns into a 409 carrying the fresh task.
-  const ifMatch = req.headers.get("if-match") ?? undefined;
-  const task = await updateTask(id, patch, ctx.userId, undefined, ifMatch);
+  // Deliberately NOT the standard `If-Match`: Vercel's edge evaluates HTTP
+  // preconditions before we ever see the response and rewrites it to a 412
+  // PRECONDITION_FAILED, so the write lands but the caller sees an error.
+  const expected = req.headers.get("x-expected-updated-at") ?? undefined;
+  const task = await updateTask(id, patch, ctx.userId, undefined, expected);
   if (!task) return error("Task not found", 404);
   return json({ task });
 });

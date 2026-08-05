@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
-import { isInboxNode, isThisWeekGroup } from "@/lib/sections";
+import { systemGroupOf, isThisWeekGroup, type SystemGroup } from "@/lib/sections";
 
 /** How a group arranges its members: a vertical column ("portrait", the
  *  default) or a horizontal row ("landscape" / paysage). */
@@ -33,15 +33,17 @@ export const GROUP_HEADER_H = 56;
 export const GROUP_PAD = 16;
 /** Gap between adjacent members (down the column, or across the row). */
 export const GROUP_GAP = 16;
-/** Empty band kept after the last member — always a visible landing target so
- *  you can drop more sections in even once the column/row has one. Portrait
- *  keeps it below the last member; landscape keeps it to the right. */
-export const GROUP_DROPZONE = 76;
-/** Landscape's trailing band is horizontal, so it needs to be wide enough for
- *  the hint chip rather than tall enough for a line of text. */
-export const GROUP_DROPZONE_W = 170;
 /** Size of a freshly-dropped (empty) group — a visible drop target. */
 export const NEW_GROUP_SIZE = { width: 460, height: 220 };
+
+/** What an empty machine-managed tray says about itself. Each names how cards
+ *  GET here, since you never build one by hand. */
+const EMPTY_TRAY_HINT: Record<SystemGroup, string> = {
+  inbox: "Nothing untriaged",
+  backlog: "Nothing in the backlog — hover a card and press →",
+  later: "Nothing deferred — hover a card and press ↓",
+  doneThisWeek: "Nothing finished yet — press Delete on a done card",
+};
 
 /** The toggle's glyph: two stacked bars for portrait (a column), two
  *  side-by-side bars for landscape (a row). Depicts the CURRENT layout — the
@@ -101,7 +103,10 @@ export function SectionGroupNode({
   const inputRef = useRef<HTMLInputElement>(null);
   const layout = groupLayoutOf(node);
   const landscape = layout === "landscape";
-  const isInbox = isInboxNode(node);
+  // Which machine-managed tray this is, if any. A tray can never BE this
+  // week's board: the two are opposite ends of triage, and the trays are
+  // reconciler-owned, so starring one would fight the machine for the group.
+  const systemKind = systemGroupOf(node);
   const thisWeek = isThisWeekGroup(node);
 
   // Focus + select the name when entering edit mode, so a fresh group (or a
@@ -182,7 +187,7 @@ export function SectionGroupNode({
             Marks the one group agents file this week's work into (see
             resolveThisWeekSection). Hidden on the INBOX tray: it's the OTHER
             destination, the pile of things nobody has scheduled. */}
-        {onSetThisWeek && !isInbox ? (
+        {onSetThisWeek && !systemKind ? (
           <button
             type="button"
             title={
@@ -247,31 +252,24 @@ export function SectionGroupNode({
       </div>
 
       {/* Body: a transparent backdrop. Member sections are separate nodes that
-          render on top (the editor packs them in from the top/left), so the
-          persistent drop hint is pinned to the trailing band — below the last
-          member in portrait, right of it in landscape — where it stays visible
-          and is always a valid landing target. */}
-      <div
-        className={[
-          "pointer-events-none flex flex-1 p-4",
-          landscape
-            ? "flex-row items-center justify-end"
-            : "flex-col items-center justify-end",
-        ].join(" ")}
-      >
-        <span
-          className={[
-            "rounded-md border border-dashed px-3 py-2 text-center text-sm transition-colors",
-            dropActive ? "border-accent text-accent" : "border-border text-faint",
-          ].join(" ")}
-        >
-          {memberCount === 0
-            ? "Drag sections here"
-            : landscape
-              ? "Drop another here"
-              : "Drop another section here"}
-        </span>
-      </div>
+          render on top (the editor packs them in from the top/left), so once the
+          group HAS members there's nothing to draw here — the box wraps them, and
+          a drop is captured by the group's own bounds (see `groupAtPoint`), not by
+          a visible landing strip. Only an empty group shows a hint. */}
+      {memberCount === 0 ? (
+        <div className="pointer-events-none flex flex-1 flex-col items-center justify-center p-4">
+          <span
+            className={[
+              "rounded-md border border-dashed px-3 py-2 text-center text-sm transition-colors",
+              dropActive ? "border-accent text-accent" : "border-border text-faint",
+            ].join(" ")}
+          >
+            {/* A tray fills itself — its lanes appear per board as cards arrive
+                — so telling you to drag sections in would be wrong. */}
+            {systemKind ? EMPTY_TRAY_HINT[systemKind] : "Drag sections here"}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }

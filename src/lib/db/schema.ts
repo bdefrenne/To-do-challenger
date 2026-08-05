@@ -506,6 +506,10 @@ export const tasks = pgTable(
     index("tasks_status_idx").on(t.status),
     index("tasks_archived_idx").on(t.archivedAt),
     index("tasks_canvas_section_idx").on(t.canvasSectionId),
+    /* Activity windows — "what moved / shipped / was edited between X and Y". */
+    index("tasks_status_since_idx").on(t.statusSince),
+    index("tasks_completed_at_idx").on(t.completedAt),
+    index("tasks_updated_at_idx").on(t.updatedAt),
   ],
 );
 
@@ -535,7 +539,11 @@ export const taskLogs = pgTable(
     /** Which surface produced the event (ui | api | mcp). Null for legacy rows. */
     source: logSource("source"),
   },
-  (t) => [index("task_logs_task_idx").on(t.taskId)],
+  (t) => [
+    index("task_logs_task_idx").on(t.taskId),
+    /* "Who touched what, when" — the actor filter's EXISTS subquery. */
+    index("task_logs_actor_at_idx").on(t.actorId, t.at),
+  ],
 );
 
 /* ---- Image attachments ----
@@ -719,12 +727,20 @@ export const canvasNodes = pgTable(
     color: text("color"),
     /** Fractional z-order (higher = on top). */
     position: doublePrecision("position").notNull().default(0),
-    /** Free-form extras: font size; a section's bound `boardId`, optional own
-     *  `name`, and `master` (its board's Send target); a group's `layout`; the
-     *  two flags that name a group's ROLE for task placement — `inbox` (the
-     *  machine-managed tray of unfiled tasks, set on the group and each of its
-     *  lanes) and `thisWeek` (the one group agents file this week's work into —
-     *  see `resolveThisWeekSection`). */
+    /** Free-form extras: font size; a section's bound `boardId` and optional own
+     *  `name`; a group's `layout`; and the flags that name a group's ROLE for
+     *  task placement (see `resolvePlacementSection`), each set on the group AND
+     *  on every lane inside it:
+     *
+     *    `inbox` · `backlog` · `later` · `doneThisWeek`
+     *        the machine-managed trays. INBOX is the odd one — its lanes mean
+     *        UNPINNED, so nothing ever points at them; the other three are
+     *        ordinary pin targets.
+     *    `thisWeek`
+     *        the one group the USER stars. Every section inside it is its board's
+     *        master — the target of other sections' "Send to" button — which is
+     *        why there's no separate `master` flag (older rows may still carry
+     *        one; it is ignored). */
     data: jsonb("data").notNull().default(sql`'{}'::jsonb`),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

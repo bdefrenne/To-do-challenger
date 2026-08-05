@@ -1,11 +1,16 @@
 /*
-  THIS WEEK PLACEMENT CHECK — every mutator × every surface.
+  CANVAS PLACEMENT CHECK — every mutator × every surface.
 
-  The invariant: a task an agent files as "this week" lands on the flagged
-  section_group's section for its own board; everything else stays unpinned and
-  surfaces in INBOX. And, like work-entry assignment, the STATUS-IMPLIED move is
+  The invariant: a task an agent files with a `placement` lands on that group's
+  section for its OWN board; everything else stays unpinned and surfaces in
+  INBOX. And, like work-entry assignment, the STATUS-IMPLIED move to THIS WEEK is
   an agent-surface-only implicit write — the web UI never re-files a card behind
   the user's back.
+
+  THIS WEEK gets the deepest coverage because it's the one with an implicit rule;
+  the other groups (BACKLOG / LATER / DONE THIS WEEK) share one resolver with it,
+  so they're checked at the resolver and at one mutator each. The deprecated
+  `thisWeek` boolean is checked alongside `placement` — callers still pass it.
 
   Runs against DATABASE_URL on its OWN throwaway group + lane, then deletes them
   along with every scratch task. It deliberately does NOT flag one of your real
@@ -31,13 +36,17 @@ import {
   bulkUpdate,
   deleteTask,
   resolveThisWeekSection,
+  resolvePlacementSection,
   getCanvas,
   listCanvases,
 } from "../src/lib/db/service";
 import {
   boardsNeedingWeekLane,
+  boardsFiledInSystemGroup,
+  deletionOf,
   thisWeekGroupId,
   weekLaneId,
+  systemLaneId,
   isThisWeekGroup,
 } from "../src/lib/sections";
 import { withLogContext, type LogSource } from "../src/lib/db/log-context";
@@ -46,9 +55,15 @@ import type { CanvasNode, Task } from "../src/lib/types";
 const AUTHOR = "check:this-week";
 const TITLE = "[check:this-week] scratch — safe to delete";
 
-/** Our throwaway nodes. Prefixed so a leftover is obvious and easy to sweep. */
-const GROUP_ID = "check-tw-group";
-const LANE_ID = "check-tw-lane";
+/** Our throwaway nodes. Prefixed so a leftover is obvious and easy to sweep.
+ *  The "!" also makes them sort FIRST: `resolvePlacementSection` breaks a
+ *  multi-group tie on the lowest id, so this guarantees the scratch group wins
+ *  over any real one that happens to carry the same flag. */
+const GROUP_ID = "!check-tw-group";
+const LANE_ID = "!check-tw-lane";
+/** Second scratch group, for the BACKLOG/LATER/DONE THIS WEEK trays. */
+const SYS_GROUP_ID = "!check-pl-group";
+const SYS_LANE_ID = "!check-pl-lane";
 
 let pass = 0;
 const failures: string[] = [];
@@ -119,12 +134,16 @@ async function main() {
   console.log(`  covered board   ${coveredBoard} → our lane ${LANE_ID}`);
   console.log(`  uncovered board ${uncoveredBoard}\n`);
 
-  /* ---- 0. Nothing flagged: everything stays in INBOX ------------------- */
-  check(
-    "no flagged group: resolveThisWeekSection returns null",
-    (await resolveThisWeekSection(coveredBoard)) === null,
-  );
-  {
+  /* ---- 0. Nothing flagged: everything stays in INBOX -------------------
+   * Only meaningful on a database where nobody has starred a group yet — the
+   * resolver is deliberately global, so a real flagged group anywhere makes
+   * "nothing is flagged" untestable rather than false. Skipped, loudly, instead
+   * of reported as a failure. */
+  const alreadyFlagged = (await resolveThisWeekSection(coveredBoard)) !== null;
+  if (alreadyFlagged) {
+    console.log("  – skipped: this database already has a starred THIS WEEK group\n");
+  } else {
+    check("no flagged group: resolveThisWeekSection returns null", true);
     const id = await mk({ boardId: coveredBoard, thisWeek: true });
     check("no flagged group: thisWeek:true still leaves the task unpinned", (await pinOf(id)) === null);
   }
@@ -174,7 +193,14 @@ async function main() {
     };
     const scene = [...nodes, groupNode, stubSection(LANE_ID, { groupId: GROUP_ID, boardId: coveredBoard })];
     check("thisWeekGroupId finds the flagged group", thisWeekGroupId(scene) === GROUP_ID);
-    check("isThisWeekGroup is true only for it", scene.filter(isThisWeekGroup).length === 1);
+    // Not "exactly one is flagged": the scene includes the REAL canvas, which may
+    // already have a starred group. What must hold is that the predicate keys off
+    // the flag and the kind — a lane inside the group is never itself the group.
+    check("isThisWeekGroup is true for the group", isThisWeekGroup(groupNode));
+    check(
+      "isThisWeekGroup is false for its member lane",
+      !isThisWeekGroup(stubSection(LANE_ID, { groupId: GROUP_ID, thisWeek: true })),
+    );
 
     const pinned = weekLaneId(GROUP_ID, uncoveredBoard);
     const task = { id: "t1", parentId: null, boardId: uncoveredBoard };
@@ -303,7 +329,109 @@ async function main() {
     check("bulkUpdate → building via mcp files unpinned tasks", (await pinOf(a)) === LANE_ID);
   }
 
-  /* ---- 7. The move is explicable on the timeline ----------------------- */
+  /* ---- 7. The other groups: BACKLOG / LATER / DONE THIS WEEK ----------
+   * One resolver serves all four placements, so these check the parts THIS WEEK
+   * can't: that each flag finds its own group, that the derived lane id is keyed
+   * on the CANVAS (not the group, as `weekLaneId` is), and that `placement`
+   * outranks the deprecated boolean. */
+  await db.insert(canvasNodes).values([
+    {
+      id: SYS_GROUP_ID,
+      userId: ME,
+      canvasId: canvas.id,
+      kind: "section_group",
+      content: "[check:placement] backlog",
+      data: { backlog: true, layout: "portrait" },
+    },
+    {
+      id: SYS_LANE_ID,
+      userId: ME,
+      canvasId: canvas.id,
+      kind: "section",
+      content: "[check:placement] lane",
+      data: { backlog: true, groupId: SYS_GROUP_ID, boardId: coveredBoard },
+    },
+  ]);
+
+  check(
+    "backlog: a board the group covers resolves to that existing section",
+    (await resolvePlacementSection("backlog", coveredBoard)) === SYS_LANE_ID,
+    `got ${await resolvePlacementSection("backlog", coveredBoard)}`,
+  );
+  check(
+    "backlog: a board it doesn't cover resolves to the CANVAS-derived lane id",
+    (await resolvePlacementSection("backlog", uncoveredBoard)) ===
+      systemLaneId("backlog", canvas.id, uncoveredBoard),
+    `got ${await resolvePlacementSection("backlog", uncoveredBoard)}`,
+  );
+  check(
+    "each flag finds its OWN group — nothing is flagged 'later'",
+    (await resolvePlacementSection("later", coveredBoard)) === null,
+  );
+  check(
+    "placement 'inbox' means unpinned, not a lane",
+    (await resolvePlacementSection("inbox", coveredBoard)) === null,
+  );
+  {
+    const id = await mk({ boardId: coveredBoard, placement: "backlog" });
+    check("createTask placement:'backlog' files it in the backlog lane", (await pinOf(id)) === SYS_LANE_ID);
+    await as("mcp", () => updateTask(id, { placement: "inbox" }, ME, AUTHOR));
+    check("updateTask placement:'inbox' sends it back to INBOX", (await pinOf(id)) === null);
+  }
+  {
+    const id = await mk({ boardId: coveredBoard });
+    await as("mcp", () => moveTask(id, { placement: "backlog" }, ME, AUTHOR));
+    check("moveTask placement:'backlog' files it too", (await pinOf(id)) === SYS_LANE_ID);
+  }
+  {
+    const a = await mk({ boardId: coveredBoard });
+    const b = await mk({ boardId: uncoveredBoard });
+    await as("mcp", () => bulkUpdate(ME, [a, b], { placement: "backlog" }, AUTHOR));
+    check(
+      "bulkUpdate placement:'backlog' resolves each task's OWN board",
+      (await pinOf(a)) === SYS_LANE_ID &&
+        (await pinOf(b)) === systemLaneId("backlog", canvas.id, uncoveredBoard),
+      `a=${await pinOf(a)} b=${await pinOf(b)}`,
+    );
+  }
+  {
+    // An explicit placement outranks the legacy boolean, which outranks status.
+    const id = await mk({ boardId: coveredBoard, placement: "backlog", thisWeek: true });
+    check("placement wins over the deprecated thisWeek", (await pinOf(id)) === SYS_LANE_ID);
+  }
+  {
+    const id = await mk({ boardId: coveredBoard, canvasSectionId: LANE_ID, placement: "backlog" });
+    check("an explicit canvasSectionId still wins over both", (await pinOf(id)) === LANE_ID);
+  }
+  {
+    const pinned = systemLaneId("backlog", canvas.id, uncoveredBoard);
+    const filed = boardsFiledInSystemGroup("backlog", canvas.id, [
+      { id: "t3", parentId: null, boardId: uncoveredBoard },
+    ], { t3: { canvasSectionId: pinned } as Task });
+    check(
+      "boardsFiledInSystemGroup asks for exactly the lane the server pinned to",
+      filed.size === 1 && filed.has(uncoveredBoard),
+      `got ${JSON.stringify([...filed])}`,
+    );
+  }
+
+  /* ---- 8. The two-step exit for finished work -------------------------- */
+  check("DELETE on a not-done card deletes it", deletionOf("building", null) === "delete");
+  check("DELETE on a done card parks it", deletionOf("done", null) === "park");
+  check(
+    "DELETE again from DONE THIS WEEK archives it",
+    deletionOf("done", "doneThisWeek") === "archive",
+  );
+  check(
+    "…and so does a not-done card that somehow sits there",
+    deletionOf("building", "doneThisWeek") === "archive",
+  );
+  check(
+    "parking is not triggered from the other trays",
+    deletionOf("done", "backlog") === "park" && deletionOf("building", "later") === "delete",
+  );
+
+  /* ---- 9. The move is explicable on the timeline ----------------------- */
   {
     const id = await mk({ boardId: coveredBoard });
     await as("mcp", () => updateTask(id, { status: "analyzing" }, ME, AUTHOR));
@@ -318,14 +446,19 @@ async function main() {
 }
 
 async function cleanup() {
-  // Exactly three things can exist: our group, our lane, and any lane an OPEN
-  // canvas materialised for a scratch pin — all derived from GROUP_ID, so the
-  // `like` can only ever match our own nodes.
+  // Our two scratch groups, their lanes, and any THIS WEEK lane an OPEN canvas
+  // materialised for a scratch pin — all derived from GROUP_ID, so the `like`
+  // can only ever match our own nodes.
+  //
+  // A BACKLOG lane a canvas materialised is deliberately NOT swept: its id is
+  // derived from the CANVAS, so it's a genuine lane for a real board, identical
+  // to one a user would have made. It empties when the scratch tasks go, and the
+  // reconciler drops an empty tray lane on its next pass.
   const gone = await db
     .delete(canvasNodes)
     .where(
       or(
-        inArray(canvasNodes.id, [GROUP_ID, LANE_ID]),
+        inArray(canvasNodes.id, [GROUP_ID, LANE_ID, SYS_GROUP_ID, SYS_LANE_ID]),
         like(canvasNodes.id, `${weekLaneId(GROUP_ID, null).slice(0, -"noboard".length)}%`),
       ),
     )

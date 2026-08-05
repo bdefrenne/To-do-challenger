@@ -109,7 +109,6 @@ export function CanvasNode({
   canvasName = "",
   isMaster = false,
   masterSection = null,
-  onSetMaster,
   onRemove,
   groupMemberCount = 0,
   groupDropActive = false,
@@ -144,13 +143,12 @@ export function CanvasNode({
   onLinkStart?: (e: ReactPointerEvent) => void;
   /** The parent canvas's name — a section uses it to name a new project. */
   canvasName?: string;
-  /** Section-only: this section is its board's master (Send target). */
+  /** Section-only: this section is its board's master (Send target) — i.e. it
+   *  sits inside the starred THIS WEEK group. Derived, never toggled here. */
   isMaster?: boolean;
   /** Section-only: the master section for this section's board, if any and not
    *  this one — the target of its "Send to top of …" button. */
   masterSection?: { id: string; name: string } | null;
-  /** Section-only: mark/unmark this section as its board's master. */
-  onSetMaster?: (master: boolean) => void;
   /** Section / section_group: remove this node from the canvas. */
   onRemove?: () => void;
   /** section_group-only: how many sections currently belong to it. */
@@ -291,7 +289,6 @@ export function CanvasNode({
         canvasName={canvasName}
         isMaster={isMaster}
         masterSection={masterSection}
-        onSetMaster={onSetMaster}
         onRemove={onRemove}
       />
     );

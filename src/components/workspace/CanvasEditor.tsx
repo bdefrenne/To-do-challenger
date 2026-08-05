@@ -43,8 +43,6 @@ import {
   GROUP_HEADER_H,
   GROUP_PAD,
   GROUP_GAP,
-  GROUP_DROPZONE,
-  GROUP_DROPZONE_W,
   groupLayoutOf,
   type GroupLayout,
 } from "./SectionGroupNode";
@@ -58,17 +56,24 @@ import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 import { MIN_SECTION_HEIGHT } from "./SectionNode";
 import { SectionMembershipProvider } from "./SectionMembershipContext";
 import {
+  boardsFiledInSystemGroup,
   boardsNeedingInbox,
   boardsNeedingWeekLane,
   buildSectionMembership,
-  inboxGroupId,
-  inboxLaneId,
   isInboxNode,
   isThisWeekGroup,
   laneBoardId,
+  masterSectionsByBoard,
+  systemGroupId,
+  systemGroupOf,
+  systemLaneId,
   thisWeekGroupId,
   weekLaneId,
+  SYSTEM_GROUPS,
+  SYSTEM_GROUP_TITLE,
+  type SystemGroup,
 } from "@/lib/sections";
+import type { TaskPlacement } from "@/lib/types";
 
 type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
 
@@ -328,15 +333,16 @@ const computeGroupLayout = (
       }
       cursor += (landscape ? m.width : m.height) + GROUP_GAP;
     }
-    // Keep a drop-zone band past the last member so there's always a visible,
-    // hittable target for adding more sections (not just a tight wrap of one) —
-    // below the column in portrait, right of the row in landscape.
+    // Wrap the members tightly, closing on the same GROUP_PAD inset the packing
+    // opened with. No trailing drop-zone band: a drop is captured by the group's
+    // whole box (see `groupAtPoint`), so the band was decoration, and it left the
+    // group visibly longer than its contents.
     const desiredW = landscape
-      ? Math.round(cursor - GROUP_GAP - g.x + GROUP_DROPZONE_W)
+      ? Math.round(cursor - GROUP_GAP - g.x + GROUP_PAD)
       : Math.round(cross + 2 * GROUP_PAD);
     const desiredH = landscape
       ? Math.round(GROUP_HEADER_H + cross + 2 * GROUP_PAD)
-      : Math.round(cursor - GROUP_GAP - g.y + GROUP_DROPZONE);
+      : Math.round(cursor - GROUP_GAP - g.y + GROUP_PAD);
     if (
       !skip.has(g.id) &&
       (Math.round(g.width) !== desiredW || Math.round(g.height) !== desiredH)
@@ -694,7 +700,7 @@ export function CanvasEditor({
     if (patches.length) patchMany(patches);
   }, [nodes, draggingIds, patchMany]);
 
-  /* -------- INBOX: keep a lane for every board with unplaced tasks -------- */
+  /* -------- System groups: INBOX / BACKLOG / LATER / DONE THIS WEEK -------- */
 
   /** Board id → name, for lane titles (a lane's `content` is its board name,
    *  exactly like a hand-bound section's). */
@@ -705,99 +711,140 @@ export function CanvasEditor({
   }, [projects]);
 
   /**
-   * Reconcile the INBOX group and its lanes from the tasks that no work Section
-   * claims — the same derive-and-mirror-back shape as the group layout above.
+   * Reconcile the machine-managed groups and their per-board lanes — the same
+   * derive-and-mirror-back shape as the group layout above.
    *
-   * Node ids are DERIVED from the canvas + board (`inboxLaneId`) rather than
+   * Node ids are DERIVED from the canvas + board (`systemLaneId`) rather than
    * random, which is what makes this safe to run in every client at once:
    * storage is a LiveMap keyed by node id, so two clients creating "the Platform
    * lane" converge on one entry instead of racing to two. Writes only happen
    * when the desired set differs from what's there, so this can't loop.
+   *
+   * The four kinds differ in exactly two ways:
+   *
+   *   • Which boards want a lane. INBOX asks who is UNCLAIMED
+   *     (`boardsNeedingInbox`); the other three ask who has a card pinned to
+   *     their lanes (`boardsFiledInSystemGroup`). Same answer shape, opposite
+   *     question — an inbox lane means "unpinned", so nothing ever points at it.
+   *   • Whether the group itself survives an empty canvas. INBOX comes and goes
+   *     with the work it holds; the parking lots stay put, because they're
+   *     destinations you send cards TO (a tray that vanishes when you empty it
+   *     can't be aimed at).
    */
   useEffect(() => {
     if (!nodesMap) return;
-    const needed = boardsNeedingInbox(nodes, taskNodes, taskMap);
-    const groupId = inboxGroupId(canvasId);
-    const existingLanes = nodes.filter((n) => n.kind === "section" && isInboxNode(n));
-    const wantedIds = new Set([...needed].map((b) => inboxLaneId(canvasId, b)));
-
-    // Lanes whose board no longer has unplaced tasks — drop them so an emptied
-    // inbox shrinks away instead of leaving a wall of empty boxes.
-    const stale = existingLanes.filter((n) => !wantedIds.has(n.id)).map((n) => n.id);
-    const group = nodes.find((n) => n.id === groupId);
-    const missing = [...needed].filter(
-      (b) => !nodes.some((n) => n.id === inboxLaneId(canvasId, b)),
+    // Where the tray column starts. Measured against USER content only — include
+    // the trays and each new one would be placed left of the last, so the column
+    // would march off to infinity as the set grew.
+    const anchors = nodes.filter(
+      (n) => n.kind !== "draw" && systemGroupOf(n) === null,
     );
+    const baseX = Math.round(
+      (anchors.length ? Math.min(...anchors.map((n) => n.x)) : 0) -
+        NEW_GROUP_SIZE.width -
+        120,
+    );
+    const baseY = Math.round(
+      anchors.length ? Math.min(...anchors.map((n) => n.y)) : 0,
+    );
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const creates: StoredNode[] = [];
+    const removes: string[] = [];
+    const repairs: { id: string; patch: Partial<StoredNode> }[] = [];
 
-    if (!needed.size) {
-      // Nothing to triage: remove the lanes, and the group with them.
-      const gone = [...stale, ...(group ? [groupId] : [])];
-      if (gone.length) removeMany(gone);
-      return;
-    }
+    SYSTEM_GROUPS.forEach((kind, i) => {
+      const groupId = systemGroupId(kind, canvasId);
+      const group = nodes.find((n) => n.id === groupId);
+      const existingLanes = nodes.filter(
+        (n) => n.kind === "section" && systemGroupOf(n) === kind,
+      );
+      const wanted =
+        kind === "inbox"
+          ? boardsNeedingInbox(nodes, taskNodes, taskMap)
+          : boardsFiledInSystemGroup(kind, canvasId, taskNodes, taskMap);
+      const wantedIds = new Set(
+        [...wanted].map((b) => systemLaneId(kind, canvasId, b)),
+      );
 
-    if (stale.length) removeMany(stale);
-    if (!group) {
-      // Park the group clear of existing content, to the LEFT of everything —
-      // it's a tray you glance at, not something that should shove work aside.
-      const xs = nodes.filter((n) => n.kind !== "draw").map((n) => n.x);
-      const ys = nodes.filter((n) => n.kind !== "draw").map((n) => n.y);
-      putNode({
-        id: groupId,
-        kind: "section_group",
-        content: "INBOX",
-        x: Math.round((xs.length ? Math.min(...xs) : 0) - NEW_GROUP_SIZE.width - 120),
-        y: Math.round(ys.length ? Math.min(...ys) : 0),
-        width: NEW_GROUP_SIZE.width,
-        height: NEW_GROUP_SIZE.height,
-        color: null,
-        // Behind the work sections, like any other group.
-        position: 0,
-        data: { inbox: true, layout: "portrait" },
-      });
-    }
-    for (const boardId of missing) {
-      putNode({
-        id: inboxLaneId(canvasId, boardId),
-        kind: "section",
-        content: boardId ? (boardNames.get(boardId) ?? "") : "",
-        // computeGroupLayout owns the real position; these are just a first frame.
-        x: 0,
-        y: 0,
-        width: NEW_SECTION_SIZE.width,
-        height: MIN_SECTION_HEIGHT,
-        color: null,
-        position: lanePosition(boardId),
-        data: {
-          inbox: true,
-          groupId,
-          ...(boardId ? { boardId } : {}),
-          ...(boardId ? {} : { name: "No board" }),
-        },
-      });
-    }
+      // Lanes whose board has nothing here any more — drop them, so an emptied
+      // tray shrinks away instead of leaving a wall of empty boxes.
+      removes.push(
+        ...existingLanes.filter((n) => !wantedIds.has(n.id)).map((n) => n.id),
+      );
+      if (kind === "inbox" && !wanted.size) {
+        // Nothing to triage: the INBOX group goes too.
+        if (group) removes.push(groupId);
+        return;
+      }
 
-    // RE-ADOPT any lane that has drifted out of the group. Membership lives on
-    // the child (`data.groupId`), and several paths can clear it — deleting the
-    // INBOX group releases its members, and so does dragging a lane out. Nothing
-    // put it back: the loop above only creates lanes that are MISSING, and an
-    // orphaned lane still exists. A non-member is invisible to
-    // `computeGroupLayout`, so it kept stale coordinates forever and piled up on
-    // its neighbours. The reconciler owns these lanes, so it repairs them.
-    const repairs = existingLanes
-      .filter(
-        (n) =>
-          wantedIds.has(n.id) &&
-          (n.data?.groupId !== groupId ||
-            n.position !== lanePosition(laneBoardId(n))),
-      )
-      .map((n) => ({
-        id: n.id,
-        patch: {
-          data: { ...(n.data ?? {}), groupId } as StoredNode["data"],
-          position: lanePosition(laneBoardId(n)),
-        },
-      }));
+      if (!group)
+        creates.push({
+          id: groupId,
+          kind: "section_group",
+          content: SYSTEM_GROUP_TITLE[kind],
+          // Parked clear of existing content, to the LEFT of everything and
+          // stacked in `SYSTEM_GROUPS` order — these are trays you glance at, not
+          // something that should shove work aside. Movable afterwards: the slot
+          // is only ever chosen once, at creation.
+          x: baseX,
+          y: baseY + i * (NEW_GROUP_SIZE.height + 120),
+          width: NEW_GROUP_SIZE.width,
+          height: NEW_GROUP_SIZE.height,
+          color: null,
+          // Behind the work sections, like any other group.
+          position: 0,
+          data: { [kind]: true, layout: "portrait" },
+        });
+
+      for (const boardId of wanted) {
+        const laneId = systemLaneId(kind, canvasId, boardId);
+        if (nodeIds.has(laneId)) continue;
+        creates.push({
+          id: laneId,
+          kind: "section",
+          content: boardId ? (boardNames.get(boardId) ?? "") : "",
+          // computeGroupLayout owns the real position; these are a first frame.
+          x: 0,
+          y: 0,
+          width: NEW_SECTION_SIZE.width,
+          height: MIN_SECTION_HEIGHT,
+          color: null,
+          position: lanePosition(boardId),
+          data: {
+            [kind]: true,
+            groupId,
+            ...(boardId ? { boardId } : { name: "No board" }),
+          },
+        });
+      }
+
+      // RE-ADOPT any lane that has drifted out of its group. Membership lives on
+      // the child (`data.groupId`), and several paths can clear it — deleting the
+      // group releases its members, and so does dragging a lane out. Nothing put
+      // it back: the loop above only creates lanes that are MISSING, and an
+      // orphaned lane still exists. A non-member is invisible to
+      // `computeGroupLayout`, so it kept stale coordinates forever and piled up
+      // on its neighbours. The reconciler owns these lanes, so it repairs them.
+      repairs.push(
+        ...existingLanes
+          .filter(
+            (n) =>
+              wantedIds.has(n.id) &&
+              (n.data?.groupId !== groupId ||
+                n.position !== lanePosition(laneBoardId(n))),
+          )
+          .map((n) => ({
+            id: n.id,
+            patch: {
+              data: { ...(n.data ?? {}), groupId } as StoredNode["data"],
+              position: lanePosition(laneBoardId(n)),
+            },
+          })),
+      );
+    });
+
+    if (removes.length) removeMany(removes);
+    for (const node of creates) putNode(node);
     if (repairs.length) patchMany(repairs);
   }, [
     nodesMap,
@@ -857,16 +904,22 @@ export function CanvasEditor({
     }
   }, [nodesMap, nodes, taskNodes, taskMap, boardNames, putNode]);
 
-  /** Identity of the section set as far as membership is concerned: which
-   *  sections exist and which board each INBOX lane serves. Deliberately excludes
-   *  geometry — `nodes` gets a fresh identity on every pointermove of a drag
-   *  (that's how positions travel), but where a task renders never depends on
-   *  where a section sits. */
+  /** Identity of the section set as far as membership and placement are
+   *  concerned: which sections exist and which board each system lane serves.
+   *  Every system lane's board is encoded, not just INBOX's — membership only
+   *  needs the inbox ones, but `laneFor` below has to find the BACKLOG/LATER/DONE
+   *  lane for a board, and would go stale if a lane's board changed silently.
+   *  Deliberately excludes geometry: `nodes` gets a fresh identity on every
+   *  pointermove of a drag (that's how positions travel), but where a task
+   *  renders never depends on where a section sits. */
   const sectionsKey = useMemo(
     () =>
       nodes
         .filter((n) => n.kind === "section")
-        .map((n) => `${n.id}:${isInboxNode(n) ? (laneBoardId(n) ?? "-") : ""}`)
+        .map((n) => {
+          const kind = systemGroupOf(n);
+          return `${n.id}:${kind ?? ""}:${kind ? (laneBoardId(n) ?? "-") : ""}`;
+        })
         .join("|"),
     [nodes],
   );
@@ -901,12 +954,88 @@ export function CanvasEditor({
     [sectionNodes, taskNodes, taskMap],
   );
 
+  /**
+   * Resolve a placement to the lane a board's cards go to, creating the lane if
+   * this canvas doesn't have one yet. The client twin of the server's
+   * `resolvePlacementSection`, and it agrees with it by construction: same
+   * derived lane ids, same "an existing member wins" rule, same tie-break.
+   *
+   * Reads nodes through `nodesRef` rather than closing over them, so the
+   * callback stays stable — it's only ever called from an event handler, where
+   * the ref is current, and a fresh identity per node change would re-register
+   * the resolver on every pointermove of a drag.
+   */
+  const laneFor = useCallback(
+    (placement: TaskPlacement, boardId: string | null): string | null => {
+      if (placement === "inbox") return null;
+      const all = nodesRef.current;
+      const groupId =
+        placement === "thisWeek"
+          ? thisWeekGroupId(all)
+          : systemGroupId(placement, canvasId);
+      // Nothing starred THIS WEEK — there's no such destination on this canvas.
+      if (!groupId) return null;
+
+      // An existing member for this board always wins, so the user's own lanes
+      // are what cards land in. Same ordering as `masterSectionsByBoard` and the
+      // server's `ORDER BY position, id`.
+      const existing = all
+        .filter(
+          (n) =>
+            n.kind === "section" &&
+            n.data?.groupId === groupId &&
+            laneBoardId(n) === boardId,
+        )
+        .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1))[0];
+      if (existing) return existing.id;
+
+      const laneId =
+        placement === "thisWeek"
+          ? weekLaneId(groupId, boardId)
+          : systemLaneId(placement, canvasId, boardId);
+      if (!all.some((n) => n.id === laneId)) {
+        putNode({
+          id: laneId,
+          kind: "section",
+          content: boardId ? (boardNames.get(boardId) ?? "") : "",
+          // computeGroupLayout owns the real position; these are a first frame.
+          x: 0,
+          y: 0,
+          width: NEW_SECTION_SIZE.width,
+          height: MIN_SECTION_HEIGHT,
+          color: null,
+          // THIS WEEK is hand-arranged, so a new lane APPENDS rather than
+          // shoving its way into the middle of it. A system tray is sorted by
+          // the same board hash its reconciler uses.
+          position:
+            placement === "thisWeek"
+              ? Math.max(0, ...groupMembers(all, groupId).map((m) => m.position)) + 1
+              : lanePosition(boardId),
+          data: {
+            ...(placement === "thisWeek" ? {} : { [placement]: true }),
+            groupId,
+            ...(boardId ? { boardId } : { name: "No board" }),
+          },
+        });
+      }
+      return laneId;
+    },
+    [canvasId, boardNames, putNode],
+  );
+
   // Lend the resolution to WorkspaceContext so its shared drag paths can re-pin
   // a dragged card correctly — they can't derive a card's Section themselves.
   useEffect(() => {
     const laneIds = new Set(
       sectionNodes.filter((n) => isInboxNode(n)).map((n) => n.id),
     );
+    // Only the SYSTEM lanes, by id — BACKLOG/LATER/DONE THIS WEEK are ordinary
+    // pin targets, so unlike `laneIds` this can't be used to decide pinning.
+    const trayOf = new Map<string, SystemGroup>();
+    for (const n of sectionNodes) {
+      const kind = systemGroupOf(n);
+      if (kind) trayOf.set(n.id, kind);
+    }
     const sectionByTask = new Map<string, string>();
     for (const [sectionId, ids] of membership.bySection)
       for (const id of ids) sectionByTask.set(id, sectionId);
@@ -918,9 +1047,14 @@ export function CanvasEditor({
         sectionNodeId && !laneIds.has(sectionNodeId) ? sectionNodeId : null,
       membersOf: (sectionNodeId) =>
         (sectionNodeId && membership.bySection.get(sectionNodeId)) || new Set<string>(),
+      groupOf: (taskId) => {
+        const section = sectionByTask.get(taskId);
+        return section ? (trayOf.get(section) ?? null) : null;
+      },
+      laneFor,
     });
     return () => registerPlacement(null);
-  }, [sectionNodes, membership, registerPlacement]);
+  }, [sectionNodes, membership, registerPlacement, laneFor]);
 
   /* -------- snapshot storage → Postgres (debounced diff) -------- */
   const savedRef = useRef<Map<string, string>>(new Map());
@@ -1169,11 +1303,11 @@ export function CanvasEditor({
         if (n?.kind !== "section_group") continue;
         for (const m of groupMembers(nodesRef.current, id)) {
           if (removing.has(m.id)) continue; // being deleted anyway
-          // An INBOX lane is owned by the reconciler, not by the user — releasing
+          // A system lane is owned by the reconciler, not by the user — releasing
           // it would strand it outside any group, where nothing lays it out and
           // nothing puts it back. Leave its `groupId` alone: the reconciler
           // recreates the group and re-adopts the lane.
-          if (isInboxNode(m)) continue;
+          if (systemGroupOf(m)) continue;
           const rest = { ...(m.data ?? {}) };
           delete rest.groupId;
           releases.push({ id: m.id, patch: { data: rest as StoredNode["data"] } });
@@ -1811,14 +1945,14 @@ export function CanvasEditor({
             const g = groupAtPoint(nodesRef.current, px, py);
             // Re-read: `node` is a pointerdown snapshot, so merging its `data`
             // would revert anything written to this section during the drag (a
-            // peer binding a board, a master toggle).
+            // peer binding a board, a rename).
             const cur = nodesRef.current.find((n) => n.id === node.id) ?? node;
             const currentGid = cur.data?.groupId as string | undefined;
-            // An INBOX lane can be dragged around, but never re-parented: the
+            // A system lane can be dragged around, but never re-parented: the
             // reconciler owns which group it belongs to. Dropping it elsewhere (or
             // outside every group) would strand it where nothing lays it out and
             // nothing adopts it back — it would just pile up on its neighbours.
-            if (isInboxNode(cur)) return;
+            if (systemGroupOf(cur)) return;
             if (g) {
               const siblings = groupMembers(nodesRef.current, g.id).filter(
                 (m) => m.id !== node.id,
@@ -2014,29 +2148,6 @@ export function CanvasEditor({
         patchMany([{ id, patch: patch as Partial<StoredNode> }]),
       resizeStart: () => history.pause(),
       resizeEnd: () => history.resume(),
-      setMaster: (node, master) => {
-        const bid = node.data?.boardId as string | undefined;
-        const updates: { id: string; patch: Partial<StoredNode> }[] = [
-          { id: node.id, patch: { data: { ...node.data, master } } },
-        ];
-        // One master per board: marking this one demotes any sibling.
-        if (master && bid) {
-          for (const other of nodesRef.current) {
-            if (
-              other.id !== node.id &&
-              other.kind === "section" &&
-              other.data?.boardId === bid &&
-              other.data?.master === true
-            ) {
-              updates.push({
-                id: other.id,
-                patch: { data: { ...other.data, master: false } },
-              });
-            }
-          }
-        }
-        patchMany(updates);
-      },
       setThisWeek: (node, thisWeek) => {
         const updates: { id: string; patch: Partial<StoredNode> }[] = [
           { id: node.id, patch: { data: { ...node.data, thisWeek } } },
@@ -2091,18 +2202,17 @@ export function CanvasEditor({
     return ga - gb || a.position - b.position;
   });
 
-  // The master section per DB board: a section whose `data.master` is set. Its
-  // Send buttons on sibling sections (same board) target it. `content` is the
-  // section's title. One master per board is enforced when marking one (below).
+  // The master section per DB board: the lane that board has inside the THIS
+  // WEEK group. Sibling sections' "Send to …" buttons target it. There's no
+  // separate master flag any more — the group's star is the only star, so a
+  // board's master and this week's work can't drift apart (see
+  // `masterSectionsByBoard`, which the server's SQL twin mirrors).
   const masterByBoard = new Map<string, { id: string; name: string }>();
-  for (const n of nodes) {
-    const bid = n.data?.boardId as string | undefined;
-    if (n.kind === "section" && bid && n.data?.master === true) {
-      // Label it the way its header reads: its own name if it has one, else the
-      // board's (`content`) — this feeds siblings' "Send to …" button.
-      const own = ((n.data?.name as string | undefined) ?? "").trim();
-      masterByBoard.set(bid, { id: n.id, name: own || n.content });
-    }
+  for (const [bid, n] of masterSectionsByBoard(nodes)) {
+    // Label it the way its header reads: its own name if it has one, else the
+    // board's (`content`) — this feeds siblings' "Send to …" button.
+    const own = ((n.data?.name as string | undefined) ?? "").trim();
+    masterByBoard.set(bid, { id: n.id, name: own || n.content });
   }
 
   const cursor = spaceDown
@@ -2302,7 +2412,7 @@ export function CanvasEditor({
                 smooth={!draggingIds.has(node.id)}
                 scale={viewport.scale}
                 canvasName={canvasName}
-                isMaster={node.data?.master === true}
+                isMaster={master?.id === node.id}
                 masterSectionId={other?.id ?? null}
                 masterSectionName={other?.name ?? null}
                 groupMemberCount={

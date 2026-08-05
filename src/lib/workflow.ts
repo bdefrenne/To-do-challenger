@@ -36,15 +36,22 @@ recording who it's for. Taking a handoff assigns you too (\`work_on_task\`,
 \`lock_task\`, or the human clicking Copy prompt), even when the status hasn't
 moved yet.
 
-**Where a task lands on the canvas.** New tasks go to their board's **INBOX**
-lane — the pile of things for later. When something is meant to be done **this
-week**, or you're **starting on it now**, it belongs on the **THIS WEEK** board
-instead: pass \`thisWeek: true\` to \`create_task\` / \`update_task\`. Setting the
-status to Analyzing or beyond already does this for a task nobody has filed by
-hand, so the normal "create it, then start work" flow needs nothing extra. Pass
-\`thisWeek: false\` when the user says it's for later — that's what keeps INBOX
-meaningful. (If nobody has flagged a THIS WEEK group on the canvas, everything
-just stays in INBOX.)
+**Where a task lands on the canvas.** \`placement\` picks the group, and it's an
+axis of its own — it never changes a task's status, and status never changes it
+beyond the one rule below.
+
+| \`placement\` | means |
+| --- | --- |
+| \`inbox\` | untriaged — the default, and where anything unfiled shows up |
+| \`thisWeek\` | to be done this week, or you're starting on it now |
+| \`backlog\` | triaged, but not scheduled |
+| \`later\` | deliberately deferred — what to pass when the user says "later" |
+| \`doneThisWeek\` | finished this week, waiting to be swept |
+
+Pass it to \`create_task\` / \`update_task\`. Setting the status to Analyzing or
+beyond already files a task nobody has placed by hand onto THIS WEEK, so the
+normal "create it, then start work" flow needs nothing extra. (If nobody has
+starred a THIS WEEK group on the canvas, everything just stays in INBOX.)
 
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
@@ -56,6 +63,17 @@ are context, never a map of the current codebase. Never use another task's
 notes to guess where code lives or how it's shaped; open the actual files and
 read them directly. (That's why \`list_tasks\`/\`search_tasks\` omit those
 fields — they're only on the task you \`get_task\` directly.)
+
+**Ask the board a question; don't download it.** \`list_tasks\` and
+\`search_tasks\` filter server-side — by status, board/project, assignee, text,
+and by activity window: \`statusChangedFrom\`/\`To\` (what moved),
+\`completedFrom\`/\`To\` (what shipped), \`updatedFrom\`/\`To\`. A bare
+\`YYYY-MM-DD\` means that whole day, and \`from = to\` is a valid single-day
+window. \`actor\` narrows to who actually *did* the work (the activity log) —
+that, not \`assignee\`, is what "what did I do today" means. Reach for
+\`detail: "full"\` only when you truly need the working fields. A read that
+still doesn't fit comes back \`truncated\` with the filters that would narrow
+it: use them rather than re-running the same wide call.
 
 The steps below are **composable** — not every task needs every one. Depending
 on what's asked, you might do just the analysis, just the technical plan

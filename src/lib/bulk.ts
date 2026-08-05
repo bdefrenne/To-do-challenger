@@ -21,7 +21,7 @@ export const MAX_BULK_OPS = 200;
 /** Outcome of a single op — so a partial failure is visible, not silent.
  *  Positionally aligned with the `operations` array that produced it. */
 export interface OpResult {
-  op: "create" | "update" | "move" | "complete" | "comment" | "delete";
+  op: "create" | "update" | "move" | "complete" | "comment" | "archive" | "delete";
   ok: boolean;
   /** The affected task id (the new id for a successful `create`). */
   id?: string;

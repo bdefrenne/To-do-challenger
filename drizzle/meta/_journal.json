@@ -204,6 +204,13 @@
       "when": 1785700000000,
       "tag": "0028_add_telegram_log_source",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1785800000000,
+      "tag": "0029_add_read_query_indexes",
+      "breakpoints": true
     }
   ]
 }

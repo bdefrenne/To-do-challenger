@@ -191,7 +191,7 @@ export function TaskTableRow({
         </div>
 
         <button onClick={onOpen} className="flex min-w-0 items-center gap-2 text-left">
-          <span className={`truncate ${done ? "text-faint line-through" : "text-fg"}`}>
+          <span className={`truncate ${done ? "text-faint" : "text-fg"}`}>
             {task.title}
           </span>
           {task.commentCount ? (

@@ -8,7 +8,7 @@
   ====================================================================
 */
 
-import { and, asc, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, ne, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
 import { db } from "./client";
@@ -40,10 +40,11 @@ import { daysAgo } from "@/lib/format";
 import { currentLogContext, type LogSource } from "./log-context";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
 import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
-import { weekLaneId } from "@/lib/sections";
+import { weekLaneId, systemLaneId } from "@/lib/sections";
 import type {
   Task,
   TaskStatus,
+  TaskPlacement,
   Recurrence,
   FibPoints,
   Importance,
@@ -74,6 +75,93 @@ export interface TaskDTO extends Task {
 
 const iso = (d: Date | string | null) =>
   d == null ? undefined : (d instanceof Date ? d.toISOString() : d);
+
+/* ---- Date windows ----
+   Every "what happened between X and Y" read goes through `dateWindow`. It
+   exists because each caller used to hand-roll `new Date(from)` / `new Date(to)`
+   and compare inclusively, which made the most natural window of all — a single
+   day, from = to — resolve to the empty range [00:00, 00:00]. */
+
+const DAY_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** How far `tz` is ahead of UTC at a given instant, in ms (0 for UTC). */
+function tzOffsetMs(at: Date, tz: string): number {
+  if (tz === "UTC") return 0;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(at);
+  const n = (type: string) => Number(parts.find((p) => p.type === type)?.value);
+  // hour12:false renders midnight as "24" on some ICU builds — fold it back.
+  const asIfUtc = Date.UTC(
+    n("year"),
+    n("month") - 1,
+    n("day"),
+    n("hour") % 24,
+    n("minute"),
+    n("second"),
+  );
+  return asIfUtc - at.getTime();
+}
+
+/** The instant at which `YYYY-MM-DD` (+ `plusDays`) begins in `tz`. */
+function dayStart(day: string, tz: string, plusDays = 0): Date {
+  const [y, m, d] = day.split("-").map(Number);
+  const naive = Date.UTC(y, m - 1, d + plusDays);
+  // The offset sampled at the naive instant is right except when the window
+  // edge sits across a DST change; one correction lands it (offsets shift by
+  // an hour, day boundaries are 24 apart).
+  const off = tzOffsetMs(new Date(naive), tz);
+  const first = naive - off;
+  return new Date(first - (tzOffsetMs(new Date(first), tz) - off));
+}
+
+/**
+ * Parse a caller's date window into a HALF-OPEN instant range `[start, end)`.
+ *
+ * Both ends are optional and accept either a bare day (`YYYY-MM-DD`) or a full
+ * ISO instant. A bare day means the WHOLE day in `tz`, so `from = to =
+ * "2026-08-04"` covers 04T00:00 → 05T00:00 — "what happened on the 4th?".
+ *
+ * `end` is EXCLUSIVE: compare with `< end`, never `<=`. That way an event at
+ * 23:59:59.999 counts and one at the next midnight does not, and consecutive
+ * windows tile without double-counting.
+ */
+export function dateWindow(
+  from?: string,
+  to?: string,
+  tz = "UTC",
+): { start?: Date; end?: Date } {
+  return {
+    start: from
+      ? DAY_ONLY.test(from)
+        ? dayStart(from, tz)
+        : new Date(from)
+      : undefined,
+    end: to
+      ? DAY_ONLY.test(to)
+        ? dayStart(to, tz, 1)
+        : new Date(to)
+      : undefined,
+  };
+}
+
+/** Conditions placing a timestamp column inside a half-open window. */
+function inWindow(
+  col: SQL | AnyColumn,
+  { start, end }: { start?: Date; end?: Date },
+): SQL[] {
+  const conds: SQL[] = [];
+  if (start) conds.push(sql`${col} >= ${start}`);
+  if (end) conds.push(sql`${col} < ${end}`);
+  return conds;
+}
 
 /** Keep importance inside the -1…2 ladder — guards legacy rows and any stray
  *  out-of-range write (validation already enforces this at the API edge). */
@@ -303,13 +391,36 @@ const THIS_WEEK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
 export async function resolveThisWeekSection(
   boardId: string | null,
 ): Promise<string | null> {
+  return resolvePlacementSection("thisWeek", boardId);
+}
+
+/**
+ * Where a task goes for a given `placement` — the pin to write, or null for
+ * "leave it unpinned", which is what INBOX *is*.
+ *
+ * All three pinned placements work the same way, and the doc above explains why:
+ * find the flagged group, prefer a lane it already has for this board, else name
+ * the lane the canvas will materialise. They differ only in which `data` flag
+ * marks the group and how the fallback lane id is derived — THIS WEEK's is keyed
+ * on the group id (the group is hand-made, so its id is random), the system
+ * groups' on the canvas id (their ids are themselves derived from it).
+ */
+export async function resolvePlacementSection(
+  placement: TaskPlacement,
+  boardId: string | null,
+): Promise<string | null> {
+  if (placement === "inbox") return null;
+  // Each placement's name IS the `data` flag that marks its group, so the query
+  // is the same for all of them.
+  const flag = placement;
+
   const groups = await db
     .select({ id: canvasNodes.id, canvasId: canvasNodes.canvasId })
     .from(canvasNodes)
     .where(
       and(
         eq(canvasNodes.kind, "section_group"),
-        sql`${canvasNodes.data}->>'thisWeek' = 'true'`,
+        sql`${canvasNodes.data}->>${flag} = 'true'`,
       ),
     )
     .orderBy(asc(canvasNodes.id));
@@ -331,8 +442,39 @@ export async function resolveThisWeekSection(
     )
     .orderBy(asc(canvasNodes.position), asc(canvasNodes.id))
     .limit(1);
+  if (existing) return existing.id;
 
-  return existing?.id ?? weekLaneId(group.id, boardId);
+  return placement === "thisWeek"
+    ? weekLaneId(group.id, boardId)
+    : systemLaneId(placement, group.canvasId, boardId);
+}
+
+/** How a placement change reads on the activity timeline. Every move is
+ *  announced — a card that relocated itself with no explanation is the thing
+ *  these lines exist to prevent. */
+const PLACEMENT_LOG: Record<TaskPlacement, string> = {
+  inbox: "📥 Moved back to INBOX",
+  thisWeek: "📅 Moved to THIS WEEK",
+  backlog: "🗂️ Moved to BACKLOG",
+  later: "🕓 Moved to LATER",
+  doneThisWeek: "✅ Moved to DONE THIS WEEK",
+};
+
+/**
+ * The placement a write asks for, or undefined for "don't move it".
+ *
+ * `thisWeek` is the older, boolean spelling of the same idea, kept working for
+ * every caller written against it (the MCP tool contract, agent instructions,
+ * `scripts/check-this-week.ts`). Normalised here, once, so the four mutators
+ * below only ever reason about `placement`.
+ */
+function askedPlacement(input: {
+  placement?: TaskPlacement;
+  thisWeek?: boolean;
+}): TaskPlacement | undefined {
+  if (input.placement !== undefined) return input.placement;
+  if (input.thisWeek !== undefined) return input.thisWeek ? "thisWeek" : "inbox";
+  return undefined;
 }
 
 /**
@@ -689,7 +831,75 @@ export interface TaskFilter {
   includeArchived?: boolean;
   /** Return ONLY archived tasks (for the Archived view). Overrides includeArchived. */
   archivedOnly?: boolean;
+
+  /* ---- Activity windows ------------------------------------------------
+     "What changed between X and Y", the axis a standup or a daily summary
+     actually asks on. Each pair is a `dateWindow` (bare YYYY-MM-DD = that
+     whole day; `to` is inclusive of its day, exclusive of the next). Undefined
+     ends are open, so passing only `From` means "since". */
+
+  /** Tasks whose status last moved inside the window (`statusSince`). */
+  statusChangedFrom?: string;
+  statusChangedTo?: string;
+  /** Tasks completed inside the window (`completedAt`). */
+  completedFrom?: string;
+  completedTo?: string;
+  /** Tasks edited inside the window (`updatedAt`). */
+  updatedFrom?: string;
+  updatedTo?: string;
+  /** Tasks created inside the window (`createdAt`). */
+  createdFrom?: string;
+  createdTo?: string;
+
+  /**
+   * Tasks this user actually TOUCHED — the activity log's `actorId`, which is
+   * the only record of who did the work. Distinct from `assignee` (who it's
+   * for, often stale or empty) and from the owner (who created it, credited
+   * even when someone else did it all).
+   *
+   * Any log kind counts as a touch: a status move, an edit, a comment, a
+   * commit link. Windowed by `actorFrom`/`actorTo`, which default to whichever
+   * activity window the caller already gave — so "what did I do on the 4th?"
+   * needs the date once, not twice.
+   */
+  actor?: string;
+  actorFrom?: string;
+  actorTo?: string;
+
+  /** Drop done tasks. Left undefined they're INCLUDED — the web board needs
+   *  its Done column, so the "hide done" default belongs to the callers that
+   *  want it (the MCP tools), never to this layer. */
+  includeDone?: boolean;
+
+  /** IANA zone the bare-date window edges are read in (default UTC). */
+  tz?: string;
+
+  /** Cap on rows returned. Pair with `sort` — truncating a position-ordered
+   *  list keeps an arbitrary slice, which is rarely what a capped read wants. */
+  limit?: number;
+  /** `position` = the board's own order (default). `recent` = most recent
+   *  status move first, the useful order for an activity window. */
+  sort?: "position" | "recent";
 }
+
+/** The filter keys a caller can add to narrow an over-large read. Surfaced in
+ *  the MCP truncation envelope so the next call can be the right one. */
+export const TASK_FILTER_KEYS = [
+  "status",
+  "boardId",
+  "projectId",
+  "assignee",
+  "actor",
+  "text",
+  "statusChangedFrom",
+  "statusChangedTo",
+  "completedFrom",
+  "completedTo",
+  "updatedFrom",
+  "updatedTo",
+  "includeDone",
+  "limit",
+] as const;
 
 /** Build the WHERE for the team's tasks, narrowed by an optional filter. Tasks
  *  are team-visible, so there is no owner fence; `userId` is ignored. */
@@ -721,6 +931,48 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
   // powers the Archived view; `includeArchived` returns both.
   if (filter?.archivedOnly) conds.push(isNotNull(tasks.archivedAt));
   else if (!filter?.includeArchived) conds.push(isNull(tasks.archivedAt));
+
+  if (filter?.includeDone === false) conds.push(ne(tasks.status, "done"));
+
+  const tz = filter?.tz ?? "UTC";
+  conds.push(
+    ...inWindow(
+      tasks.statusSince,
+      dateWindow(filter?.statusChangedFrom, filter?.statusChangedTo, tz),
+    ),
+    ...inWindow(
+      tasks.completedAt,
+      dateWindow(filter?.completedFrom, filter?.completedTo, tz),
+    ),
+    ...inWindow(
+      tasks.updatedAt,
+      dateWindow(filter?.updatedFrom, filter?.updatedTo, tz),
+    ),
+    ...inWindow(
+      tasks.createdAt,
+      dateWindow(filter?.createdFrom, filter?.createdTo, tz),
+    ),
+  );
+
+  // Who touched it: an EXISTS over the activity log — no join, so a task with
+  // 20 log rows still comes back once. The window falls back to whichever
+  // activity window the caller already stated.
+  if (filter?.actor) {
+    const w = dateWindow(
+      filter.actorFrom ??
+        filter.statusChangedFrom ??
+        filter.completedFrom ??
+        filter.updatedFrom,
+      filter.actorTo ??
+        filter.statusChangedTo ??
+        filter.completedTo ??
+        filter.updatedTo,
+      tz,
+    );
+    conds.push(
+      sql`exists (select 1 from ${taskLogs} where ${taskLogs.taskId} = ${tasks.id} and ${and(eq(taskLogs.actorId, filter.actor), ...inWindow(taskLogs.at, w))})`,
+    );
+  }
   return and(...conds);
 }
 
@@ -738,17 +990,43 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
  */
 const TASK_ORDER = [asc(tasks.position), asc(tasks.createdAt), asc(tasks.id)];
 
-/** All of a user's tasks as a nested tree, ordered by status then position. */
+/** Most recent status move first — the order that makes `limit` meaningful on
+ *  an activity window (truncating TASK_ORDER keeps an arbitrary slice). */
+const RECENT_ORDER = [desc(tasks.statusSince), desc(tasks.createdAt), asc(tasks.id)];
+
+/** The matching rows for a filter, ordered and capped. One query builder for
+ *  the tree and flat readers so they can never disagree on scope. */
+function taskRows(userId: string, filter?: TaskFilter) {
+  const q = db
+    .select()
+    .from(tasks)
+    .where(taskWhere(userId, filter))
+    .orderBy(...(filter?.sort === "recent" ? RECENT_ORDER : TASK_ORDER));
+  return filter?.limit ? q.limit(filter.limit) : q;
+}
+
+/** How many tasks match — the same WHERE, without the cap. Lets a capped read
+ *  report "42 of 98" instead of implying it returned everything. */
+export async function countTasks(
+  userId: string,
+  filter?: TaskFilter,
+): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(tasks)
+    .where(taskWhere(userId, filter));
+  return row?.n ?? 0;
+}
+
+/** All of a user's tasks as a nested tree, ordered by status then position.
+ *  A filtered read nests whatever matched: a task whose parent didn't match
+ *  surfaces as a root rather than vanishing. */
 export async function listTasks(
   userId: string,
   filter?: TaskFilter,
 ): Promise<TaskDTO[]> {
   const [rows, counts, attachments, ctx] = await Promise.all([
-    db
-      .select()
-      .from(tasks)
-      .where(taskWhere(userId, filter))
-      .orderBy(...TASK_ORDER),
+    taskRows(userId, filter),
     commentCounts(userId),
     attachmentsByTask(userId),
     codeCtx(userId),
@@ -762,11 +1040,7 @@ export async function listTasksFlat(
   filter?: TaskFilter,
 ): Promise<TaskDTO[]> {
   const [rows, counts, attachments, ctx] = await Promise.all([
-    db
-      .select()
-      .from(tasks)
-      .where(taskWhere(userId, filter))
-      .orderBy(...TASK_ORDER),
+    taskRows(userId, filter),
     commentCounts(userId),
     attachmentsByTask(userId),
     codeCtx(userId),
@@ -923,10 +1197,12 @@ export interface CreateTaskInput {
    *  unpinned tasks in their board's INBOX lane, so only the canvas's own
    *  composers (which know which section you typed into) should set this. */
   canvasSectionId?: string | null;
-  /** "This is for this week": place the task in the canvas's THIS WEEK group
-   *  instead of leaving it in INBOX. Implied by a status in
-   *  `THIS_WEEK_STATUSES` — a task born into Analyzing is being worked on now.
-   *  Ignored when `canvasSectionId` names a section explicitly. */
+  /** Which canvas group to file it in — INBOX, THIS WEEK, BACKLOG, LATER or
+   *  DONE THIS WEEK. Defaults to INBOX unless the status implies THIS WEEK (a
+   *  task born into Analyzing is being worked on now). Ignored when
+   *  `canvasSectionId` names a section explicitly. */
+  placement?: TaskPlacement;
+  /** Older boolean spelling of `placement`: true = thisWeek, false = inbox. */
   thisWeek?: boolean;
   value?: FibPoints;
   difficulty?: FibPoints;
@@ -1044,16 +1320,16 @@ export async function createTask(
     lockedAt = new Date();
   }
   // Canvas placement. An explicit pin (a canvas composer knows the section you
-  // typed into) always wins; otherwise "this week" — asked for, or implied by
-  // being born straight into work — routes it to the THIS WEEK group, and
-  // anything else stays unpinned and surfaces in its board's INBOX lane.
-  const wantsThisWeek = input.thisWeek ?? statusImpliesThisWeek(status);
+  // typed into) always wins; otherwise the asked-for group — or, failing that,
+  // THIS WEEK when being born straight into work implies it — and anything else
+  // stays unpinned and surfaces in its board's INBOX lane.
+  const placement =
+    askedPlacement(input) ??
+    (statusImpliesThisWeek(status) ? "thisWeek" : "inbox");
   const canvasSectionId =
     input.canvasSectionId !== undefined && input.canvasSectionId !== null
       ? input.canvasSectionId
-      : wantsThisWeek
-        ? await resolveThisWeekSection(boardId)
-        : null;
+      : await resolvePlacementSection(placement, boardId);
   const explicitAssignees = await resolveAssignees(input.assigneeIds ?? []);
   // Born straight into work = you own it. `userId` is already a canonical id.
   const assigneeIds = claimsWork(status)
@@ -1114,10 +1390,13 @@ export interface UpdateTaskInput {
    *  back to its board's INBOX lane. Unlike `customFields` this is a single
    *  scalar, so re-pinning never has to read-modify-write a shared bag. */
   canvasSectionId?: string | null;
-  /** Move the task into the canvas's THIS WEEK group (`true`) or back to its
-   *  board's INBOX lane (`false`). Implied by a status transition into
-   *  `THIS_WEEK_STATUSES`, but only for a task nobody has pinned by hand.
-   *  Ignored when `canvasSectionId` is passed alongside it. */
+  /** Move the task into one of the canvas's groups — THIS WEEK, BACKLOG, LATER,
+   *  DONE THIS WEEK, or `"inbox"` to release it back to its board's INBOX lane.
+   *  THIS WEEK is implied by a status transition into `THIS_WEEK_STATUSES`, but
+   *  only for a task nobody has pinned by hand. Ignored when `canvasSectionId` is
+   *  passed alongside it. */
+  placement?: TaskPlacement;
+  /** Older boolean spelling of `placement`: true = thisWeek, false = inbox. */
   thisWeek?: boolean;
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
@@ -1199,9 +1478,9 @@ export async function updateTask(
       values.archivedAt = null;
     }
     // Lock the code the first time the task enters the working part of the
-    // spine (Analyzing+). Folded into THIS update so the If-Match guard below
-    // still holds — no separate mintRef write to trip it. Any entry path (UI
-    // picker, AI update_task, prompt) funnels through here.
+    // spine (Analyzing+). Folded into THIS update so the expectedUpdatedAt
+    // guard below still holds — no separate mintRef write to trip it. Any entry
+    // path (UI picker, AI update_task, prompt) funnels through here.
     if (LOCKING_STATUSES.has(patch.status!) && !current.refLocked) {
       const lockCtx = await codeCtx(userId);
       const lock = await computeLockFields(current, userId, lockCtx);
@@ -1215,29 +1494,31 @@ export async function updateTask(
     }
   }
 
-  // THIS WEEK placement. An explicit `canvasSectionId` wins outright; otherwise
-  // an explicit `thisWeek` moves the task either way, and entering a work status
-  // moves an UNPINNED task there — never one the user parked in a section by
-  // hand, because an agent starting work is no reason to yank a card out of the
-  // group it was filed in. Recorded so the timeline explains the move.
-  let placedThisWeek: boolean | null = null;
+  // Canvas placement. An explicit `canvasSectionId` wins outright; otherwise an
+  // explicit `placement` moves the task to that group, and entering a work status
+  // moves an UNPINNED task to THIS WEEK — never one the user parked in a section
+  // by hand, because an agent starting work is no reason to yank a card out of
+  // the group it was filed in. Recorded so the timeline explains the move.
+  let placed: TaskPlacement | null = null;
   if (patch.canvasSectionId === undefined) {
-    if (patch.thisWeek !== undefined) placedThisWeek = patch.thisWeek;
-    else if (
+    placed = askedPlacement(patch) ?? null;
+    if (
+      placed === null &&
       statusChanged &&
       statusImpliesThisWeek(patch.status) &&
       current.canvasSectionId === null
     )
-      placedThisWeek = true;
+      placed = "thisWeek";
   }
-  if (placedThisWeek === true) {
-    const target = await resolveThisWeekSection(current.boardId);
-    // No flagged group, or it's already there: nothing to move or announce.
-    if (target && target !== current.canvasSectionId) values.canvasSectionId = target;
-    else placedThisWeek = null;
-  } else if (placedThisWeek === false) {
-    if (current.canvasSectionId === null) placedThisWeek = null;
-    else values.canvasSectionId = null;
+  if (placed !== null) {
+    const target = await resolvePlacementSection(placed, current.boardId);
+    // Already there — or asked for a group this canvas hasn't flagged, in which
+    // case `resolvePlacementSection` gives us null and there's nowhere to move
+    // it. Either way there's nothing to do or announce. (`inbox` legitimately
+    // resolves to null, so it only counts as a move if the task WAS pinned.)
+    if (target !== current.canvasSectionId && (target !== null || placed === "inbox"))
+      values.canvasSectionId = target;
+    else placed = null;
   }
 
   const [row] = await db
@@ -1274,8 +1555,7 @@ export async function updateTask(
     );
   if (autoLocked) logParts.push(`🔒 Locked as ${autoLocked}`);
   if (autoAssigned) logParts.push(await autoAssignNote(userId));
-  if (placedThisWeek !== null)
-    logParts.push(placedThisWeek ? "📅 Moved to THIS WEEK" : "📥 Moved back to INBOX");
+  if (placed !== null) logParts.push(PLACEMENT_LOG[placed]);
   const patchMsg = describeBulkPatch(patch);
   if (patchMsg) logParts.push(patchMsg);
   if (logParts.length)
@@ -1302,6 +1582,11 @@ export async function moveTask(
      *  Section is bound to the old board, so leaving the pin would render the
      *  card in a Section for a board it no longer belongs to. */
     canvasSectionId?: string | null;
+    /** File it in a canvas group by name instead of by section id — the same
+     *  input `createTask`/`updateTask` take. An explicit `canvasSectionId` wins. */
+    placement?: TaskPlacement;
+    /** Older boolean spelling of `placement`: true = thisWeek, false = inbox. */
+    thisWeek?: boolean;
   },
   userId: string,
   author = "You",
@@ -1386,25 +1671,30 @@ export async function moveTask(
     autoLocked = ref;
   }
 
-  // An explicit pin wins; otherwise a board change drops the stale one, because
-  // the Section it pointed at belongs to the board we just left.
-  let canvasSectionId =
-    target.canvasSectionId !== undefined
-      ? target.canvasSectionId
-      : boardChanged
-        ? null
-        : current.canvasSectionId;
+  // An explicit pin wins; otherwise a named group; otherwise a board change
+  // drops the stale pin, because the Section it pointed at belongs to the board
+  // we just left.
+  const asked = askedPlacement(target);
+  let placed: TaskPlacement | null = null;
+  let canvasSectionId: string | null;
+  if (target.canvasSectionId !== undefined) {
+    canvasSectionId = target.canvasSectionId;
+  } else if (asked !== undefined) {
+    canvasSectionId = await resolvePlacementSection(asked, boardId);
+    placed = canvasSectionId !== current.canvasSectionId ? asked : null;
+  } else {
+    canvasSectionId = boardChanged ? null : current.canvasSectionId;
+  }
   // …and an agent moving the task into work files it on THIS WEEK's board, the
   // same rule `updateTask` applies — but only if nothing else claimed it, so a
   // card the user filed by hand (or a fresh pin above) stays where it is.
-  let movedToThisWeek = false;
   if (
     canvasSectionId === null &&
     statusChanged &&
     statusImpliesThisWeek(status)
   ) {
-    canvasSectionId = await resolveThisWeekSection(boardId);
-    movedToThisWeek = canvasSectionId !== null;
+    canvasSectionId = await resolvePlacementSection("thisWeek", boardId);
+    if (canvasSectionId !== null) placed = "thisWeek";
   }
 
   // Same work-entry claim as updateTask: a move that parks the task in
@@ -1442,7 +1732,7 @@ export async function moveTask(
   const moveNotes = [
     ...(autoLocked ? [`🔒 Locked as ${autoLocked}`] : []),
     ...(autoAssigned ? [await autoAssignNote(userId)] : []),
-    ...(movedToThisWeek ? ["📅 Moved to THIS WEEK"] : []),
+    ...(placed !== null ? [PLACEMENT_LOG[placed]] : []),
   ];
   if (moveNotes.length) await log(id, "updated", moveNotes.join(" · "), author);
 
@@ -1665,6 +1955,7 @@ export type BulkOp =
   | { op: "move"; id: string; target: MoveTarget }
   | { op: "complete"; id: string; done?: boolean }
   | { op: "comment"; id: string; message: string }
+  | { op: "archive"; id: string; archived?: boolean }
   | { op: "delete"; id: string };
 
 // The per-op result shape and the batch cap live in `@/lib/bulk` — the browser
@@ -1825,50 +2116,46 @@ export async function bulkUpdate(
     }
   }
 
-  // 3c. THIS WEEK placement — the same rules as `updateTask`: an explicit
-  //     `canvasSectionId` wins, else `thisWeek` moves it either way, else
-  //     entering a work status moves the tasks nobody pinned by hand. Can't ride
-  //     the bulk UPDATE either: the target section is per BOARD, so it's one
-  //     write per distinct board (bounded by the board count, not the task
-  //     count) — and only for the tasks that actually need moving.
-  /** Task id → its new pin, for the trail rows and the returned shape (the bulk
-   *  UPDATE's `rows` were read before these writes). */
-  const placed = new Map<string, string | null>();
+  // 3c. Canvas placement — the same rules as `updateTask`: an explicit
+  //     `canvasSectionId` wins, else an explicit `placement` moves them to that
+  //     group, else entering a work status moves the tasks nobody pinned by hand
+  //     to THIS WEEK. Can't ride the bulk UPDATE either: the target section is
+  //     per BOARD, so it's one write per distinct board (bounded by the board
+  //     count, not the task count) — and only for the tasks that need moving.
+  /** Task id → the group it was moved to, for the trail rows. */
+  const placed = new Map<string, TaskPlacement>();
+  /** Task id → its new pin, for the returned shape (the bulk UPDATE's `rows`
+   *  were read before these writes, so they still carry the old one). */
+  const repinned = new Map<string, string | null>();
   if (patch.canvasSectionId === undefined) {
-    const statusImplies =
-      patch.thisWeek === undefined && statusImpliesThisWeek(patch.status);
-    if (patch.thisWeek === true || statusImplies) {
-      // The status-implied move spares anything already filed in a section.
-      const movable = owned.filter(
-        (r) => patch.thisWeek === true || r.canvasSectionId === null,
-      );
-      const byBoard = new Map<string | null, string[]>();
+    const asked = askedPlacement(patch);
+    const target = asked ?? (statusImpliesThisWeek(patch.status) ? "thisWeek" : null);
+    if (target !== null) {
+      // A status-IMPLIED move spares anything already filed in a section; an
+      // explicit one moves every task named.
+      const movable =
+        asked !== undefined ? owned : owned.filter((r) => r.canvasSectionId === null);
+      const byBoard = new Map<string | null, (typeof owned)[number][]>();
       for (const r of movable) {
         const list = byBoard.get(r.boardId);
-        if (list) list.push(r.id);
-        else byBoard.set(r.boardId, [r.id]);
+        if (list) list.push(r);
+        else byBoard.set(r.boardId, [r]);
       }
-      for (const [boardId, taskIds] of byBoard) {
-        const target = await resolveThisWeekSection(boardId);
-        if (!target) continue; // no group flagged — leave them in INBOX
-        const stale = movable.filter(
-          (r) => taskIds.includes(r.id) && r.canvasSectionId !== target,
-        );
+      for (const [boardId, group] of byBoard) {
+        const section = await resolvePlacementSection(target, boardId);
+        // No group flagged for this placement — leave them where they are.
+        // (`inbox` resolves to null legitimately, and unpinning IS the move.)
+        if (section === null && target !== "inbox") continue;
+        const stale = group.filter((r) => r.canvasSectionId !== section);
         if (!stale.length) continue;
         await db
           .update(tasks)
-          .set({ canvasSectionId: target })
+          .set({ canvasSectionId: section })
           .where(inArray(tasks.id, stale.map((r) => r.id)));
-        for (const r of stale) placed.set(r.id, target);
-      }
-    } else if (patch.thisWeek === false) {
-      const pinned = owned.filter((r) => r.canvasSectionId !== null).map((r) => r.id);
-      if (pinned.length) {
-        await db
-          .update(tasks)
-          .set({ canvasSectionId: null })
-          .where(inArray(tasks.id, pinned));
-        for (const id of pinned) placed.set(id, null);
+        for (const r of stale) {
+          placed.set(r.id, target);
+          repinned.set(r.id, section);
+        }
       }
     }
   }
@@ -1895,8 +2182,8 @@ export async function bulkUpdate(
       r.assigneeIds.length > (priorAssignees.get(r.id)?.length ?? 0)
     )
       parts.push(assignNote);
-    if (placed.has(r.id))
-      parts.push(placed.get(r.id) ? "📅 Moved to THIS WEEK" : "📥 Moved back to INBOX");
+    const to = placed.get(r.id);
+    if (to !== undefined) parts.push(PLACEMENT_LOG[to]);
     return {
       taskId: r.id,
       kind: "updated" as const,
@@ -1919,7 +2206,9 @@ export async function bulkUpdate(
       const row = relocked.get(r.id) ?? r;
       // 3c ran after both UPDATEs read their rows, so fold its pin back in.
       return rowToTask(
-        placed.has(r.id) ? { ...row, canvasSectionId: placed.get(r.id)! } : row,
+        repinned.has(r.id)
+          ? { ...row, canvasSectionId: repinned.get(r.id)! }
+          : row,
         counts.get(r.id) ?? 0,
         [],
         codes,
@@ -1994,6 +2283,18 @@ export async function bulkApply(
             c
               ? { op: "comment", ok: true, id: op.id }
               : { op: "comment", ok: false, id: op.id, error: "Task not found" },
+          );
+          break;
+        }
+        case "archive": {
+          // Cascades to the subtree, and rejects a task that isn't done — so a
+          // batch that archives must complete first (ops run in array order).
+          const t = await archiveTask(op.id, op.archived ?? true, userId, author);
+          if (t) touched.add(t.id);
+          results.push(
+            t
+              ? { op: "archive", ok: true, id: t.id }
+              : { op: "archive", ok: false, id: op.id, error: "Task not found" },
           );
           break;
         }
@@ -2172,8 +2473,9 @@ export async function listNotes(
     conds.push(eq(taskNotes.taskId, taskId));
   }
   if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
-  if (filter?.from) conds.push(gte(taskNotes.createdAt, new Date(filter.from)));
-  if (filter?.to) conds.push(lte(taskNotes.createdAt, new Date(filter.to)));
+  conds.push(
+    ...inWindow(taskNotes.createdAt, dateWindow(filter?.from, filter?.to)),
+  );
   if (!filter?.includeResolved) conds.push(isNull(taskNotes.resolvedAt));
   const rows = await db
     .select()
@@ -2253,31 +2555,34 @@ export interface StandupData {
   finished: TaskDTO[];
 }
 
+/**
+ * The digest for a window. `actor` is who did the work — the activity log's
+ * `actorId`, defaulting to the caller, so "what did I ship?" is exact. Pass
+ * `actor: null` for the whole team.
+ *
+ * Built on `listTasksFlat` rather than its own query, so it inherits the
+ * half-open window (a single-day `from = to` used to return nothing) and the
+ * team-wide visibility every other task read already has.
+ */
 export async function standup(
   userId: string,
   from: string,
   to: string,
+  actor?: string | null,
 ): Promise<StandupData> {
-  const [notes, ctx, finishedRows] = await Promise.all([
+  const [notes, finished] = await Promise.all([
     listNotes(userId, { from, to }),
-    codeCtx(userId),
-    db
-      .select()
-      .from(tasks)
-      .where(
-        and(
-          eq(tasks.userId, userId),
-          eq(tasks.status, "done"),
-          gte(tasks.completedAt, new Date(from)),
-          lte(tasks.completedAt, new Date(to)),
-        ),
-      )
-      .orderBy(desc(tasks.completedAt)),
+    listTasksFlat(userId, {
+      status: ["done"],
+      completedFrom: from,
+      completedTo: to,
+      // A task archived right after being finished still shipped.
+      includeArchived: true,
+      actor: actor === null ? undefined : (actor ?? userId),
+      sort: "recent",
+    }),
   ]);
-  return {
-    notes,
-    finished: finishedRows.map((r) => rowToTask(r, 0, [], ctx)),
-  };
+  return { notes, finished };
 }
 
 /* -------------------------------------------------------------------- */

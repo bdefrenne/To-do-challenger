@@ -122,8 +122,8 @@ Everything Claude changes shows up on your board within ~2s, attributed to
 
 | Group | Tools |
 |---|---|
-| **Tasks** | `list_tasks`, `get_task`, `create_task`, `update_task`, `move_task`, `complete_task`, `add_comment`, `delete_task` |
-| **Search** | `search_tasks` — filter by status, assignee, tag, text, due window, or overdue (prefer over `list_tasks` for targeted questions) |
+| **Tasks** | `list_tasks` (filtered, nested), `get_task`, `create_task`, `update_task`, `move_task`, `complete_task`, `add_comment`, `delete_task` |
+| **Search** | `search_tasks` — the flat twin of `list_tasks`. Both filter server-side by status, board/project, assignee, text, due window or overdue, **plus activity windows** (`statusChangedFrom`/`To` = what moved, `completedFrom`/`To` = what shipped, `updatedFrom`/`To`) and `actor` = who actually did the work. `detail: compact\|standard\|full` and `limit` control how much comes back; an over-large read is truncated with the filters that would narrow it |
 | **Organize** | `list_projects`, `create_project`, `create_board`, `rename_board`, `rename_project` — plus `boardId` on `create_task`/`move_task` to file work onto a board |
 | **Bulk** | `bulk_update` (same patch to many), `bulk_apply` (ordered mixed create/update/move/complete/comment/delete) |
 | **Attachments** | `get_attachment` (view an image inline) |

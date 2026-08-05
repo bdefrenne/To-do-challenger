@@ -12,6 +12,7 @@ import {
 import type {
   Task,
   TaskStatus,
+  TaskPlacement,
   TaskLogEntry,
   Project,
   Board,
@@ -19,6 +20,7 @@ import type {
   NoteType,
   TaskCommit,
 } from "@/lib/types";
+import { deletionOf, type SystemGroup } from "@/lib/sections";
 import { compareTaskOrder, insertRelative } from "@/lib/task-order";
 import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
 
@@ -55,6 +57,20 @@ export interface PlacementResolver {
   pinFor: (sectionNodeId: string | null) => string | null;
   /** Ids of the tasks currently rendering in that Section, for position math. */
   membersOf: (sectionNodeId: string | null) => Set<string>;
+  /** Which machine-managed tray a card is sitting in, if any — what makes
+   *  DELETE mean "archive" for a card already parked in DONE THIS WEEK. */
+  groupOf: (taskId: string) => SystemGroup | null;
+  /**
+   * The Section a board's cards go to for a given placement — the lane inside
+   * THIS WEEK / BACKLOG / LATER / DONE THIS WEEK, or null for `"inbox"` (which
+   * IS the absence of a pin) and for a placement this canvas has no group for.
+   *
+   * MATERIALISES the lane if it doesn't exist yet, so the answer is a node the
+   * caller can pin to immediately. The server can afford to name a lane that
+   * doesn't exist and let the reconciler catch up a tick later; a card the user
+   * just flung would visibly bounce through INBOX in the meantime.
+   */
+  laneFor: (placement: TaskPlacement, boardId: string | null) => string | null;
 }
 
 export interface TaskNode {
@@ -97,8 +113,9 @@ interface WorkspaceContextValue {
   toggleDone: (id: string) => void;
   setStatus: (id: string, status: TaskStatus) => void;
   /** Edit content fields (title/description/…); guarded against concurrent
-   *  writes via If-Match — a conflict surfaces `notice` and reloads. Persists
-   *  immediately; use for discrete edits (assignees, dates, one-shot title). */
+   *  writes via `X-Expected-Updated-At` — a conflict surfaces `notice` and
+   *  reloads. Persists immediately; use for discrete edits (assignees, dates,
+   *  one-shot title). */
   editTask: (id: string, patch: TaskEdit) => void;
   /** Live edit for high-frequency text (description/title while typing): instant
    *  to peers, Postgres write batched ~10s (or flushed via `flushEdits`). */
@@ -124,6 +141,9 @@ interface WorkspaceContextValue {
   /** Re-pin a dragged card (and re-home its subtree's board). `targetPin` is what
    *  to write: a Section node id, or **null** to unpin — which is how a card
    *  belongs to an INBOX lane. */
+  /** Send a card to a canvas group: THIS WEEK (end of the list), BACKLOG or
+   *  LATER (top), DONE THIS WEEK, or INBOX (unpinned). The hover arrows' path. */
+  sendToPlacement: (id: string, to: TaskPlacement) => void;
   moveNodeIntoSection: (
     dragId: string,
     targetPin: string | null,
@@ -293,7 +313,7 @@ export type ChangeSignal =
   | { kind: "patch"; taskId: string; patch: TaskEdit };
 
 /** Human-authored content fields. An edit touching any of these opts into the
- *  If-Match optimistic-concurrency check; positional/status-only writes don't
+ *  optimistic-concurrency check; positional/status-only writes don't
  *  (they're last-write-wins and self-heal on the next refetch). */
 const CONTENT_FIELDS: (keyof TaskEdit)[] = [
   "title",
@@ -417,7 +437,7 @@ export function WorkspaceProvider({
   // `pendingEdits` = MY edits not yet written to Postgres; flushed on a debounce.
   const pendingEditsRef = useRef<Map<string, TaskEdit>>(new Map());
   const editFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Latest taskMap for the (possibly delayed) flush's If-Match token.
+  // Latest taskMap for the (possibly delayed) flush's expected-updatedAt token.
   const taskMapRef = useRef<Record<string, Task>>({});
   useEffect(() => void (taskMapRef.current = taskMap), [taskMap]);
 
@@ -783,9 +803,16 @@ export function WorkspaceProvider({
 
   /**
    * PATCH a task. If the patch touches a content field (title, description,
-   * …) and we know the task's current `updatedAt`, send it as `If-Match` so
-   * the server rejects the write with a 409 if another writer changed the
-   * task first. Status-only patches send no header → last-write-wins.
+   * …) and we know the task's current `updatedAt`, send it as our own
+   * `X-Expected-Updated-At` header so the server rejects the write with a 409
+   * if another writer changed the task first. Status-only patches send no
+   * header → last-write-wins.
+   *
+   * NOT the standard `If-Match`: Vercel's edge evaluates HTTP preconditions
+   * itself and turns a perfectly good response into a 412 PRECONDITION_FAILED
+   * whenever the value doesn't match the response ETag — the write lands, but
+   * the client sees an error. A custom header no intermediary interprets keeps
+   * the conflict check ours alone. (Server side: /api/tasks/[id]/route.ts.)
    */
   function patchTask(id: string, patch: TaskEdit) {
     // Read the token from the ref, not the render's taskMap — a batched flush can
@@ -795,11 +822,11 @@ export function WorkspaceProvider({
     return api(`/api/tasks/${id}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
-      ...(guarded ? { headers: { "If-Match": token } } : {}),
+      ...(guarded ? { headers: { "X-Expected-Updated-At": token } } : {}),
     });
   }
 
-  /** Edit content fields on a task (guarded by If-Match via `patchTask`). */
+  /** Edit content fields on a task (conflict-guarded via `patchTask`). */
   function editTask(id: string, patch: TaskEdit) {
     mutate(
       () =>
@@ -839,17 +866,45 @@ export function WorkspaceProvider({
     [mutate],
   );
 
-  /** Delete a task with an undo window: drop it from view immediately, then
-   *  commit to Postgres after UNDO_WINDOW_MS unless `undoDelete` cancels first.
-   *  The removed node is snapshotted so undo can restore it.
+  /**
+   * Delete a task with an undo window: drop it from view immediately, then
+   * commit to Postgres after UNDO_WINDOW_MS unless `undoDelete` cancels first.
+   * The removed node is snapshotted so undo can restore it.
    *
-   *  Done tasks are ARCHIVED rather than deleted — pressing Delete on a finished
-   *  task tucks it into the Archived view (reversibly) instead of destroying it.
-   *  The toast reflects which happened ("Archived" vs "Deleted"). */
+   * Finished work exits in TWO steps (`deletionOf`): the first Delete on a done
+   * card PARKS it in DONE THIS WEEK, and only a second Delete from there archives
+   * it. So the week's finished work stays visible until it's swept, and the
+   * irreversible-looking step always takes a deliberate second press. A card that
+   * was never done still deletes on the first press — parking it would put a
+   * not-done card in a group called DONE THIS WEEK.
+   *
+   * Parking needs a canvas: the lanes live in its Liveblocks storage. On the
+   * board views (no `placementRef`) there's nowhere to park, so a done card
+   * archives on the first press exactly as it always has.
+   */
   function deleteTask(id: string) {
     const task = taskMapRef.current[id];
     if (!task || pendingDeleteRef.current.has(id)) return;
-    const mode: "delete" | "archive" = task.status === "done" ? "archive" : "delete";
+    const placement = placementRef.current;
+    const action = placement
+      ? deletionOf(task.status, placement.groupOf(id))
+      : task.status === "done"
+        ? "archive"
+        : "delete";
+    if (action === "park" && placement) {
+      const boardId = task.boardId ?? null;
+      const lane = placement.laneFor("doneThisWeek", boardId);
+      // No lane resolvable (shouldn't happen — the reconciler keeps the group
+      // alive — but a canvas mid-hydration could say null). Archive instead of
+      // silently doing nothing.
+      if (lane) {
+        moveNodeIntoSection(id, lane, boardId, {
+          siblingIds: placement.membersOf(lane),
+        });
+        return;
+      }
+    }
+    const mode: "delete" | "archive" = action === "delete" ? "delete" : "archive";
     const node = nodesRef.current.find((n) => n.id === id);
     setTaskMap((prev) => {
       if (!prev[id]) return prev;
@@ -1143,6 +1198,40 @@ export function WorkspaceProvider({
         ),
       () => bulk(ops),
     );
+  }
+
+  /**
+   * Fling a card into one of the canvas's groups — the hover arrows' one path.
+   *
+   * THIS WEEK appends (this week's list is a queue you work down, so new arrivals
+   * belong at the END); BACKLOG and LATER take the top, because what you just
+   * decided to defer is the thing you'll want to see first when you come back to
+   * the pile. INBOX is `laneFor` → null, i.e. simply unpinned.
+   *
+   * No-op without a mounted canvas, or when the card is already there — the
+   * groups are canvas furniture, so there's nothing to move it to (or nothing to
+   * do) in either case.
+   */
+  function sendToPlacement(id: string, to: TaskPlacement) {
+    const placement = placementRef.current;
+    const task = taskMap[id];
+    if (!placement || !task) return;
+    const boardId = task.boardId ?? null;
+    const lane = placement.laneFor(to, boardId);
+    if (to !== "inbox" && !lane) return; // no such group on this canvas
+    if (placement.sectionOf(id) === lane) return;
+    const siblingIds = placement.membersOf(lane);
+    // "Top of the list" = insert before the first top-level card already there.
+    // With an empty lane there's nothing to sit before, so it appends either way.
+    const first = nodes
+      .filter((n) => n.parentId === null && n.id !== id && siblingIds.has(n.id))
+      .sort(compareTaskOrder)[0]?.id;
+    moveNodeIntoSection(id, lane, boardId, {
+      ...(to !== "thisWeek" && first
+        ? { targetId: first, pos: "before" as const }
+        : {}),
+      siblingIds,
+    });
   }
 
   // Move a task into a canvas Section — possibly one on a different board.
@@ -1844,6 +1933,7 @@ export function WorkspaceProvider({
         undoDelete,
         pendingDeletes,
         moveNode,
+        sendToPlacement,
         moveNodeIntoSection,
         dropToGroup,
         moveToBoard,

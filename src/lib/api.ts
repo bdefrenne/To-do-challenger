@@ -20,6 +20,15 @@ export const statusSchema = z.enum([
   "done",
 ]);
 export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);
+/** Which canvas group a task is filed in — its triage bucket, independent of
+ *  `status`. See `TaskPlacement` in types.ts. */
+export const placementSchema = z.enum([
+  "inbox",
+  "thisWeek",
+  "backlog",
+  "later",
+  "doneThisWeek",
+]);
 /** Fibonacci story points used for `value` (payoff) and `difficulty` (effort). */
 export const fibSchema = z.union([
   z.literal(1),
@@ -53,6 +62,85 @@ const customFieldsSchema = z.record(
   z.union([z.string(), z.number(), z.boolean()]),
 );
 
+/* ---- Reading tasks -------------------------------------------------------
+   ONE declaration of "which tasks do you want", spread into both the REST
+   query parsing (/api/tasks) and the MCP tool args. A filter added here shows
+   up on every surface at once, which is the only way the three stay in step. */
+
+/** A window edge: a bare day (`YYYY-MM-DD`, meaning that whole day) or a full
+ *  ISO instant for sub-day precision. */
+const windowEdge = z
+  .string()
+  .max(40)
+  .regex(
+    /^\d{4}-\d{2}-\d{2}([T ].*)?$/,
+    "use YYYY-MM-DD (that whole day) or a full ISO instant",
+  );
+
+/** How much of each task to return. The default is deliberately `compact`:
+ *  descriptions and the free-text working fields are what make a whole-board
+ *  read unreadably large. */
+export const taskDetailSchema = z.enum(["compact", "standard", "full"]);
+
+export const taskFilterShape = {
+  status: z.array(statusSchema).optional(),
+  boardId: z.string().optional(),
+  projectId: z.string().optional(),
+  assignee: z
+    .string()
+    .max(120)
+    .optional()
+    .describe("a user id, email, or display name — matches one of a task's assignees"),
+  actor: z
+    .string()
+    .max(120)
+    .optional()
+    .describe(
+      "who TOUCHED the task (the activity log's actor) — id, email or display name. " +
+        'This, not `assignee`, answers "what did I work on". Windowed by the ' +
+        "activity window below.",
+    ),
+  text: z.string().max(200).optional().describe("substring of title or description"),
+  dueBefore: ymd.optional(),
+  dueAfter: ymd.optional(),
+  overdue: z.boolean().optional().describe("past due and not done"),
+  statusChangedFrom: windowEdge
+    .optional()
+    .describe("status last moved on/after this day — the 'what changed' axis"),
+  statusChangedTo: windowEdge.optional().describe("…and on/before this day"),
+  completedFrom: windowEdge.optional().describe("completed on/after this day"),
+  completedTo: windowEdge.optional().describe("…and on/before this day"),
+  updatedFrom: windowEdge.optional().describe("edited on/after this day"),
+  updatedTo: windowEdge.optional().describe("…and on/before this day"),
+  createdFrom: windowEdge.optional().describe("created on/after this day"),
+  createdTo: windowEdge.optional().describe("…and on/before this day"),
+  tz: z
+    .string()
+    .max(60)
+    .optional()
+    .describe('IANA zone the bare-date window edges mean, e.g. "Europe/Brussels" (default UTC)'),
+  includeArchived: z
+    .boolean()
+    .optional()
+    .describe("also include archived tasks (excluded by default)"),
+  archivedOnly: z
+    .boolean()
+    .optional()
+    .describe("return ONLY archived tasks (the Archived view)"),
+  /** Callers that want done work hidden pass `false` themselves — notably the
+   *  MCP tools, which default it off. Left undefined, done tasks are included,
+   *  because the web board needs its Done column. */
+  includeDone: z.boolean().optional(),
+  sort: z
+    .enum(["position", "recent"])
+    .optional()
+    .describe("`recent` = most recent status move first; makes `limit` meaningful"),
+  limit: z.number().int().min(1).max(1000).optional(),
+};
+
+export const taskFilterSchema = z.object(taskFilterShape);
+export type TaskFilterInput = z.infer<typeof taskFilterSchema>;
+
 export const createTaskSchema = z.object({
   title: z.string().min(1, "title is required").max(500),
   status: statusSchema.optional(),
@@ -63,6 +151,9 @@ export const createTaskSchema = z.object({
   dependsOn: dependsOnSchema.optional(),
   customFields: customFieldsSchema.optional(),
   canvasSectionId: z.string().nullable().optional(),
+  placement: placementSchema.optional(),
+  /** Deprecated boolean spelling of `placement` (true = thisWeek, false =
+   *  inbox), kept so callers written against it keep working. */
   thisWeek: z.boolean().optional(),
   value: fibSchema.optional(),
   difficulty: fibSchema.optional(),
@@ -83,6 +174,8 @@ export const updateTaskSchema = z
     dependsOn: dependsOnSchema,
     customFields: customFieldsSchema,
     canvasSectionId: z.string().nullable(),
+    placement: placementSchema,
+    /** Deprecated boolean spelling of `placement`. */
     thisWeek: z.boolean(),
     value: fibSchema.nullable(),
     difficulty: fibSchema.nullable(),
@@ -130,6 +223,10 @@ export const moveTaskSchema = z.object({
   /** Re-pin/unpin on a canvas Section. Omitted on a board change means "clear
    *  it" — see moveTask. */
   canvasSectionId: z.string().nullable().optional(),
+  /** File it in a canvas group by name instead of by section id. */
+  placement: placementSchema.optional(),
+  /** Deprecated boolean spelling of `placement`. */
+  thisWeek: z.boolean().optional(),
 });
 
 export const commentSchema = z.object({
@@ -154,6 +251,7 @@ export const bulkOpSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("move"), id: taskHandle, target: moveTaskSchema }),
   z.object({ op: z.literal("complete"), id: taskHandle, done: z.boolean().optional() }),
   z.object({ op: z.literal("comment"), id: taskHandle, message: z.string().min(1).max(10_000) }),
+  z.object({ op: z.literal("archive"), id: taskHandle, archived: z.boolean().optional() }),
   z.object({ op: z.literal("delete"), id: taskHandle }),
 ]);
 
@@ -340,10 +438,10 @@ export const saveCanvasNodesSchema = z.object({
 });
 
 /**
- * Thrown by the service layer when a write carried an `If-Match`/
- * `expectedUpdatedAt` token that no longer matches the stored row (another
- * writer got there first). `route()` turns it into a 409 that carries the
- * fresh task so the client can reconcile.
+ * Thrown by the service layer when a write carried an `expectedUpdatedAt`
+ * token (header `X-Expected-Updated-At` on the REST API) that no longer
+ * matches the stored row (another writer got there first). `route()` turns it
+ * into a 409 that carries the fresh task so the client can reconcile.
  */
 export class ConflictError extends Error {
   constructor(public current: unknown) {
