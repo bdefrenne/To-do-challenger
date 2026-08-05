@@ -728,10 +728,14 @@ async function ensureOwnerCode(
 const rowToNote = (r: TaskNoteRow): Note => ({
   id: r.id,
   taskId: r.taskId,
+  canvasId: r.canvasId,
+  x: r.x,
+  y: r.y,
   type: r.type,
   note: r.note,
   tags: r.tags ?? [],
   author: r.author,
+  actorId: r.actorId,
   createdAt: iso(r.createdAt)!,
   resolvedAt: iso(r.resolvedAt),
 });
@@ -1229,7 +1233,7 @@ export async function getTask(
  *  re-fetching the whole list. One indexed aggregate (tasks_user_idx). */
 export async function getChangeCursor(_userId: string): Promise<string> {
   // Team-wide: the board is shared, so the cursor tracks the whole instance.
-  const [taskAgg, boardAgg, projectAgg] = await Promise.all([
+  const [taskAgg, boardAgg, projectAgg, noteAgg] = await Promise.all([
     db
       .select({
         n: sql<number>`count(*)::int`,
@@ -1248,11 +1252,20 @@ export async function getChangeCursor(_userId: string): Promise<string> {
         u: sql<number>`coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0)`,
       })
       .from(projects),
+    // Folds in notes so a resolve/drag on a canvas note trips the poll for
+    // clients with no Liveblocks room open (Notes page, another canvas, MCP).
+    db
+      .select({
+        n: sql<number>`count(*)::int`,
+        u: sql<number>`coalesce(extract(epoch from max(${taskNotes.updatedAt}))::bigint, 0)`,
+      })
+      .from(taskNotes),
   ]);
   const [{ n, u }] = taskAgg;
   const [{ n: bn, u: bu }] = boardAgg;
   const [{ n: pn, u: pu }] = projectAgg;
-  return `${n}:${u}:${bn}:${bu}:${pn}:${pu}`;
+  const [{ n: nn, u: nu }] = noteAgg;
+  return `${n}:${u}:${bn}:${bu}:${pn}:${pu}:${nn}:${nu}`;
 }
 
 /* -------------------------------------------------------------------- */
@@ -2560,6 +2573,7 @@ export async function addNote(
 ): Promise<Note | null> {
   const taskId = await resolveTaskId(handle, userId);
   if (!taskId) return null;
+  const ctx = currentLogContext();
   const [row] = await db
     .insert(taskNotes)
     .values({
@@ -2569,14 +2583,58 @@ export async function addNote(
       type: input.type ?? null,
       tags: input.tags ?? [],
       author,
+      actorId: ctx?.actorId,
     })
     .returning();
   await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, taskId));
   return rowToNote(row);
 }
 
+/** Add a note anchored to a canvas position — a sticky dropped on the team
+ *  whiteboard. `taskHandle` optionally ALSO links it to a task: the two
+ *  anchors aren't mutually exclusive (see the schema comment on `taskNotes`).
+ *  Null if the canvas doesn't exist, or `taskHandle` is given but unresolvable. */
+export async function addCanvasNote(
+  canvasId: string,
+  x: number,
+  y: number,
+  input: AddNoteInput,
+  userId: string,
+  author = "You",
+  taskHandle?: string,
+): Promise<Note | null> {
+  if (!(await canvasExists(canvasId))) return null;
+  let taskId: string | null = null;
+  if (taskHandle) {
+    taskId = await resolveTaskId(taskHandle, userId);
+    if (!taskId) return null;
+  }
+  const ctx = currentLogContext();
+  const [row] = await db
+    .insert(taskNotes)
+    .values({
+      canvasId,
+      taskId,
+      x,
+      y,
+      userId,
+      note: input.note,
+      type: input.type ?? null,
+      tags: input.tags ?? [],
+      author,
+      actorId: ctx?.actorId,
+    })
+    .returning();
+  await db
+    .update(canvases)
+    .set({ updatedAt: new Date() })
+    .where(eq(canvases.id, canvasId));
+  return rowToNote(row);
+}
+
 export interface NoteFilter {
   taskId?: string;
+  canvasId?: string;
   type?: NoteType;
   from?: string;
   to?: string;
@@ -2585,18 +2643,22 @@ export interface NoteFilter {
   includeResolved?: boolean;
 }
 
-/** Query a user's notes across tasks — powers the Notes page + standup. By
- *  default only OPEN (unresolved) notes are returned. */
+/** Query notes across the team — powers the Notes page, standup, and a
+ *  canvas's stickies. Team-visible like tasks/canvases: nobody is fenced out
+ *  of anyone else's notes. By default only OPEN (unresolved) notes are
+ *  returned. `_userId` stays a parameter (unused for scoping) so callers don't
+ *  need to change and a future per-user view has a place to hang. */
 export async function listNotes(
-  userId: string,
+  _userId: string,
   filter?: NoteFilter,
 ): Promise<Note[]> {
-  const conds: (SQL | undefined)[] = [eq(taskNotes.userId, userId)];
+  const conds: (SQL | undefined)[] = [];
   if (filter?.taskId) {
-    const taskId = await resolveTaskId(filter.taskId, userId);
+    const taskId = await resolveTaskId(filter.taskId, _userId);
     if (!taskId) return [];
     conds.push(eq(taskNotes.taskId, taskId));
   }
+  if (filter?.canvasId) conds.push(eq(taskNotes.canvasId, filter.canvasId));
   if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
   conds.push(
     ...inWindow(taskNotes.createdAt, dateWindow(filter?.from, filter?.to)),
@@ -2605,26 +2667,82 @@ export async function listNotes(
   const rows = await db
     .select()
     .from(taskNotes)
-    .where(and(...conds))
+    .where(conds.length ? and(...conds) : undefined)
     .orderBy(desc(taskNotes.createdAt));
   return rows.map(rowToNote);
 }
 
-/** Check off (or re-open) a note. Scoped to the owner so you can't resolve
- *  someone else's. Returns the updated note, or null if not found. */
-export async function resolveNote(
+/** Check off (or re-open) a note, or move it (a sticky drag). Team-visible —
+ *  any signed-in user may resolve or move any note, matching tasks/canvases.
+ *  Returns the updated note, or null if not found. */
+export async function patchNote(
   noteId: string,
-  resolved: boolean,
-  userId: string,
+  patch: { resolved?: boolean; x?: number; y?: number },
 ): Promise<Note | null> {
   const [row] = await db
     .update(taskNotes)
-    .set({ resolvedAt: resolved ? new Date() : null })
-    .where(and(eq(taskNotes.id, noteId), eq(taskNotes.userId, userId)))
+    .set({
+      ...(patch.resolved !== undefined
+        ? { resolvedAt: patch.resolved ? new Date() : null }
+        : {}),
+      ...(patch.x !== undefined ? { x: patch.x } : {}),
+      ...(patch.y !== undefined ? { y: patch.y } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(taskNotes.id, noteId))
     .returning();
   if (!row) return null;
-  await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
+  if (row.taskId) {
+    await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
+  }
+  if (row.canvasId) {
+    await db
+      .update(canvases)
+      .set({ updatedAt: new Date() })
+      .where(eq(canvases.id, row.canvasId));
+  }
   return rowToNote(row);
+}
+
+/** Check off (or re-open) a note. Thin wrapper over `patchNote` — kept as its
+ *  own export so the MCP tool name/behavior doesn't change. */
+export async function resolveNote(
+  noteId: string,
+  resolved: boolean,
+  _userId: string,
+): Promise<Note | null> {
+  return patchNote(noteId, { resolved });
+}
+
+/** Move a note — a sticky drag on the canvas. Thin wrapper over `patchNote`. */
+export async function moveNote(
+  noteId: string,
+  x: number,
+  y: number,
+  _userId: string,
+): Promise<Note | null> {
+  return patchNote(noteId, { x, y });
+}
+
+/** Permanently remove a note (a sticky's "×", or a mis-added task note).
+ *  Unlike resolving, there's no undo. Team-visible — any signed-in user may
+ *  delete any note, matching tasks/canvases. */
+export async function deleteNote(noteId: string): Promise<boolean> {
+  const [row] = await db
+    .delete(taskNotes)
+    .where(eq(taskNotes.id, noteId))
+    .returning({ taskId: taskNotes.taskId, canvasId: taskNotes.canvasId });
+  if (!row) return false;
+  if (row.taskId) {
+    await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
+  }
+  if (row.canvasId) {
+    await db
+      .update(canvases)
+      .set({ updatedAt: new Date() })
+      .where(eq(canvases.id, row.canvasId));
+  }
+  return true;
 }
 
 /* -------------------------------------------------------------------- */

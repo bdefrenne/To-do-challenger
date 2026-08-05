@@ -65,10 +65,16 @@ declare global {
      *  for the ≤2s version poll:
      *   - `tasks-changed`: a structural edit happened — peers refetch from Postgres.
      *   - `task-patch`: a batched field delta (Phase 2) — peers apply it directly
-     *     to their taskMap without a DB read (the write is deferred ~10s). */
+     *     to their taskMap without a DB read (the write is deferred ~10s).
+     *   - `canvas-notes-changed`: a sticky note on THIS canvas was added,
+     *     moved, or resolved (Postgres-backed, not Liveblocks storage — see
+     *     `task_notes`) — peers reload just this canvas's notes. Kept
+     *     separate from `tasks-changed` so a sticky drag doesn't trigger a
+     *     full task/project refetch for everyone in the room. */
     RoomEvent:
       | { type: "tasks-changed" }
-      | { type: "task-patch"; taskId: string; patch: Record<string, Json> };
+      | { type: "task-patch"; taskId: string; patch: Record<string, Json> }
+      | { type: "canvas-notes-changed" };
   }
 }
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import type { Note, NoteType } from "@/lib/types";
@@ -156,7 +157,9 @@ export default function NotesPage() {
                   </h3>
                   <ul className="space-y-1.5">
                     {byType.get(t)!.map((n) => {
-                      const code = taskMap[n.taskId]?.code ?? taskMap[n.taskId]?.ref;
+                      const code = n.taskId
+                        ? taskMap[n.taskId]?.code ?? taskMap[n.taskId]?.ref
+                        : undefined;
                       const resolved = Boolean(n.resolvedAt);
                       const resolvable = RESOLVABLE.has(t);
                       return (
@@ -175,11 +178,18 @@ export default function NotesPage() {
                           ) : null}
                           {code ? (
                             <button
-                              onClick={() => openTask(n.taskId)}
+                              onClick={() => openTask(n.taskId!)}
                               className="shrink-0 font-mono text-[11px] text-muted hover:text-accent hover:underline"
                             >
                               {code}
                             </button>
+                          ) : n.canvasId ? (
+                            <Link
+                              href={`/canvas/${n.canvasId}`}
+                              className="shrink-0 text-[11px] text-muted hover:text-accent hover:underline"
+                            >
+                              ✎ canvas
+                            </Link>
                           ) : null}
                           <span className={resolved ? "text-fg line-through" : "text-fg"}>
                             {n.note}

@@ -52,6 +52,7 @@ import {
   DEFAULT_PEN_WIDTH,
 } from "./DrawNode";
 import { uploadCanvasImage } from "./uploadCanvasImage";
+import { CanvasStickyNote, STICKY_WIDTH } from "./CanvasStickyNote";
 import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 import { MIN_SECTION_HEIGHT } from "./SectionNode";
 import { SectionMembershipProvider } from "./SectionMembershipContext";
@@ -75,7 +76,7 @@ import {
 } from "@/lib/sections";
 import type { TaskPlacement } from "@/lib/types";
 
-type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
+type Tool = "select" | "text" | "section" | "group" | "draw" | "erase" | "sticky";
 
 /** Pen palette + widths offered when the pencil is active. */
 const PEN_COLORS = ["#111827", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#ffffff"];
@@ -475,6 +476,12 @@ export function CanvasEditor({
     taskMap,
     projects,
     registerPlacement,
+    registerOpenCanvas,
+    canvasNotes,
+    addCanvasNote,
+    moveCanvasNote,
+    resolveCanvasNote,
+    deleteCanvasNote,
   } = useWorkspace();
 
   // useStorage's root is ToJson<Storage>, so `nodes` is a plain readonly
@@ -520,6 +527,17 @@ export function CanvasEditor({
   // preview until pointerup commits it to a `draw` node.
   const [pen, setPen] = useState<Pen>(() => loadPen(canvasId));
   const [drawing, setDrawing] = useState<number[] | null>(null);
+
+  // Sticky-note compose popup: where to drop it (canvas coords, for the note)
+  // plus where to draw the popup (screen coords — it's fixed-positioned, not
+  // part of the pan/zoom transform). Cleared on submit/cancel.
+  const [stickyDraft, setStickyDraft] = useState<{
+    x: number;
+    y: number;
+    screenX: number;
+    screenY: number;
+  } | null>(null);
+  const [stickyText, setStickyText] = useState("");
 
   // Count of image uploads in flight (paste/drop) — drives the "Pasting…" pill.
   const [uploading, setUploading] = useState(0);
@@ -662,6 +680,8 @@ export function CanvasEditor({
             taskId: signal.taskId,
             patch: signal.patch as Record<string, Json>,
           });
+        else if (signal.kind === "notesRefetch")
+          broadcast({ type: "canvas-notes-changed" });
         else broadcast({ type: "tasks-changed" });
       }),
     [subscribeLocalChange, broadcast],
@@ -669,7 +689,18 @@ export function CanvasEditor({
   useEventListener(({ event }) => {
     if (event.type === "task-patch") applyRemotePatch(event.taskId, event.patch as TaskEdit);
     else if (event.type === "tasks-changed") refreshFromRemote();
+    // A peer's sticky changed — reload just this canvas's notes, not the
+    // whole task/project state (a room IS one canvas, so no payload needed).
+    else if (event.type === "canvas-notes-changed") registerOpenCanvas(canvasId);
   });
+
+  // Tell WorkspaceContext which canvas is on screen, so its poll/remote-
+  // refresh loop keeps this canvas's stickies current too. Mirrors
+  // registerPlacement below.
+  useEffect(() => {
+    registerOpenCanvas(canvasId);
+    return () => registerOpenCanvas(null);
+  }, [canvasId, registerOpenCanvas]);
 
   /* -------- Liveblocks storage mutations -------- */
   const putNode = useMutation(({ storage }, node: StoredNode) => {
@@ -1710,6 +1741,10 @@ export function CanvasEditor({
         case "E":
           setTool("erase");
           break;
+        case "n":
+        case "N":
+          setTool("sticky");
+          break;
         case "v":
         case "V":
           setTool("select");
@@ -2024,6 +2059,20 @@ export function CanvasEditor({
         return;
       }
 
+      if (toolRef.current === "sticky") {
+        e.preventDefault();
+        const p = toCanvas(e.clientX, e.clientY);
+        setStickyDraft({
+          x: Math.round(p.x),
+          y: Math.round(p.y),
+          screenX: e.clientX,
+          screenY: e.clientY,
+        });
+        setStickyText("");
+        setTool("select");
+        return;
+      }
+
       // Freehand pen: sample the cursor path, preview it live, commit on release.
       if (toolRef.current === "draw") {
         e.preventDefault();
@@ -2234,6 +2283,7 @@ export function CanvasEditor({
         <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">
           <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
           <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
+          <ToolBtn active={tool === "sticky"} onClick={() => setTool("sticky")} title="Sticky note — team-visible, reviewable (N)">🗒</ToolBtn>
           <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (S)">▤</ToolBtn>
           <ToolBtn active={tool === "group"} onClick={() => setTool("group")} title="Section Group — container that stacks sections (G)">▣</ToolBtn>
           <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)">✏️</ToolBtn>
@@ -2428,6 +2478,20 @@ export function CanvasEditor({
             );
           })}
 
+          {/* Sticky notes (TD-55): Postgres-backed, not Liveblocks storage — see
+              CanvasStickyNote's doc comment. Rendered as plain siblings in this
+              same transformed container, so pan/zoom is free. */}
+          {(canvasNotes[canvasId] ?? []).map((note) => (
+            <CanvasStickyNote
+              key={note.id}
+              note={note}
+              scale={viewport.scale}
+              onMove={(x, y) => moveCanvasNote(canvasId, note.id, x, y)}
+              onResolve={(resolved) => resolveCanvasNote(canvasId, note.id, resolved)}
+              onDelete={() => deleteCanvasNote(canvasId, note.id)}
+            />
+          ))}
+
           {/* Insertion caret for a pending section→group drop. Rendered after the
               nodes (later sibling, no z-index — same trick as the connector svg
               below) because the dragged section paints over the group it's headed
@@ -2617,6 +2681,49 @@ export function CanvasEditor({
           </p>
         </div>
       ) : null}
+
+      {/* Sticky-note compose popup. Screen-anchored (fixed), NOT a child of
+          `innerRef` — a transformed ancestor would turn `fixed` into
+          `absolute`-relative-to-it, which is not what we want here. */}
+      {stickyDraft ? (
+        <div
+          className="fixed z-30 flex flex-col gap-1.5 rounded-lg border border-border bg-surface p-2 shadow-lg"
+          style={{ left: stickyDraft.screenX, top: stickyDraft.screenY, width: STICKY_WIDTH }}
+        >
+          <textarea
+            autoFocus
+            value={stickyText}
+            onChange={(e) => setStickyText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setStickyDraft(null);
+              } else if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                submitStickyDraft();
+              }
+            }}
+            placeholder="Note for the team…"
+            rows={3}
+            className="resize-none rounded-md border border-border bg-surface-2 p-1.5 text-sm text-fg placeholder:text-faint focus:border-accent focus:outline-none"
+          />
+          <div className="flex justify-end gap-1.5">
+            <button
+              onClick={() => setStickyDraft(null)}
+              className="rounded-md px-2 py-1 text-xs text-muted hover:bg-surface-2"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={submitStickyDraft}
+              disabled={!stickyText.trim()}
+              className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white disabled:opacity-40"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
     </SectionMembershipProvider>
   );
@@ -2625,6 +2732,12 @@ export function CanvasEditor({
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
     zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+
+  function submitStickyDraft() {
+    const note = stickyText.trim();
+    if (note && stickyDraft) addCanvasNote(canvasId, stickyDraft.x, stickyDraft.y, { note });
+    setStickyDraft(null);
   }
 }
 

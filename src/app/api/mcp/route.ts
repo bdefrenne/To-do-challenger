@@ -59,6 +59,7 @@ import {
   updateBoard,
   mintRef,
   addNote,
+  addCanvasNote,
   listNotes,
   resolveNote,
   linkCommit,
@@ -598,14 +599,37 @@ const handler = createMcpHandler(
 
     server.tool(
       "add_note",
-      "Add a note to a task — the one log for anything worth remembering. Use `decision` ONLY for a SIGNIFICANT choice, and usually only when the user says 'log this…' — never reflexively for small choices (put the 'why' in the note body). Use a standup-worthy callout otherwise: `progress`, `milestone`, `blocker`, `question`, `fyi`. Use `review` ONLY when the user explicitly asks you to flag something for them to visually double-check later — never add review notes on your own initiative. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
+      "Add a note — the one log for anything worth remembering. Anchor it to a task (`id`), to a canvas as a sticky on the team whiteboard (`canvasId` + `x`/`y`), or both (a sticky that ALSO references a task) — pass at least one anchor. Use `decision` ONLY for a SIGNIFICANT choice, and usually only when the user says 'log this…' — never reflexively for small choices (put the 'why' in the note body). Use a standup-worthy callout otherwise: `progress`, `milestone`, `blocker`, `question`, `fyi`. Use `review` ONLY when the user explicitly asks you to flag something for them to visually double-check later — never add review notes on your own initiative. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
       {
-        id: taskHandle,
+        id: taskHandle.optional().describe("A task to anchor the note to."),
+        canvasId: z
+          .string()
+          .optional()
+          .describe("A canvas to drop a sticky note on — requires x/y."),
+        x: z.number().optional().describe("Canvas-space x, required with canvasId."),
+        y: z.number().optional().describe("Canvas-space y, required with canvasId."),
         note: z.string().min(1).max(10_000),
         type: noteTypeEnum.optional(),
         tags: z.array(z.string().min(1).max(60)).max(20).optional(),
       },
-      async ({ id, note, type, tags }) => {
+      async ({ id, canvasId, x, y, note, type, tags }) => {
+        if (canvasId != null) {
+          if (x == null || y == null)
+            return text({ error: "x and y are required when canvasId is set" });
+          const n = await addCanvasNote(
+            canvasId,
+            x,
+            y,
+            { note, type, tags },
+            currentUser(),
+            AI_AUTHOR,
+            id,
+          );
+          return n
+            ? text({ note: n })
+            : text({ error: "Canvas not found (or id didn't resolve to a task)" });
+        }
+        if (!id) return text({ error: "Provide id and/or canvasId+x+y" });
         const n = await addNote(id, { note, type, tags }, currentUser(), AI_AUTHOR);
         return n ? text({ note: n }) : text({ error: "Task not found" });
       },
@@ -613,9 +637,10 @@ const handler = createMcpHandler(
 
     server.tool(
       "list_notes",
-      "Query notes ACROSS all your tasks — filter by task, type (e.g. decision), or date range. Returns only OPEN notes unless `includeResolved` is true. Use for retros ('show our technical decisions'), audits, the standup digest, and listing open `review` items to double-check.",
+      "Query notes across all tasks AND canvas stickies — filter by task, canvas, type (e.g. decision), or date range. Returns only OPEN notes unless `includeResolved` is true. Use for retros ('show our technical decisions'), audits, the standup digest, listing open `review` items to double-check, and reading a canvas's stickies (also returned inline by get_canvas).",
       {
         taskId: taskHandle.optional(),
+        canvasId: z.string().optional(),
         type: noteTypeEnum.optional(),
         from: z.string().max(40).optional(),
         to: z.string().max(40).optional(),
@@ -1032,11 +1057,13 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. `data.thisWeek` marks the THIS WEEK board — the one group the USER makes and stars, where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button.",
+      "Get one canvas by id with all its nodes AND sticky notes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. `data.thisWeek` marks the THIS WEEK board — the one group the USER makes and stars, where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. `notes` are this canvas's stickies (see add_note/list_notes) — open ones plus resolved ones (resolved stickies stay pinned, dimmed, until deleted).",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);
-        return canvas ? text({ canvas }) : text({ error: "Canvas not found" });
+        if (!canvas) return text({ error: "Canvas not found" });
+        const notes = await listNotes(currentUser(), { canvasId: id, includeResolved: true });
+        return text({ canvas: { ...canvas, notes } });
       },
     );
 

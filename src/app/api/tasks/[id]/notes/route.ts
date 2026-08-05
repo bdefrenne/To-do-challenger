@@ -18,9 +18,10 @@ import { addNote, listNotes } from "@/lib/db/service";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export const GET = route(async (_req: NextRequest, ctx: AuthedCtx) => {
+export const GET = route(async (req: NextRequest, ctx: AuthedCtx) => {
   const { id } = await ctx.params;
-  const notes = await listNotes(ctx.userId, { taskId: id });
+  const includeResolved = new URL(req.url).searchParams.get("includeResolved") === "true";
+  const notes = await listNotes(ctx.userId, { taskId: id, includeResolved });
   return json({ notes });
 });
 

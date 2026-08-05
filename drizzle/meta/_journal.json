@@ -218,6 +218,13 @@
       "when": 1785900000000,
       "tag": "0030_add_task_status_events",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786000000000,
+      "tag": "0031_add_canvas_notes",
+      "breakpoints": true
     }
   ]
 }
