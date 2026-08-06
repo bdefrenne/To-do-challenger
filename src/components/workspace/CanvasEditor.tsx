@@ -57,6 +57,7 @@ import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 import { MIN_SECTION_HEIGHT } from "./SectionNode";
 import { SectionMembershipProvider } from "./SectionMembershipContext";
 import {
+  anchorTrioGroupIds,
   boardsFiledInSystemGroup,
   boardsNeedingInbox,
   boardsNeedingWeekLane,
@@ -95,6 +96,11 @@ const MAX_SCALE = 3;
 const JUMP_MS = 320;
 /** Longest edge (canvas units) a freshly pasted/dropped image is scaled to. */
 const MAX_PLACE = 480;
+/** Vertical gap between THIS WEEK and BACKLOG, and between BACKLOG and LATER,
+ *  when they're first anchored into a stack (see the "Anchor BACKLOG/LATER"
+ *  effect). Matches the tray-column gap the system-group reconciler already
+ *  uses (`NEW_GROUP_SIZE.height + 120`). */
+const TRIO_GAP = 120;
 const uid = () => crypto.randomUUID();
 
 /** The task ids a text note links to (drawn as connectors to their cards). */
@@ -888,6 +894,52 @@ export function CanvasEditor({
     removeMany,
     patchMany,
   ]);
+
+  /**
+   * Anchor BACKLOG under THIS WEEK, and LATER under BACKLOG, the first time
+   * all three exist together — so the pair reads as parked directly beneath
+   * this week's work rather than off in the INBOX/DONE THIS WEEK tray column.
+   *
+   * Guarded by `data.anchoredToWeek` so it only ever fires ONCE per group:
+   * after that, the trio is a rigid unit a drag can reposition as a whole
+   * (see `anchorTrioGroupIds` in `onNodePointerDown`), and this effect must
+   * not fight that by snapping them back on every render.
+   */
+  useEffect(() => {
+    if (!nodesMap) return;
+    const weekId = thisWeekGroupId(nodes);
+    if (!weekId) return;
+    const week = nodes.find((n) => n.id === weekId);
+    if (!week) return;
+    const backlog = nodes.find((n) => n.id === systemGroupId("backlog", canvasId));
+    const later = nodes.find((n) => n.id === systemGroupId("later", canvasId));
+    const patches: { id: string; patch: Partial<StoredNode> }[] = [];
+    let nextY = week.y + week.height + TRIO_GAP;
+    if (backlog && backlog.data?.anchoredToWeek !== true) {
+      patches.push({
+        id: backlog.id,
+        patch: {
+          x: week.x,
+          y: nextY,
+          data: { ...backlog.data, anchoredToWeek: true } as StoredNode["data"],
+        },
+      });
+      nextY += backlog.height + TRIO_GAP;
+    } else if (backlog) {
+      nextY = backlog.y + backlog.height + TRIO_GAP;
+    }
+    if (later && later.data?.anchoredToWeek !== true) {
+      patches.push({
+        id: later.id,
+        patch: {
+          x: week.x,
+          y: nextY,
+          data: { ...later.data, anchoredToWeek: true } as StoredNode["data"],
+        },
+      });
+    }
+    if (patches.length) patchMany(patches);
+  }, [nodesMap, nodes, canvasId, patchMany]);
 
   /* ---- THIS WEEK: materialise the lane an agent's placement is waiting on ---- */
 
@@ -1903,6 +1955,17 @@ export function CanvasEditor({
       const moveIds = new Set(sel);
       if (node.kind === "section_group") {
         for (const m of groupMembers(nodesRef.current, node.id)) moveIds.add(m.id);
+        // THIS WEEK / BACKLOG / LATER travel as one rigid unit — grabbing any
+        // one of the three drags the other two along with it, preserving
+        // whatever relative offset they currently sit at.
+        const trio = anchorTrioGroupIds(nodesRef.current, canvasId);
+        if (trio.has(node.id)) {
+          for (const gid of trio) {
+            if (gid === node.id) continue;
+            moveIds.add(gid);
+            for (const m of groupMembers(nodesRef.current, gid)) moveIds.add(m.id);
+          }
+        }
       }
       const origin = new Map(
         nodesRef.current
@@ -2019,7 +2082,7 @@ export function CanvasEditor({
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     },
-    [patchMany, history, toCanvas],
+    [patchMany, history, toCanvas, canvasId],
   );
 
   /* -------- pointer: background (pan / create / marquee) -------- */

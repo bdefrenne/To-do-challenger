@@ -9,7 +9,7 @@ import { BoardModal } from "./workspace/BoardModal";
 import { ProjectModal } from "./workspace/ProjectModal";
 import { PeopleProvider, usePeople } from "./PeopleContext";
 import { Avatar } from "./ui/Badge";
-import type { Project } from "@/lib/types";
+import type { Project, TaskPlacement } from "@/lib/types";
 
 export interface SessionUser {
   id: string;
@@ -50,6 +50,7 @@ export function AppShell({
         <GlobalProjectSettings />
         <Notice />
         <DeleteUndoToast />
+        <SendUndoToast />
       </WorkspaceProvider>
     </PeopleProvider>
   );
@@ -119,6 +120,47 @@ function DeleteUndoToast() {
           <kbd className="rounded bg-surface-3 px-1 text-[9px] font-semibold leading-none text-faint">
             ⌘Z
           </kbd>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const SEND_LABEL: Record<TaskPlacement, string> = {
+  inbox: "Inbox",
+  thisWeek: "This week",
+  backlog: "Backlog",
+  later: "Later",
+  doneThisWeek: "Done this week",
+};
+
+/** "Sent … · Undo" toast for the canvas hover arrows (↑/→/↓ → THIS WEEK /
+ *  BACKLOG / LATER). A send commits immediately, so unlike `DeleteUndoToast`
+ *  there's no grace window to show — this just fires on every send, no
+ *  debounce, overwriting whatever it was already showing. */
+function SendUndoToast() {
+  const { pendingSend, undoSend, clearPendingSend } = useWorkspace();
+  useEffect(() => {
+    if (!pendingSend) return;
+    const t = setTimeout(clearPendingSend, 4000);
+    return () => clearTimeout(t);
+  }, [pendingSend, clearPendingSend]);
+
+  if (!pendingSend) return null;
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-32 z-[300] flex justify-center px-4">
+      <div
+        role="status"
+        className="pointer-events-auto flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm text-fg shadow-lg"
+      >
+        <span className="max-w-[16rem] truncate">
+          Sent “{pendingSend.title}” to {SEND_LABEL[pendingSend.to]}
+        </span>
+        <button
+          onClick={undoSend}
+          className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-surface-2 px-2 py-0.5 text-xs font-medium text-accent transition-colors hover:border-accent"
+        >
+          Undo
         </button>
       </div>
     </div>

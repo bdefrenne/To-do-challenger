@@ -214,6 +214,31 @@ export const masterSectionsByBoard = (
 };
 
 /**
+ * The ids of the THIS WEEK / BACKLOG / LATER trio that travel together as one
+ * rigid unit on the canvas — grabbing any one of the three drags the other
+ * two along with it, preserving whatever relative offset they currently sit
+ * at (see `onNodePointerDown` in CanvasEditor). This is purely a MOVEMENT
+ * grouping, layered on top of the ordinary system-group/THIS WEEK identity
+ * above — it doesn't change membership, pinning, or the reconciler.
+ *
+ * Only ids that actually exist on this canvas come back, so the trio
+ * degrades gracefully: no starred THIS WEEK group yet, or BACKLOG/LATER not
+ * materialised yet, just means fewer nodes travel together.
+ */
+export function anchorTrioGroupIds(
+  canvasNodes: readonly CanvasNode[],
+  canvasId: string,
+): Set<string> {
+  const existing = new Set(canvasNodes.map((n) => n.id));
+  const ids = [
+    thisWeekGroupId(canvasNodes),
+    systemGroupId("backlog", canvasId),
+    systemGroupId("later", canvasId),
+  ].filter((id): id is string => id !== null && existing.has(id));
+  return new Set(ids);
+}
+
+/**
  * The Section a task is pinned to, or null for "not placed".
  *
  * Reads only the first-class column. It does NOT fall back to the pre-0027

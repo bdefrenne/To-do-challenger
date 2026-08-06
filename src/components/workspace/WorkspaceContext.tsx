@@ -166,6 +166,13 @@ interface WorkspaceContextValue {
   /** Send a card to a canvas group: THIS WEEK (end of the list), BACKLOG or
    *  LATER (top), DONE THIS WEEK, or INBOX (unpinned). The hover arrows' path. */
   sendToPlacement: (id: string, to: TaskPlacement) => void;
+  /** The latest arrow-key send, for its undo toast (overwritten each time, not
+   *  a queue — see `pendingSend`'s declaration for why). */
+  pendingSend: { id: string; title: string; to: TaskPlacement; fromPin: string | null } | null;
+  /** Put the pending send back where it came from. */
+  undoSend: () => void;
+  /** Dismiss the send-undo toast without reversing it (its auto-dismiss). */
+  clearPendingSend: () => void;
   moveNodeIntoSection: (
     dragId: string,
     targetPin: string | null,
@@ -497,6 +504,16 @@ export function WorkspaceProvider({
   const [pendingDeletes, setPendingDeletes] = useState<
     { id: string; title: string; mode: "delete" | "archive" }[]
   >([]);
+
+  // Most recent arrow-key placement move (the ↑/→/↓ hover shortcuts), for its
+  // undo toast. Unlike `pendingDeletes` this ISN'T a queue: a send commits
+  // immediately (no grace window to defer), so there's nothing to accumulate —
+  // each new send just overwrites the last, no debounce, same as `notice`.
+  // `fromPin` is where it was pinned before the move, for `undoSend` to put it
+  // back.
+  const [pendingSend, setPendingSend] = useState<
+    { id: string; title: string; to: TaskPlacement; fromPin: string | null } | null
+  >(null);
 
   // Mirror of the open-modal stack so the (never re-armed) poll closure can
   // refresh every open task's thread when the cursor moves — no interval re-arm.
@@ -1287,7 +1304,8 @@ export function WorkspaceProvider({
     const boardId = task.boardId ?? null;
     const lane = placement.laneFor(to, boardId);
     if (to !== "inbox" && !lane) return; // no such group on this canvas
-    if (placement.sectionOf(id) === lane) return;
+    const fromPin = placement.sectionOf(id);
+    if (fromPin === lane) return;
     const siblingIds = placement.membersOf(lane);
     // "Top of the list" = insert before the first top-level card already there.
     // With an empty lane there's nothing to sit before, so it appends either way.
@@ -1300,7 +1318,22 @@ export function WorkspaceProvider({
         : {}),
       siblingIds,
     });
+    setPendingSend({ id, title: task.title, to, fromPin });
   }
+
+  // Put a sent card back where it came from — the send-undo toast's button.
+  // Reversing precisely isn't the point (this mirrors `sendToPlacement` itself,
+  // which only ever appends/tops a lane rather than restoring an exact index);
+  // getting it back into the right group is what "oops, wrong arrow" needs.
+  function undoSend() {
+    const pending = pendingSend;
+    if (!pending) return;
+    const task = taskMap[pending.id];
+    if (task) moveNodeIntoSection(pending.id, pending.fromPin, task.boardId ?? null);
+    setPendingSend(null);
+  }
+
+  const clearPendingSend = useCallback(() => setPendingSend(null), []);
 
   // Move a task into a canvas Section — possibly one on a different board.
   //
@@ -2108,6 +2141,9 @@ export function WorkspaceProvider({
         pendingDeletes,
         moveNode,
         sendToPlacement,
+        pendingSend,
+        undoSend,
+        clearPendingSend,
         moveNodeIntoSection,
         dropToGroup,
         moveToBoard,
