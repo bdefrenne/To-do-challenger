@@ -873,10 +873,24 @@ export function WorkspaceProvider({
     // fire seconds later and must send the LATEST updatedAt to avoid a false 409.
     const token = taskMapRef.current[id]?.updatedAt;
     const guarded = token && CONTENT_FIELDS.some((f) => f in patch);
-    return api(`/api/tasks/${id}`, {
+    return api<{ task?: TaskDTO }>(`/api/tasks/${id}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
       ...(guarded ? { headers: { "X-Expected-Updated-At": token } } : {}),
+    }).then((res) => {
+      // Every write — even a status-only one — bumps the row's `updatedAt`
+      // server-side. `mutate`/`flushEdits` only reconcile from the source once
+      // ALL in-flight ops for this burst drain, so a second content edit fired
+      // before that (e.g. importance right after a title save) would otherwise
+      // reuse this now-stale token and 409 against its OWN prior write. Bump it
+      // the moment each response lands so the next guarded write in the same
+      // burst sees the fresh value.
+      if (res?.task?.updatedAt) {
+        setTaskMap((prev) =>
+          prev[id] ? { ...prev, [id]: { ...prev[id], updatedAt: res.task!.updatedAt } } : prev,
+        );
+      }
+      return res;
     });
   }
 
