@@ -103,6 +103,37 @@ function useSectionUnits(sectionId: string): TaskUnit[] {
   }, [sectionId, nodes, taskMap, bySection]);
 }
 
+/** Does this unit, or any of its descendants, belong to the filtered assignee?
+ *  Used to decide whether a unit survives an assignee filter at all — a match
+ *  buried a few levels deep keeps its ancestors around too, so the tree isn't
+ *  left with orphaned children (see `filterUnitsByAssignee`). */
+function unitMatchesAssignee(
+  unit: TaskUnit,
+  taskMap: Record<string, Task>,
+  assigneeId: string,
+): boolean {
+  const t = unit.taskId ? taskMap[unit.taskId] : undefined;
+  if (t?.assigneeIds?.includes(assigneeId)) return true;
+  return unit.children.some((c) => unitMatchesAssignee(c, taskMap, assigneeId));
+}
+
+/** Prune a unit tree down to branches that lead to a match (TD-59: "show only
+ *  this assignee's tasks"). An ancestor kept only because a descendant matches
+ *  stays in the tree — `TaskCard` dims it via `h.filterAssigneeId` so it reads
+ *  as context, not a hidden match. `null` ⇒ no filter, tree unchanged. This is
+ *  a pure render-time filter: the caller must NOT feed the result back into
+ *  outline authoring (`unitsToRows`) or a save would delete the pruned tasks. */
+function filterUnitsByAssignee(
+  units: TaskUnit[],
+  taskMap: Record<string, Task>,
+  assigneeId: string | null,
+): TaskUnit[] {
+  if (!assigneeId) return units;
+  return units
+    .filter((u) => unitMatchesAssignee(u, taskMap, assigneeId))
+    .map((u) => ({ ...u, children: filterUnitsByAssignee(u.children, taskMap, assigneeId) }));
+}
+
 export function SectionNode({
   node,
   selected,
@@ -113,6 +144,7 @@ export function SectionNode({
   isMaster = false,
   masterSection = null,
   onRemove,
+  filterAssigneeId = null,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -134,6 +166,10 @@ export function SectionNode({
   masterSection?: { id: string; name: string } | null;
   /** Remove this node from the canvas (used after sending its cards away). */
   onRemove?: () => void;
+  /** Show only this assignee's cards (TD-59). Render-only: filters what's
+   *  drawn in committed view and suppresses the resize→storage mirror below,
+   *  never touches outline authoring or Liveblocks storage. */
+  filterAssigneeId?: string | null;
 }) {
   const ws = useWorkspace();
   const boardId = (node.data?.boardId as string | undefined) ?? null;
@@ -147,6 +183,13 @@ export function SectionNode({
   // by its board — so it starts empty and stays separate from sibling sections.
   const sectionId = node.id;
   const units = useSectionUnits(sectionId);
+  // Committed-view-only render filter (TD-59) — deliberately NOT fed back into
+  // outline authoring (`unitsToRows` below still seeds from the full `units`),
+  // so an assignee filter can never cause a save to delete the tasks it hid.
+  const visibleUnits = useMemo(
+    () => filterUnitsByAssignee(units, ws.taskMap, filterAssigneeId),
+    [units, ws.taskMap, filterAssigneeId],
+  );
   // An INBOX lane: a tray showing its board's UNPINNED tasks, so that anything
   // created from the API, MCP or a board view is visible here instead of nowhere.
   // Cards land in it by having no pin, which is why `pin` is null for a lane —
@@ -246,14 +289,22 @@ export function SectionNode({
   const boxRef = useRef<HTMLDivElement>(null);
   const onResizeRef = useRef(onResize);
   const heightRef = useRef(node.height);
+  // An assignee filter (TD-59) shrinks the rendered card list without the
+  // section actually being smaller — never mirror that measurement into
+  // shared storage, or one viewer's filter would resize the section live for
+  // everyone else in the room. Kept in a ref (not a dep) for the same reason
+  // as the two above: the observer is created once.
+  const filterActiveRef = useRef(!!filterAssigneeId);
   useEffect(() => {
     onResizeRef.current = onResize;
     heightRef.current = node.height;
+    filterActiveRef.current = !!filterAssigneeId;
   });
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
     const ro = new ResizeObserver(() => {
+      if (filterActiveRef.current) return;
       const h = el.offsetHeight;
       if (Math.round(h) !== Math.round(heightRef.current)) onResizeRef.current?.(h);
     });
@@ -1024,7 +1075,8 @@ export function SectionNode({
           />
         ) : (
           <CommittedList
-            units={units}
+            units={visibleUnits}
+            filterAssigneeId={filterAssigneeId}
             taskMap={ws.taskMap}
             onOpen={ws.openTask}
             onToggle={ws.toggleDone}
@@ -1387,6 +1439,10 @@ function OutlineEditor({
 
 interface CardHandlers {
   taskMap: Record<string, Task>;
+  /** Set when an assignee filter (TD-59) is active — a card whose task isn't
+   *  directly assigned to this id is dimmed (it's shown only as context for a
+   *  matching descendant, see `filterUnitsByAssignee`). */
+  filterAssigneeId: string | null;
   onOpen: (id: string) => void;
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
@@ -1447,6 +1503,11 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   const badge = STATUS_CANVAS_BADGE[t.status];
   const statusTone = STATUS_TONE[t.status];
   const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
+  // Filtered-in only as context for a matching descendant (TD-59) — dim it so
+  // the actual match still reads as the point of the filter.
+  const dimmedByFilter = h.filterAssigneeId
+    ? !(t.assigneeIds ?? []).includes(h.filterAssigneeId)
+    : false;
   const half = (e: React.DragEvent) => {
     const r = e.currentTarget.getBoundingClientRect();
     return e.clientY < r.top + r.height / 2 ? "before" : "after";
@@ -1491,6 +1552,7 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
           badge ? `outline outline-[3px] outline-offset-2 ${statusTone.outline}` : "",
           hint === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
           hint === "after" ? "shadow-[inset_0_-2px_0_0_var(--color-accent)]" : "",
+          dimmedByFilter ? "opacity-45" : "",
         ].join(" ")}
       >
         {badge ? (
@@ -1611,6 +1673,7 @@ function InlineTaskComposer({
 
 function CommittedList({
   units,
+  filterAssigneeId,
   taskMap,
   onOpen,
   onToggle,
@@ -1626,6 +1689,8 @@ function CommittedList({
   onDropIntoSection,
 }: {
   units: TaskUnit[];
+  /** TD-59: dims a card kept only as context for a matching descendant. */
+  filterAssigneeId: string | null;
   taskMap: Record<string, Task>;
   onOpen: (id: string) => void;
   onToggle: (id: string) => void;
@@ -1647,7 +1712,7 @@ function CommittedList({
   // draws a dashed ring so it reads as "drop here to move into this section".
   const [overSection, setOverSection] = useState(false);
 
-  const h: CardHandlers = { taskMap, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onSend, onAddSubtask, dropHint, setDropHint };
+  const h: CardHandlers = { taskMap, filterAssigneeId, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onSend, onAddSubtask, dropHint, setDropHint };
   return (
     <div
       // Section-level drop zone. Card drops stopPropagation, so this fires only

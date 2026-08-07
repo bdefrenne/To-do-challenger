@@ -112,6 +112,7 @@ export function CanvasNode({
   onRemove,
   groupMemberCount = 0,
   groupDropActive = false,
+  filterAssigneeId = null,
   onSetThisWeek,
 }: {
   node: CanvasNodeT;
@@ -157,6 +158,9 @@ export function CanvasNode({
   groupDropActive?: boolean;
   /** section_group-only: mark/unmark this group as the THIS WEEK board. */
   onSetThisWeek?: (thisWeek: boolean) => void;
+  /** Section-only: show only this assignee's cards (TD-59), across every
+   *  section on the canvas. Render-only — never patched into storage. */
+  filterAssigneeId?: string | null;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
@@ -290,6 +294,7 @@ export function CanvasNode({
         isMaster={isMaster}
         masterSection={masterSection}
         onRemove={onRemove}
+        filterAssigneeId={filterAssigneeId}
       />
     );
   }

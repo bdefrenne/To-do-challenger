@@ -15,6 +15,7 @@ import { LiveMap, LiveObject, type Json } from "@liveblocks/client";
 import { LiveblocksProvider, RoomProvider } from "@liveblocks/react";
 import { CanvasEditor } from "@/components/workspace/CanvasEditor";
 import { CanvasConnectionStatus } from "@/components/workspace/CanvasConnectionStatus";
+import { CanvasAssigneeFilter } from "@/components/workspace/CanvasAssigneeFilter";
 import type { StoredNode } from "@/liveblocks.config";
 import type { Canvas, CanvasNode } from "@/lib/types";
 
@@ -52,6 +53,10 @@ export default function CanvasPage() {
   const [missing, setMissing] = useState(false);
   const [name, setName] = useState("");
   const nameTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // TD-59: show only this assignee's cards, across every group on the canvas.
+  // Local UI state only — see CanvasEditor's `filterAssigneeId` prop doc for
+  // why this never touches Liveblocks storage.
+  const [filterAssigneeId, setFilterAssigneeId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -115,9 +120,11 @@ export default function CanvasPage() {
             saveName(e.target.value);
           }}
           disabled={!canvas}
-          className="min-w-0 flex-1 rounded-md bg-transparent px-1 py-0.5 text-sm font-semibold text-fg outline-none focus:bg-surface-2"
+          className="min-w-0 max-w-xs shrink rounded-md bg-transparent px-1 py-0.5 text-sm font-semibold text-fg outline-none focus:bg-surface-2"
           placeholder="Untitled canvas"
         />
+        <CanvasAssigneeFilter value={filterAssigneeId} onChange={setFilterAssigneeId} />
+        <div className="flex-1" />
       </header>
       <div className="relative flex-1">
         {missing ? (
@@ -138,7 +145,11 @@ export default function CanvasPage() {
               initialPresence={{ cursor: null, selection: [], editing: null, view: null }}
               initialStorage={initialStorage}
             >
-              <CanvasEditor canvasId={canvasId} canvasName={name} />
+              <CanvasEditor
+                canvasId={canvasId}
+                canvasName={name}
+                filterAssigneeId={filterAssigneeId}
+              />
               <CanvasConnectionStatus />
             </RoomProvider>
           </LiveblocksProvider>

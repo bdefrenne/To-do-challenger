@@ -453,9 +453,14 @@ const loadPen = (canvasId: string): Pen => {
 export function CanvasEditor({
   canvasId,
   canvasName,
+  filterAssigneeId = null,
 }: {
   canvasId: string;
   canvasName: string;
+  /** Show only this assignee's cards across every section (TD-59). Render-only
+   *  — never patched into Liveblocks storage, so it can't fight over section
+   *  heights with peers who have a different (or no) filter active. */
+  filterAssigneeId?: string | null;
 }) {
   const nodesMap = useStorage((root) => root.nodes);
   const others = useOthers();
@@ -896,14 +901,19 @@ export function CanvasEditor({
   ]);
 
   /**
-   * Anchor BACKLOG under THIS WEEK, and LATER under BACKLOG, the first time
-   * all three exist together — so the pair reads as parked directly beneath
-   * this week's work rather than off in the INBOX/DONE THIS WEEK tray column.
+   * Keep BACKLOG pinned directly under THIS WEEK, and LATER directly under
+   * BACKLOG — continuously, not just the first time all three exist together.
+   * `computeGroupLayout` keeps auto-fitting each group's box to its own
+   * content forever (a task added, a note expanded, a lane created all grow
+   * it), so a one-time snapshot of the neighbour's height goes stale the
+   * moment that neighbour grows, and the frames start to overlap.
    *
-   * Guarded by `data.anchoredToWeek` so it only ever fires ONCE per group:
-   * after that, the trio is a rigid unit a drag can reposition as a whole
-   * (see `anchorTrioGroupIds` in `onNodePointerDown`), and this effect must
-   * not fight that by snapping them back on every render.
+   * Re-deriving position from the live sibling height on every change is safe
+   * against dragging: grabbing any one of the trio translates all three by an
+   * equal delta (see `anchorTrioGroupIds` in `onNodePointerDown`), which
+   * preserves the exact gap this effect expects — so after a drag the
+   * derived position already matches where the drag put them and `place`
+   * below is a no-op.
    */
   useEffect(() => {
     if (!nodesMap) return;
@@ -914,30 +924,17 @@ export function CanvasEditor({
     const backlog = nodes.find((n) => n.id === systemGroupId("backlog", canvasId));
     const later = nodes.find((n) => n.id === systemGroupId("later", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
+    const place = (group: CanvasNode | undefined, x: number, y: number) => {
+      if (group && (group.x !== x || group.y !== y)) {
+        patches.push({ id: group.id, patch: { x, y } });
+      }
+    };
     let nextY = week.y + week.height + TRIO_GAP;
-    if (backlog && backlog.data?.anchoredToWeek !== true) {
-      patches.push({
-        id: backlog.id,
-        patch: {
-          x: week.x,
-          y: nextY,
-          data: { ...backlog.data, anchoredToWeek: true } as StoredNode["data"],
-        },
-      });
+    if (backlog) {
+      place(backlog, week.x, nextY);
       nextY += backlog.height + TRIO_GAP;
-    } else if (backlog) {
-      nextY = backlog.y + backlog.height + TRIO_GAP;
     }
-    if (later && later.data?.anchoredToWeek !== true) {
-      patches.push({
-        id: later.id,
-        patch: {
-          x: week.x,
-          y: nextY,
-          data: { ...later.data, anchoredToWeek: true } as StoredNode["data"],
-        },
-      });
-    }
+    place(later, week.x, nextY);
     if (patches.length) patchMany(patches);
   }, [nodesMap, nodes, canvasId, patchMany]);
 
@@ -2536,6 +2533,7 @@ export function CanvasEditor({
                 groupDropActive={
                   node.kind === "section_group" && groupDropTarget === node.id
                 }
+                filterAssigneeId={filterAssigneeId}
                 api={nodeApi}
               />
             );

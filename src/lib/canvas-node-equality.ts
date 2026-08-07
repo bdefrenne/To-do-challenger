@@ -46,6 +46,9 @@ export interface CanvasNodeRenderProps {
   masterSectionName: string | null;
   groupMemberCount: number;
   groupDropActive: boolean;
+  /** Section-only: show only this assignee's cards across every section on the
+   *  canvas (TD-59). Purely a render filter — never written to storage. */
+  filterAssigneeId: string | null;
   api: unknown;
 }
 
@@ -68,5 +71,6 @@ export const canvasNodeRenderPropsEqual = (
   p.masterSectionName === n.masterSectionName &&
   p.groupMemberCount === n.groupMemberCount &&
   p.groupDropActive === n.groupDropActive &&
+  p.filterAssigneeId === n.filterAssigneeId &&
   p.api === n.api &&
   sameCanvasNode(p.node, n.node);
