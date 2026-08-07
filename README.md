@@ -16,7 +16,6 @@ Built with **Next.js 16** · React 19 · TypeScript · Tailwind v4 · **Neon Pos
 · **Drizzle** · **Vercel Blob** · **MCP** · **Google Calendar**.
 
 ## Architecture — one source of truth, many clients
-
 ```
         Postgres (Neon)         ← the real source of truth
               │
