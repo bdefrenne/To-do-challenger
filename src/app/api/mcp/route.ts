@@ -351,7 +351,9 @@ const handler = createMcpHandler(
         format: z.enum(["json", "markdown"]).optional().default("json"),
       },
       async ({ format, detail, shape, ...filter }) => {
-        const f = await resolveFilter(filter);
+        // Only `detail:'full'` renders the working fields, so only it pays to
+        // fetch them (PLAT-403) — every other read leaves them in Postgres.
+        const f = { ...(await resolveFilter(filter)), includeWorkingFields: detail === "full" };
         const [rows, total] = await Promise.all([
           shape === "flat"
             ? listTasksFlat(currentUser(), f)
@@ -563,7 +565,8 @@ const handler = createMcpHandler(
         format: z.enum(["json", "markdown"]).optional().default("json"),
       },
       async ({ format, detail, ...filter }) => {
-        const f = await resolveFilter(filter);
+        // See list_tasks: fetch the working fields only for detail:'full'.
+        const f = { ...(await resolveFilter(filter)), includeWorkingFields: detail === "full" };
         const [result, total] = await Promise.all([
           searchTasks(currentUser(), f),
           countTasks(currentUser(), f),

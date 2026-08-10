@@ -15,6 +15,7 @@ import {
 import {
   listTasks,
   listTasksFlat,
+  listTaskIds,
   createTask,
   toMarkdown,
   userNameMap,
@@ -68,6 +69,11 @@ export const GET = route(async (req: NextRequest, { userId }) => {
     tz: sp.get("tz") ?? undefined,
     sort: sort === "recent" ? "recent" : undefined,
     limit: limit ? Number(limit) : undefined,
+    // The revisable working fields are ~2/3 of a board payload and only a
+    // task's own detail view shows them, so a list read omits them unless
+    // asked (?detail=full). The workspace relies on this default — see
+    // LIST_TASK_COLUMNS in the service (PLAT-403).
+    includeWorkingFields: sp.get("detail") === "full",
   };
   // Assignee and actor are stored as account ids; resolve a name/email/id.
   for (const key of ["assignee", "actor"] as const) {
@@ -81,11 +87,28 @@ export const GET = route(async (req: NextRequest, { userId }) => {
       headers: { "content-type": "text/markdown; charset=utf-8" },
     });
   }
+  // `now` is the watermark for the client's NEXT delta read. Taken before the
+  // query so a row written mid-flight is re-sent next time rather than skipped,
+  // and taken from the server so client clock skew can't open a gap.
+  const now = new Date().toISOString();
+  // DELTA read (PLAT-403): `?since=<iso>` sends only rows touched since then,
+  // plus every live id so the client can drop what was deleted. A board of 142
+  // tasks is ~190 KB; a typical change is one task, and re-sending the whole
+  // board on every change is what put Neon's egress at 80% of its allowance.
+  const since = sp.get("since");
+  if (since) {
+    filter.updatedAfter = since;
+    const [changed, ids] = await Promise.all([
+      listTasksFlat(userId, filter),
+      listTaskIds(userId, filter),
+    ]);
+    return json({ tasks: changed, ids, now });
+  }
   const flat = sp.get("flat");
   const tasks = flat
     ? await listTasksFlat(userId, filter)
     : await listTasks(userId, filter);
-  return json({ tasks });
+  return json({ tasks, now });
 });
 
 export const POST = route(async (req: NextRequest, { userId }) => {

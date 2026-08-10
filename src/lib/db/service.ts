@@ -8,7 +8,7 @@
   ====================================================================
 */
 
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, ne, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, ilike, inArray, isNotNull, isNull, ne, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
 import { db } from "./client";
@@ -225,7 +225,7 @@ function resolvePrefix(
 }
 
 /** The displayed code: the frozen `ref` when locked, else a soft `PREFIX-seq*`. */
-function displayCode(row: TaskRow, ctx?: CodeCtx): string | undefined {
+function displayCode(row: AnyTaskRow, ctx?: CodeCtx): string | undefined {
   if (row.refLocked && row.ref) return row.ref;
   if (row.seq == null) return undefined;
   const prefix = resolvePrefix(row, ctx);
@@ -234,7 +234,7 @@ function displayCode(row: TaskRow, ctx?: CodeCtx): string | undefined {
 }
 
 function rowToTask(
-  row: TaskRow,
+  row: AnyTaskRow,
   commentCount: number,
   attachments: Attachment[] = [],
   ctx?: CodeCtx,
@@ -246,9 +246,11 @@ function rowToTask(
     code: displayCode(row, ctx),
     ref: row.ref,
     refLocked: row.refLocked,
-    analysisSummary: row.analysisSummary,
-    plan: row.plan,
-    summary: row.summary,
+    // Absent on a list read (see LIST_TASK_COLUMNS) — `undefined` then means
+    // "not fetched", distinct from the `null` of a task that has none.
+    analysisSummary: "analysisSummary" in row ? row.analysisSummary : undefined,
+    plan: "plan" in row ? row.plan : undefined,
+    summary: "summary" in row ? row.summary : undefined,
     assigneeIds: row.assigneeIds ?? [],
     startDate: row.startDate ?? undefined,
     dueDate: row.dueDate ?? undefined,
@@ -750,7 +752,7 @@ const rowToCommit = (r: TaskCommitRow): TaskCommit => ({
 
 /** Nest flat rows into a tree, preserving position order at each level. */
 function buildTree(
-  rows: TaskRow[],
+  rows: AnyTaskRow[],
   counts: Map<string, number>,
   attachments: Map<string, Attachment[]>,
   ctx?: CodeCtx,
@@ -912,6 +914,15 @@ export interface TaskFilter {
   includeArchived?: boolean;
   /** Return ONLY archived tasks (for the Archived view). Overrides includeArchived. */
   archivedOnly?: boolean;
+  /** DELTA read: only tasks whose `updatedAt` is strictly after this instant
+   *  (an ISO timestamp, not a date). Pair it with `listTaskIds` to spot
+   *  deletions — see the `?since=` branch of /api/tasks. */
+  updatedAfter?: string;
+  /** Fetch the revisable working fields (analysisSummary / plan / summary) too.
+   *  Off by default — see LIST_TASK_COLUMNS: they dominate a board payload and
+   *  only a task's own detail view renders them, so a list read leaves them in
+   *  Postgres. Set it only for a caller that will actually show them. */
+  includeWorkingFields?: boolean;
 
   /* ---- Activity windows ------------------------------------------------
      "What changed between X and Y", the axis a standup or a daily summary
@@ -1001,6 +1012,11 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
       or(ilike(tasks.title, pat), ilike(sql`coalesce(${tasks.description}, '')`, pat)),
     );
   }
+  // Exclusive, instant-precise watermark for a DELTA read (PLAT-403): "only
+  // rows touched since I last synced". Deliberately NOT `updatedFrom`, which is
+  // a day-granular activity window and would re-send the whole day.
+  if (filter?.updatedAfter)
+    conds.push(sql`${tasks.updatedAt} > ${filter.updatedAfter}::timestamptz`);
   if (filter?.dueBefore) conds.push(sql`${tasks.dueDate} <= ${filter.dueBefore}`);
   if (filter?.dueAfter) conds.push(sql`${tasks.dueDate} >= ${filter.dueAfter}`);
   if (filter?.overdue) {
@@ -1075,11 +1091,38 @@ const TASK_ORDER = [asc(tasks.position), asc(tasks.createdAt), asc(tasks.id)];
  *  an activity window (truncating TASK_ORDER keeps an arbitrary slice). */
 const RECENT_ORDER = [desc(tasks.statusSince), desc(tasks.createdAt), asc(tasks.id)];
 
+/* ---- What a LIST read selects (PLAT-403) --------------------------------
+   The three revisable working fields are ~2/3 of a board payload by volume
+   (analysisSummary 133 KB + plan 164 KB + summary 128 KB, against 108 KB of
+   descriptions, measured at 142 tasks) and are rendered on exactly one
+   surface — a single task's detail view, which loads via `getTask` anyway.
+   Selecting them in every list read is what put the Neon egress bill at 80%
+   of its allowance, so lists leave them in Postgres.
+
+   Derived by omission from the table's own columns rather than enumerated, so
+   a newly added column ships in list reads automatically instead of silently
+   going missing — and renaming one of these three is a type error here. */
+type WorkingField = "analysisSummary" | "plan" | "summary";
+
+const LIST_TASK_COLUMNS = (() => {
+  /* eslint-disable @typescript-eslint/no-unused-vars */
+  const { analysisSummary, plan, summary, ...rest } = getTableColumns(tasks);
+  /* eslint-enable @typescript-eslint/no-unused-vars */
+  return rest;
+})();
+
+/** A row from a list read: every task column except the working fields. */
+type ListTaskRow = Omit<TaskRow, WorkingField>;
+
+/** Either shape `rowToTask` can map — a full row or a list row. */
+type AnyTaskRow = TaskRow | ListTaskRow;
+
 /** The matching rows for a filter, ordered and capped. One query builder for
  *  the tree and flat readers so they can never disagree on scope. */
 function taskRows(userId: string, filter?: TaskFilter) {
   const q = db
-    .select()
+    // Only a caller that will actually render them pays for the working fields.
+    .select(filter?.includeWorkingFields ? getTableColumns(tasks) : LIST_TASK_COLUMNS)
     .from(tasks)
     .where(taskWhere(userId, filter))
     .orderBy(...(filter?.sort === "recent" ? RECENT_ORDER : TASK_ORDER));
@@ -1129,6 +1172,23 @@ export async function listTasksFlat(
   return rows.map((r) =>
     rowToTask(r, counts.get(r.id) ?? 0, attachments.get(r.id), ctx),
   );
+}
+
+/** Just the ids matching a filter — one short column, no row bodies.
+ *  The other half of a delta read: the changed rows say what's new, this says
+ *  what still exists, so the client can drop what was deleted without the
+ *  server keeping tombstones. ~37 bytes a task against ~1.3 KB for the row. */
+export async function listTaskIds(
+  userId: string,
+  filter?: TaskFilter,
+): Promise<string[]> {
+  const rows = await db
+    .select({ id: tasks.id })
+    .from(tasks)
+    // The watermark is the one filter that must NOT apply here: an unchanged
+    // task is exactly what we're trying to confirm still exists.
+    .where(taskWhere(userId, { ...filter, updatedAfter: undefined }));
+  return rows.map((r) => r.id);
 }
 
 /** Query a user's tasks by any combination of filters (flat list).
@@ -1233,39 +1293,29 @@ export async function getTask(
  *  re-fetching the whole list. One indexed aggregate (tasks_user_idx). */
 export async function getChangeCursor(_userId: string): Promise<string> {
   // Team-wide: the board is shared, so the cursor tracks the whole instance.
-  const [taskAgg, boardAgg, projectAgg, noteAgg] = await Promise.all([
-    db
-      .select({
-        n: sql<number>`count(*)::int`,
-        u: sql<number>`coalesce(extract(epoch from max(${tasks.updatedAt}))::bigint, 0)`,
-      })
-      .from(tasks),
-    db
-      .select({
-        n: sql<number>`count(*)::int`,
-        u: sql<number>`coalesce(extract(epoch from max(${boards.updatedAt}))::bigint, 0)`,
-      })
-      .from(boards),
-    db
-      .select({
-        n: sql<number>`count(*)::int`,
-        u: sql<number>`coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0)`,
-      })
-      .from(projects),
-    // Folds in notes so a resolve/drag on a canvas note trips the poll for
+  //
+  // ONE round-trip, not four. This is the single most-called query in the app —
+  // every open tab polls it on a timer — and the Neon HTTP driver bills a
+  // separate request per query, so four aggregates cost four times the egress
+  // for the same ~40 bytes of answer (PLAT-403). Scalar subqueries let Postgres
+  // do all four counts in one pass and hand back one row.
+  const [row] = await db
+    .select({
+      c: sql<string>`
+        (select count(*) from ${tasks})       || ':' ||
+        (select coalesce(extract(epoch from max(${tasks.updatedAt}))::bigint, 0) from ${tasks}) || ':' ||
+        (select count(*) from ${boards})      || ':' ||
+        (select coalesce(extract(epoch from max(${boards.updatedAt}))::bigint, 0) from ${boards}) || ':' ||
+        (select count(*) from ${projects})    || ':' ||
+        (select coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0) from ${projects}) || ':' ||
+        (select count(*) from ${taskNotes})   || ':' ||
+        (select coalesce(extract(epoch from max(${taskNotes.updatedAt}))::bigint, 0) from ${taskNotes})
+      `,
+    })
+    // Notes are folded in so a resolve/drag on a canvas note trips the poll for
     // clients with no Liveblocks room open (Notes page, another canvas, MCP).
-    db
-      .select({
-        n: sql<number>`count(*)::int`,
-        u: sql<number>`coalesce(extract(epoch from max(${taskNotes.updatedAt}))::bigint, 0)`,
-      })
-      .from(taskNotes),
-  ]);
-  const [{ n, u }] = taskAgg;
-  const [{ n: bn, u: bu }] = boardAgg;
-  const [{ n: pn, u: pu }] = projectAgg;
-  const [{ n: nn, u: nu }] = noteAgg;
-  return `${n}:${u}:${bn}:${bu}:${pn}:${pu}:${nn}:${nu}`;
+    .from(sql`(select 1) as _`);
+  return row.c;
 }
 
 /* -------------------------------------------------------------------- */

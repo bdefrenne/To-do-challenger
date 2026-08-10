@@ -304,7 +304,13 @@ interface WorkspaceContextValue {
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
-const POLL_MS = 2000;
+/* How often the change-cursor is polled. Adaptive: POLL_MIN_MS while the board
+   is actually moving, doubling to POLL_MAX_MS once it goes quiet, and snapping
+   back on focus/visibility or the next real change. A fixed 2 s poll meant a
+   tab left open all day cost a DB round-trip every 2 s forever, which is most
+   of what put Neon's egress at 80% of its allowance (PLAT-403). */
+const POLL_MIN_MS = 2000;
+const POLL_MAX_MS = 30000;
 // How long batched text edits sit before being written to Postgres. The canvas
 // stays LIVE meanwhile via delta broadcasts; peers apply them without a DB read.
 const EDIT_FLUSH_MS = 10000;
@@ -457,8 +463,19 @@ export function WorkspaceProvider({
   const reconcileSeq = useRef(0);
 
   // Last change-cursor we've reconciled to. The poll compares the server's
-  // cursor against this and only re-fetches the whole list when it moves.
+  // cursor against this and only re-fetches when it moves.
   const lastVersion = useRef<string | null>(null);
+
+  // Server-stamped instant of our last successful task read — the watermark a
+  // delta read asks from ("only what changed since"). Null until the first full
+  // fetch lands, which is why `fetchDelta` falls back to a full read.
+  const lastSyncAt = useRef<string | null>(null);
+
+  // The last map we applied, at full DTO width, readable from callbacks without
+  // making them depend on state (that would re-create the poll effect on every
+  // change). A delta merges onto THIS. Written only by `applyTaskMap`, and
+  // written synchronously so back-to-back deltas can't merge onto a stale base.
+  const lastAppliedRef = useRef<Record<string, TaskDTO>>({});
 
   /* ---- Phase 2: batched persistence for high-frequency text edits ---- */
   // `overlay` = unconfirmed field patches (mine + peers', keyed by task) that are
@@ -549,24 +566,17 @@ export function WorkspaceProvider({
     }
   }, []);
 
-  const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
-    // Snapshot the reconcile generation; if a mutation starts before this fetch
-    // resolves, the snapshot may predate that write — skip applying it (a later
-    // reconcile / the poll will apply clean state). Still return the fetched map
-    // so return-value callers (e.g. `hydrate`) keep working.
-    const seq = reconcileSeq.current;
-    try {
-      const { tasks: fetched } = await api<{ tasks: TaskDTO[] }>("/api/tasks?flat=1");
-      // Hide tasks still inside their delete undo window (see `deleteTask`), so
-      // an interim poll doesn't flash the card back before the DELETE commits.
-      const pend = pendingDeleteRef.current;
-      const tasks = pend.size ? fetched.filter((t) => !pend.has(t.id)) : fetched;
-      const map = Object.fromEntries(tasks.map((t) => [t.id, t as Task]));
-      // A mutation started while this fetch was in flight — its snapshot may
-      // predate that write. Don't apply it (nor touch the overlay); return the
-      // raw map for callers that only need existence checks. A later reconcile
-      // (the mutation's own finally, or the poll) applies clean state.
-      if (reconcileSeq.current !== seq) return map;
+  /** Push a COMPLETE task map into state: node list, live-edit overlay, map.
+   *  Shared by the full fetch and the delta fetch so the two can never drift on
+   *  the reconcile rules. Returns false if a mutation raced us and the snapshot
+   *  was dropped. Mutates `map` (overlay re-application). */
+  const applyTaskMap = useCallback(
+    (map: Record<string, TaskDTO>, seq: number): boolean => {
+      // A mutation started while the fetch was in flight — its snapshot may
+      // predate that write, so don't apply it (nor touch the overlay). A later
+      // reconcile (the mutation's own finally, or the poll) applies clean state.
+      if (reconcileSeq.current !== seq) return false;
+      const tasks = Object.values(map);
       setNodes(
         tasks.map((t) => ({
           id: t.id,
@@ -596,13 +606,75 @@ export function WorkspaceProvider({
           map[id] = { ...server, ...entry.patch };
         }
       }
+      lastAppliedRef.current = map;
       setTaskMap(map);
+      return true;
+    },
+    [],
+  );
+
+  const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
+    // Snapshot the reconcile generation; if a mutation starts before this fetch
+    // resolves, the snapshot may predate that write — skip applying it (a later
+    // reconcile / the poll will apply clean state). Still return the fetched map
+    // so return-value callers (e.g. `hydrate`) keep working.
+    const seq = reconcileSeq.current;
+    try {
+      const { tasks: fetched, now } = await api<{ tasks: TaskDTO[]; now?: string }>(
+        "/api/tasks?flat=1",
+      );
+      // Hide tasks still inside their delete undo window (see `deleteTask`), so
+      // an interim poll doesn't flash the card back before the DELETE commits.
+      const pend = pendingDeleteRef.current;
+      const tasks = pend.size ? fetched.filter((t) => !pend.has(t.id)) : fetched;
+      const map: Record<string, TaskDTO> = Object.fromEntries(tasks.map((t) => [t.id, t]));
+      // Only advance the watermark if the snapshot was actually applied. If a
+      // racing mutation made us drop it, `lastApplied` still holds the older
+      // base, and moving the watermark would make the next delta skip
+      // everything this response carried.
+      if (applyTaskMap(map, seq) && now) lastSyncAt.current = now;
       return map;
     } catch (e) {
       console.error("[workspace] failed to load tasks", e);
       return undefined;
     }
-  }, []);
+  }, [applyTaskMap]);
+
+  /** Fetch only what changed since the last sync and merge it in — the poll's
+   *  path. The board is ~190 KB while a typical change is a single task, so
+   *  re-downloading everything on each cursor move was the bulk of the egress
+   *  bill (PLAT-403). Falls back to a full read with no watermark or on error. */
+  const fetchDelta = useCallback(async (): Promise<void> => {
+    const since = lastSyncAt.current;
+    if (!since) {
+      await fetchAll();
+      return;
+    }
+    const seq = reconcileSeq.current;
+    try {
+      const { tasks: changed, ids, now } = await api<{
+        tasks: TaskDTO[];
+        ids: string[];
+        now: string;
+      }>(`/api/tasks?flat=1&since=${encodeURIComponent(since)}`);
+      const pend = pendingDeleteRef.current;
+      const alive = new Set(ids);
+      const map: Record<string, TaskDTO> = {};
+      // Carry forward everything the server still lists, then overwrite with the
+      // rows it says changed. Anything absent from `ids` was deleted.
+      for (const [id, t] of Object.entries(lastAppliedRef.current)) {
+        if (alive.has(id) && !pend.has(id)) map[id] = t;
+      }
+      for (const t of changed) {
+        if (!pend.has(t.id)) map[t.id] = t;
+      }
+      // Same rule as the full fetch: the watermark only moves if we applied.
+      if (applyTaskMap(map, seq)) lastSyncAt.current = now;
+    } catch (e) {
+      console.error("[workspace] delta fetch failed — falling back to full", e);
+      await fetchAll();
+    }
+  }, [fetchAll, applyTaskMap]);
 
   const fetchProjects = useCallback(async () => {
     try {
@@ -724,34 +796,67 @@ export function WorkspaceProvider({
       }
     };
     hydrate();
-    const iv = setInterval(async () => {
-      if (inflight.current !== 0 || document.hidden) return;
-      try {
-        const { v } = await api<{ v: string }>("/api/version");
-        if (v !== lastVersion.current) {
-          lastVersion.current = v;
-          await Promise.all([fetchAll(), fetchProjects()]);
-          // Keep every open task's thread current (e.g. a new Claude comment).
-          openTaskIdsRef.current.forEach((id) => loadLogs(id));
-          // Same for an open canvas's stickies — this is the fallback path for
-          // a note resolved/moved from a surface with no Liveblocks room open
-          // (the Notes page, MCP, Telegram): getChangeCursor folds in
-          // task_notes, so this cursor still moves even without a broadcast.
-          if (openCanvasIdRef.current) loadCanvasNotes(openCanvasIdRef.current);
+
+    // Self-scheduling rather than setInterval, so the gap can grow while
+    // nothing is happening. `delay` resets the moment the board moves or the
+    // rider comes back, so an active session still feels immediate.
+    let delay = POLL_MIN_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+
+    const tick = async () => {
+      let changed = false;
+      // A mutation in flight will resync the cursor itself; a hidden tab has
+      // nobody looking. Either way, skip the round-trip but keep the loop alive.
+      if (inflight.current === 0 && !document.hidden) {
+        try {
+          const { v } = await api<{ v: string }>("/api/version");
+          if (v !== lastVersion.current) {
+            changed = true;
+            lastVersion.current = v;
+            // Delta, not the whole board — the cursor only says SOMETHING moved.
+            await Promise.all([fetchDelta(), fetchProjects()]);
+            // Keep every open task's thread current (e.g. a new Claude comment).
+            openTaskIdsRef.current.forEach((id) => loadLogs(id));
+            // Same for an open canvas's stickies — this is the fallback path for
+            // a note resolved/moved from a surface with no Liveblocks room open
+            // (the Notes page, MCP, Telegram): getChangeCursor folds in
+            // task_notes, so this cursor still moves even without a broadcast.
+            if (openCanvasIdRef.current) loadCanvasNotes(openCanvasIdRef.current);
+          }
+        } catch (e) {
+          console.error("[workspace] version poll failed", e);
         }
-      } catch (e) {
-        console.error("[workspace] version poll failed", e);
       }
-    }, POLL_MS);
+      // Something moved → stay sharp. Nothing did → ease off toward the ceiling.
+      delay = changed ? POLL_MIN_MS : Math.min(delay * 2, POLL_MAX_MS);
+      if (!stopped) timer = setTimeout(tick, delay);
+    };
+    timer = setTimeout(tick, delay);
+
+    /** Back to a fast cadence and check now — the rider is looking again. */
+    const wakeUp = () => {
+      delay = POLL_MIN_MS;
+      if (stopped) return;
+      clearTimeout(timer);
+      timer = setTimeout(tick, POLL_MIN_MS);
+    };
     const onFocus = () => {
+      wakeUp();
       if (inflight.current === 0) reload();
     };
-    window.addEventListener("focus", onFocus);
-    return () => {
-      clearInterval(iv);
-      window.removeEventListener("focus", onFocus);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") wakeUp();
     };
-  }, [fetchAll, fetchProjects, refreshVersion, loadLogs, loadCanvasNotes]);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [fetchAll, fetchDelta, fetchProjects, refreshVersion, loadLogs, loadCanvasNotes]);
 
   /** Optimistic update now, server call, then reconcile from the source.
    *  `onSuccess` runs with the server call's result after it resolves (e.g. to
