@@ -131,6 +131,10 @@ function TaskDetailLevel({
   const [descDraft, setDescDraft] = useState("");
   const [descCopied, setDescCopied] = useState(false);
   const descSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Inline title editor — same double-click/autosave contract as the description.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const titleSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Each stack level is a fresh component instance (keyed by task id in the
   // wrapper), so the composer/gallery state above is naturally per-task — no
@@ -291,6 +295,37 @@ function TaskDetailLevel({
     saveDesc(descDraft);
     void flushEdits();
   };
+  const startEditTitle = () => {
+    setTitleDraft(task.title);
+    setEditingTitle(true);
+  };
+  const autoSizeTitle = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  };
+  // A title is required (the PATCH schema rejects ""), so an empty draft is a
+  // no-op — the field just reverts to the stored title when edit mode exits.
+  const saveTitle = (value: string) => {
+    const next = value.trim();
+    if (!next || next === task.title) return;
+    editTaskLive(taskId, { title: next });
+  };
+  const scheduleTitleSave = (value: string) => {
+    if (titleSaveTimer.current) clearTimeout(titleSaveTimer.current);
+    titleSaveTimer.current = setTimeout(() => {
+      titleSaveTimer.current = null;
+      saveTitle(value);
+    }, 500);
+  };
+  const flushTitleSave = () => {
+    if (titleSaveTimer.current) {
+      clearTimeout(titleSaveTimer.current);
+      titleSaveTimer.current = null;
+    }
+    saveTitle(titleDraft);
+    void flushEdits();
+  };
   const copyDesc = async () => {
     if (!task.description) return;
     try {
@@ -425,8 +460,45 @@ function TaskDetailLevel({
               </button>
             </div>
           </div>
-          {/* Second row: title */}
-          <h2 className="text-lg font-semibold tracking-tight">{task.title}</h2>
+          {/* Second row: title — double-click to edit, same contract as the description */}
+          {editingTitle ? (
+            <textarea
+              ref={autoSizeTitle}
+              value={titleDraft}
+              onChange={(e) => {
+                setTitleDraft(e.target.value);
+                autoSizeTitle(e.target);
+                scheduleTitleSave(e.target.value);
+              }}
+              onKeyDown={(e) => {
+                // ESC and Enter both commit and leave edit mode; ESC must not reach
+                // the document handler that closes the modal (a second ESC does that).
+                if (e.key === "Escape" || e.key === "Enter") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  flushTitleSave();
+                  setEditingTitle(false);
+                }
+              }}
+              onBlur={() => {
+                flushTitleSave();
+                setEditingTitle(false);
+              }}
+              autoFocus
+              rows={1}
+              placeholder="Task name…"
+              // -mx-2/width keeps the text on the same x as the <h2> it replaces.
+              className="-mx-2 w-[calc(100%+1rem)] resize-none overflow-hidden rounded-md border border-border bg-bg px-2 py-0.5 text-lg font-semibold tracking-tight text-fg outline-none focus:border-accent"
+            />
+          ) : (
+            <h2
+              onDoubleClick={startEditTitle}
+              title="Double-click to edit"
+              className="text-lg font-semibold tracking-tight"
+            >
+              {task.title}
+            </h2>
+          )}
         </div>
 
         <div className="grid grid-cols-1 gap-5 p-5 md:grid-cols-[1fr_390px]">
