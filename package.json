@@ -20,6 +20,12 @@
     "check:order": "tsx scripts/check-task-order.ts",
     "check:bulk": "tsx scripts/check-bulk.ts",
     "check:this-week": "tsx scripts/check-this-week.ts",
+    "repair:cross-pins": "tsx scripts/repair-cross-canvas-pins.ts",
+    "repair:week-lane-ids": "tsx scripts/repair-week-lane-ids.ts",
+    "check:done": "tsx scripts/check-done-view.ts",
+    "check:parent-done": "tsx scripts/check-parent-done.ts",
+    "check:day": "tsx scripts/check-work-days.ts",
+    "repair:week-pins": "tsx scripts/repair-week-pins.ts",
     "user:create": "tsx scripts/create-user.ts",
     "team:create": "tsx scripts/create-team.ts",
     "telegram:webhook": "tsx scripts/setup-telegram-webhook.ts"

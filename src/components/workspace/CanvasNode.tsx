@@ -113,7 +113,6 @@ export function CanvasNode({
   groupMemberCount = 0,
   groupDropActive = false,
   filterAssigneeId = null,
-  onSetThisWeek,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -157,7 +156,6 @@ export function CanvasNode({
   /** section_group-only: a section is being dragged over it right now. */
   groupDropActive?: boolean;
   /** section_group-only: mark/unmark this group as the THIS WEEK board. */
-  onSetThisWeek?: (thisWeek: boolean) => void;
   /** Section-only: show only this assignee's cards (TD-59), across every
    *  section on the canvas. Render-only — never patched into storage. */
   filterAssigneeId?: string | null;
@@ -276,7 +274,6 @@ export function CanvasNode({
             ? (layout) => onPatch({ data: { ...node.data, layout } })
             : undefined
         }
-        onSetThisWeek={onSetThisWeek}
       />
     );
   }

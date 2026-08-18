@@ -39,6 +39,13 @@ export function sanitizeCode(input: string): string {
   return cleaned || "TASK";
 }
 
+/** The locked form of a displayed code: drop the soft `*` marker. Locking never
+ *  renumbers a task (the seq is already allocated at creation), so the client
+ *  can cite the code a pending lock is about to freeze. */
+export function lockedCode(code: string): string {
+  return code.replace(/\*$/, "");
+}
+
 /** Format a displayed code from its parts. `locked` drops the soft `*` marker. */
 export function formatCode(prefix: string, seq: number, locked: boolean): string {
   const base = `${prefix}-${seq}`;

@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
-import { systemGroupOf, isThisWeekGroup, type SystemGroup } from "@/lib/sections";
+import { systemGroupOf, type SystemGroup } from "@/lib/sections";
 
 /** How a group arranges its members: a vertical column ("portrait", the
  *  default) or a horizontal row ("landscape" / paysage). */
@@ -40,9 +40,11 @@ export const NEW_GROUP_SIZE = { width: 460, height: 220 };
  *  GET here, since you never build one by hand. */
 const EMPTY_TRAY_HINT: Record<SystemGroup, string> = {
   inbox: "Nothing untriaged",
+  today: "Nothing on today's list — drop a card here, or file it from a board",
+  thisWeek: "Nothing on this week's board — hover a card and press ↑",
   backlog: "Nothing in the backlog — hover a card and press →",
   later: "Nothing deferred — hover a card and press ↓",
-  doneThisWeek: "Nothing finished yet — press Delete on a done card",
+  doneThisWeek: "Nothing finished yet — press Delete on a done card, or one in review",
 };
 
 /** The toggle's glyph: two stacked bars for portrait (a column), two
@@ -79,7 +81,6 @@ export function SectionGroupNode({
   onStopEditing,
   onRemove,
   onToggleLayout,
-  onSetThisWeek,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -98,16 +99,13 @@ export function SectionGroupNode({
   onToggleLayout?: (layout: GroupLayout) => void;
   /** Mark/unmark this group as THIS WEEK — one per canvas; the editor demotes
    *  any other when this one is marked. */
-  onSetThisWeek?: (thisWeek: boolean) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const layout = groupLayoutOf(node);
   const landscape = layout === "landscape";
-  // Which machine-managed tray this is, if any. A tray can never BE this
-  // week's board: the two are opposite ends of triage, and the trays are
-  // reconciler-owned, so starring one would fight the machine for the group.
+  // Which machine-managed tray this is, if any — THIS WEEK included now that
+  // the reconciler owns it too (TD-137), so there is no star left to draw.
   const systemKind = systemGroupOf(node);
-  const thisWeek = isThisWeekGroup(node);
 
   // Focus + select the name when entering edit mode, so a fresh group (or a
   // re-edit) lets you type the name straight away.
@@ -177,42 +175,6 @@ export function SectionGroupNode({
             {title || <span className="text-faint">Untitled group</span>}
           </span>
         )}
-        {/* Readable at canvas zoom, where the star below is a few pixels wide. */}
-        {thisWeek && !editing ? (
-          <span className="shrink-0 rounded-md bg-accent-soft px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-accent">
-            This week
-          </span>
-        ) : null}
-        {/* THIS WEEK star — the group-level twin of a section's master star.
-            Marks the one group agents file this week's work into (see
-            resolveThisWeekSection). Hidden on the INBOX tray: it's the OTHER
-            destination, the pile of things nobody has scheduled. */}
-        {onSetThisWeek && !systemKind ? (
-          <button
-            type="button"
-            title={
-              thisWeek
-                ? "THIS WEEK — new tasks marked “this week” are filed here (click to unset)"
-                : "Make this the THIS WEEK board — where agents file work for this week"
-            }
-            aria-label={thisWeek ? "Unset as this week's board" : "Make this the this-week board"}
-            aria-pressed={thisWeek}
-            onPointerDown={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSetThisWeek(!thisWeek);
-            }}
-            className={[
-              "shrink-0 rounded-md border px-1.5 py-1 text-sm leading-none transition-colors",
-              thisWeek
-                ? "border-accent bg-accent-soft text-accent"
-                : "border-border text-faint hover:border-accent hover:text-accent",
-            ].join(" ")}
-          >
-            {thisWeek ? "★" : "☆"}
-          </button>
-        ) : null}
         {onToggleLayout ? (
           <button
             type="button"

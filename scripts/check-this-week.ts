@@ -26,11 +26,13 @@
 import { loadEnvConfig } from "@next/env";
 loadEnvConfig(process.cwd(), true);
 
-import { eq, inArray, like, or } from "drizzle-orm";
+import { eq, inArray, or } from "drizzle-orm";
 import { db } from "../src/lib/db/client";
-import { canvasNodes, tasks, users } from "../src/lib/db/schema";
+import { boards, canvasNodes, tasks, users } from "../src/lib/db/schema";
 import {
   createTask,
+  createBoard,
+  deleteBoard,
   updateTask,
   moveTask,
   bulkUpdate,
@@ -39,15 +41,17 @@ import {
   resolvePlacementSection,
   getCanvas,
   listCanvases,
+  listPlacementSections,
 } from "../src/lib/db/service";
 import {
-  boardsNeedingWeekLane,
+  boardsNeedingInbox,
   boardsFiledInSystemGroup,
+  buildSectionMembership,
   deletionOf,
-  thisWeekGroupId,
-  weekLaneId,
   systemLaneId,
-  isThisWeekGroup,
+  systemGroupId,
+  systemGroupOf,
+  placementOfDerivedId,
 } from "../src/lib/sections";
 import { withLogContext, type LogSource } from "../src/lib/db/log-context";
 import type { CanvasNode, Task } from "../src/lib/types";
@@ -59,8 +63,11 @@ const TITLE = "[check:this-week] scratch — safe to delete";
  *  The "!" also makes them sort FIRST: `resolvePlacementSection` breaks a
  *  multi-group tie on the lowest id, so this guarantees the scratch group wins
  *  over any real one that happens to carry the same flag. */
-const GROUP_ID = "!check-tw-group";
 const LANE_ID = "!check-tw-lane";
+
+/** The throwaway board created for the "not covered yet" case — module-level so
+ *  cleanup can reach it. */
+let SCRATCH_BOARD = "";
 /** Second scratch group, for the BACKLOG/LATER/DONE THIS WEEK trays. */
 const SYS_GROUP_ID = "!check-pl-group";
 const SYS_LANE_ID = "!check-pl-lane";
@@ -123,51 +130,128 @@ async function main() {
   if (!full) throw new Error("no canvas");
   const nodes = full.nodes as CanvasNode[];
 
-  // Two real boards: one our group will have a section for, one it won't.
-  const boardIds = [
-    ...new Set(nodes.map((n) => n.data?.boardId as string | undefined)),
-  ].filter((b): b is string => !!b);
-  if (boardIds.length < 2) throw new Error("need two boards represented on the canvas");
-  const [coveredBoard, uncoveredBoard] = boardIds;
+  // Two real boards OF THIS CANVAS'S PROJECT: one our group will have a section
+  // for, one it won't.
+  //
+  // The project filter matters since TD-136. A canvas may legitimately show a
+  // section bound to another project's board (hand-bound sections stay legal),
+  // but a task on that board resolves its placement against ITS OWN project's
+  // canvas — so picking one here would have the test set nodes up on canvas A
+  // and assert about ids derived from canvas B.
+  const ownBoards = new Set(
+    (await db
+      .select({ id: boards.id })
+      .from(boards)
+      .where(eq(boards.projectId, canvas.projectId))).map((b) => b.id),
+  );
+  // THIS WEEK is the real, machine-owned group (TD-137), so the test can no
+  // longer invent a starred one of its own — it plants a single scratch LANE
+  // inside the real group instead.
+  //
+  // Since TD-138 every tray holds a lane for every board, so a board with NO
+  // lane no longer exists to pick. The scratch lane is given an explicitly low
+  // `position` so "an existing member wins" is decided by the documented
+  // ORDER BY position, id rather than by a tie-break — which is the rule under
+  // test, not an accident of which board sorts first.
+  const WEEK_GROUP = systemGroupId("thisWeek", canvas.id);
+  const [coveredBoard] = [...ownBoards];
+  if (!coveredBoard) throw new Error("this canvas's project has no boards");
+
+  // A THROWAWAY board for the "not covered yet" half.
+  //
+  // Since TD-138 every tray holds a lane for every board of the project, so no
+  // real board is ever uncovered — picking one would only ever test the
+  // "existing member wins" path twice. A board the canvas has not reconciled
+  // yet is the honest way to exercise the derived-lane fallback, which is what
+  // lets the SERVER pin to a node that doesn't exist yet. Deleted in cleanup.
+  const scratchBoard = await createBoard(ME, canvas.projectId, "[check] scratch");
+  if (!scratchBoard) throw new Error("could not create the scratch board");
+  SCRATCH_BOARD = scratchBoard.id;
+  const uncoveredBoard = SCRATCH_BOARD;
 
   console.log(`Canvas “${canvas.name}” (${canvas.id})`);
   console.log(`  covered board   ${coveredBoard} → our lane ${LANE_ID}`);
   console.log(`  uncovered board ${uncoveredBoard}\n`);
 
-  /* ---- 0. Nothing flagged: everything stays in INBOX -------------------
-   * Only meaningful on a database where nobody has starred a group yet — the
-   * resolver is deliberately global, so a real flagged group anywhere makes
-   * "nothing is flagged" untestable rather than false. Skipped, loudly, instead
-   * of reported as a failure. */
-  const alreadyFlagged = (await resolveThisWeekSection(coveredBoard)) !== null;
-  if (alreadyFlagged) {
-    console.log("  – skipped: this database already has a starred THIS WEEK group\n");
-  } else {
-    check("no flagged group: resolveThisWeekSection returns null", true);
+  /* ---- 0. THIS WEEK resolves like any other tray (TD-137) --------------
+   * It used to be the one placement that could silently do nothing: the group
+   * was HAND-MADE, so with nothing starred there was no id to find, the resolver
+   * returned null — which IS INBOX — and filing onto THIS WEEK did nothing from
+   * every surface. The group is machine-owned now, with a derived id like every
+   * other tray, so "nobody made one yet" is no longer a state that exists.
+   *
+   * Asserted on the BUCKET the id reads as, not the exact id: what must never
+   * happen again is `null`. Read the bucket the way the app does — placement map
+   * first, derived id second (`placementOfTask`) — because when the group already
+   * HAS a lane for this board the resolver returns that lane's real id, which is
+   * the documented preference ("an EXISTING member section always wins"). */
+  const bucketOf = async (sectionId: string | null) => {
+    if (sectionId === null) return null;
+    const map = await listPlacementSections(canvas.projectId);
+    return map[sectionId] ?? placementOfDerivedId(sectionId);
+  };
+  {
+    const got = await resolveThisWeekSection(coveredBoard);
+    check("THIS WEEK resolves to a lane, never null", got !== null, `got ${got}`);
+    check(
+      "…and that lane reads back as the THIS WEEK bucket",
+      (await bucketOf(got)) === "thisWeek",
+      `got ${got}`,
+    );
     const id = await mk({ boardId: coveredBoard, thisWeek: true });
-    check("no flagged group: thisWeek:true still leaves the task unpinned", (await pinOf(id)) === null);
+    const pin = await pinOf(id);
+    check(
+      "thisWeek:true pins the task",
+      (await bucketOf(pin)) === "thisWeek",
+      `got ${pin}`,
+    );
   }
 
-  /* ---- Our own flagged group + one member section ---------------------- */
-  await db.insert(canvasNodes).values([
-    {
-      id: GROUP_ID,
-      userId: ME,
-      canvasId: canvas.id,
+  /* ---- The group is an ordinary system group --------------------------- */
+  {
+    const groupNode: CanvasNode = {
+      ...stubSection(WEEK_GROUP, { thisWeek: true }),
       kind: "section_group",
-      content: "[check:this-week] group",
-      data: { thisWeek: true, layout: "portrait" },
-    },
+    };
+    check(
+      "systemGroupOf classifies the THIS WEEK group like any other tray",
+      systemGroupOf(groupNode) === "thisWeek",
+    );
+    check(
+      "its id is derived from the canvas, not random",
+      WEEK_GROUP === `thisWeek-${canvas.id}`,
+    );
+    check(
+      "…and a lane's id is derived too",
+      systemLaneId("thisWeek", canvas.id, coveredBoard) ===
+        `thisWeek-${canvas.id}-${coveredBoard}`,
+    );
+    check(
+      "the group id and its 'no board' lane id never collide",
+      WEEK_GROUP !== systemLaneId("thisWeek", canvas.id, null),
+    );
+    // The legacy shape still BUCKETS, so old pins keep reading as THIS WEEK
+    // until `repair:week-lane-ids` rewrites them.
+    check(
+      "a legacy wk- pin still reads as the THIS WEEK bucket",
+      placementOfDerivedId(`wk-${WEEK_GROUP}-${coveredBoard}`) === "thisWeek",
+    );
+  }
+
+  /* ---- Our own member section, inside the REAL group ------------------- */
+  await db.insert(canvasNodes).values([
     {
       id: LANE_ID,
       userId: ME,
       canvasId: canvas.id,
       kind: "section",
       content: "[check:this-week] lane",
-      data: { groupId: GROUP_ID, boardId: coveredBoard },
+      // Sorts ahead of any machine lane for the same board — see above.
+      position: -1,
+      data: { groupId: WEEK_GROUP, boardId: coveredBoard },
     },
   ]);
-  console.log("Created a throwaway THIS WEEK group + lane.\n");
+  console.log("Created a throwaway lane inside the THIS WEEK group.\n");
 
   /* ---- 1. Resolution --------------------------------------------------- */
   check(
@@ -177,53 +261,53 @@ async function main() {
   );
   check(
     "a board it doesn't cover resolves to the DERIVED lane id",
-    (await resolveThisWeekSection(uncoveredBoard)) === weekLaneId(GROUP_ID, uncoveredBoard),
+    (await resolveThisWeekSection(uncoveredBoard)) ===
+      systemLaneId("thisWeek", canvas.id, uncoveredBoard),
     `got ${await resolveThisWeekSection(uncoveredBoard)}`,
   );
-  check(
-    "a board-less task resolves to the derived 'noboard' lane",
-    (await resolveThisWeekSection(null)) === weekLaneId(GROUP_ID, null),
-  );
+  {
+    // No board means the PROJECT is the only thing naming a canvas (TD-136).
+    const got = await resolveThisWeekSection(null, canvas.projectId);
+    // Either the derived lane, or an existing board-less member of the group —
+    // "an EXISTING member section always wins" applies to the No-board lane too,
+    // and a canvas carrying a legacy `wk-…-noboard` node still has one until the
+    // reconciler sweeps it (TD-137).
+    const existingNoBoard = nodes.some(
+      (n) =>
+        n.id === got &&
+        n.kind === "section" &&
+        n.data?.groupId === WEEK_GROUP &&
+        !n.data?.boardId,
+    );
+    check(
+      "a board-less task resolves to the group's 'noboard' lane",
+      got === systemLaneId("thisWeek", canvas.id, null) || existingNoBoard,
+      `got ${got}`,
+    );
+  }
 
   /* ---- 2. The client half: which lanes need materialising -------------- */
   {
-    const groupNode: CanvasNode = {
-      ...stubSection(GROUP_ID, { thisWeek: true }),
-      kind: "section_group",
-    };
-    const scene = [...nodes, groupNode, stubSection(LANE_ID, { groupId: GROUP_ID, boardId: coveredBoard })];
-    check("thisWeekGroupId finds the flagged group", thisWeekGroupId(scene) === GROUP_ID);
-    // Not "exactly one is flagged": the scene includes the REAL canvas, which may
-    // already have a starred group. What must hold is that the predicate keys off
-    // the flag and the kind — a lane inside the group is never itself the group.
-    check("isThisWeekGroup is true for the group", isThisWeekGroup(groupNode));
-    check(
-      "isThisWeekGroup is false for its member lane",
-      !isThisWeekGroup(stubSection(LANE_ID, { groupId: GROUP_ID, thisWeek: true })),
-    );
-
-    const pinned = weekLaneId(GROUP_ID, uncoveredBoard);
+    const pinned = systemLaneId("thisWeek", canvas.id, uncoveredBoard);
     const task = { id: "t1", parentId: null, boardId: uncoveredBoard };
     const map = { t1: { canvasSectionId: pinned } as Task };
-    const needed = boardsNeedingWeekLane(scene, [task], map);
+
+    // Demand comes from the same helper the other trays use now — one fewer
+    // code path, and the reconciler treats THIS WEEK exactly like BACKLOG.
+    const needed = boardsFiledInSystemGroup("thisWeek", canvas.id, [task], map);
     check(
-      "boardsNeedingWeekLane asks for exactly the lane the server pinned to",
+      "boardsFiledInSystemGroup asks for exactly the lane the server pinned to",
       needed.size === 1 && needed.has(uncoveredBoard),
       `got ${JSON.stringify([...needed])}`,
     );
     check(
-      "…and stops asking once that lane exists",
-      boardsNeedingWeekLane([...scene, stubSection(pinned, { groupId: GROUP_ID })], [task], map).size === 0,
-    );
-    check(
-      "a pin to an existing section is never mistaken for a pending lane",
-      boardsNeedingWeekLane(scene, [{ id: "t2", parentId: null, boardId: coveredBoard }], {
-        t2: { canvasSectionId: LANE_ID } as Task,
-      }).size === 0,
-    );
-    check(
-      "no flagged group ⇒ nothing to materialise",
-      boardsNeedingWeekLane(nodes, [task], map).size === 0,
+      "a pin to an existing hand-made section is not demand for a derived lane",
+      boardsFiledInSystemGroup(
+        "thisWeek",
+        canvas.id,
+        [{ id: "t2", parentId: null, boardId: coveredBoard }],
+        { t2: { canvasSectionId: LANE_ID } as Task },
+      ).size === 0,
     );
   }
 
@@ -236,7 +320,7 @@ async function main() {
     const id = await mk({ boardId: uncoveredBoard, thisWeek: true });
     check(
       "createTask thisWeek:true on an uncovered board → derived lane",
-      (await pinOf(id)) === weekLaneId(GROUP_ID, uncoveredBoard),
+      (await pinOf(id)) === systemLaneId("thisWeek", canvas.id, uncoveredBoard),
     );
   }
   {
@@ -314,7 +398,8 @@ async function main() {
     await as("mcp", () => bulkUpdate(ME, [a, b], { thisWeek: true }, AUTHOR));
     check(
       "bulkUpdate thisWeek:true resolves each task's OWN board",
-      (await pinOf(a)) === LANE_ID && (await pinOf(b)) === weekLaneId(GROUP_ID, uncoveredBoard),
+      (await pinOf(a)) === LANE_ID &&
+        (await pinOf(b)) === systemLaneId("thisWeek", canvas.id, uncoveredBoard),
       `a=${await pinOf(a)} b=${await pinOf(b)}`,
     );
     await as("mcp", () => bulkUpdate(ME, [a, b], { thisWeek: false }, AUTHOR));
@@ -364,10 +449,29 @@ async function main() {
       systemLaneId("backlog", canvas.id, uncoveredBoard),
     `got ${await resolvePlacementSection("backlog", uncoveredBoard)}`,
   );
-  check(
-    "each flag finds its OWN group — nothing is flagged 'later'",
-    (await resolvePlacementSection("later", coveredBoard)) === null,
-  );
+  // Nothing here is flagged 'later', so this must NOT hand back the backlog
+  // group's lane — each flag finds its own group. What it does hand back is the
+  // derived LATER lane: a system tray's ids are computed from the canvas, so the
+  // server can name the lane the reconciler will draw and the card lands in the
+  // right tray as soon as the canvas opens. (Before that fallback existed this
+  // returned null, and filing into a tray the canvas hadn't drawn yet silently
+  // did nothing — which is what made a brand-new tray like TODAY unusable.)
+  {
+    const got = await resolvePlacementSection("later", coveredBoard);
+    check(
+      "each flag finds its OWN group — 'later' never resolves to the backlog lane",
+      got !== SYS_LANE_ID && got !== SYS_GROUP_ID,
+      `got ${got}`,
+    );
+    // Which canvas hosts the derived lane depends on the data (see
+    // `trayCanvasId`), so assert the KIND rather than the exact id — that's the
+    // part the reconciler reads to put the card in the right tray.
+    check(
+      "…and an unflagged tray resolves to a canvas-derived LATER lane",
+      got !== null && placementOfDerivedId(got) === "later",
+      `got ${got}`,
+    );
+  }
   check(
     "placement 'inbox' means unpinned, not a lane",
     (await resolvePlacementSection("inbox", coveredBoard)) === null,
@@ -415,6 +519,94 @@ async function main() {
     );
   }
 
+  /* ---- 7b. Each project resolves to ITS OWN canvas (TD-136) ------------ */
+  // The regression this whole change exists for. Before it, `resolvePlacementSection`
+  // scanned `section_group` nodes across EVERY canvas and took `groups[0]` ordered
+  // by node id, so a task's placement landed on whichever canvas id sorted first —
+  // deterministic, and unrelated to the task's project.
+  {
+    /** Which canvas a resolved section lives on. Three shapes:
+     *   • a real node — it says so directly;
+     *   • a system tray's derived lane (`<kind>-<canvasId>-<boardId>`) — the
+     *     canvas id is in the middle;
+     *   • a THIS WEEK lane of a HAND-MADE group (`wk-<groupId>-<boardId>`) —
+     *     the group's id is random, so only the group node knows the canvas. */
+    const canvasOf = async (sectionId: string): Promise<string | null> => {
+      const [row] = await db
+        .select({ canvasId: canvasNodes.canvasId })
+        .from(canvasNodes)
+        .where(eq(canvasNodes.id, sectionId))
+        .limit(1);
+      if (row) return row.canvasId;
+      const all = await listCanvases();
+      const byId = all.find((c) => sectionId.includes(c.id));
+      if (byId) return byId.id;
+      if (!sectionId.startsWith("wk-")) return null;
+      const groups = await db
+        .select({ id: canvasNodes.id, canvasId: canvasNodes.canvasId })
+        .from(canvasNodes)
+        .where(eq(canvasNodes.kind, "section_group"));
+      return (
+        groups.find((g) => sectionId.startsWith(`wk-${g.id}-`))?.canvasId ?? null
+      );
+    };
+
+    // Two projects that each have a canvas AND a board to file onto.
+    const allCanvases = await listCanvases();
+    const pairs: { projectId: string; canvasId: string; boardId: string }[] = [];
+    for (const c of allCanvases) {
+      const [b] = await db
+        .select({ id: boards.id })
+        .from(boards)
+        .where(eq(boards.projectId, c.projectId))
+        .limit(1);
+      if (b) pairs.push({ projectId: c.projectId, canvasId: c.id, boardId: b.id });
+    }
+    check(
+      "at least two projects have a canvas and a board (else this proves nothing)",
+      pairs.length >= 2,
+      `got ${pairs.length}`,
+    );
+
+    if (pairs.length >= 2) {
+      for (const bucket of ["backlog", "later", "thisWeek"] as const) {
+        const landed = await Promise.all(
+          pairs.map(async (p) => {
+            const section = await resolvePlacementSection(bucket, p.boardId);
+            return {
+              ...p,
+              section,
+              on: section ? await canvasOf(section) : null,
+            };
+          }),
+        );
+        check(
+          `placement '${bucket}' resolves onto each board's OWN project canvas`,
+          landed.every((l) => l.section !== null && l.on === l.canvasId),
+          landed
+            .map((l) => `${l.boardId.slice(0, 8)} sec=${l.section} on=${l.on} want=${l.canvasId}`)
+            .join("; "),
+        );
+        check(
+          `…and two projects never share a '${bucket}' destination`,
+          new Set(landed.map((l) => l.section)).size === landed.length,
+        );
+      }
+
+      // The end-to-end version: a real task, created through the mutator.
+      const other = pairs.find((p) => p.canvasId !== canvas.id);
+      if (other) {
+        const id = await mk({ boardId: other.boardId, placement: "backlog" });
+        const pin = await pinOf(id);
+        check(
+          "a task on another project's board is pinned on THAT project's canvas",
+          pin !== null && (await canvasOf(pin)) === other.canvasId,
+          `pin=${pin} want canvas ${other.canvasId}`,
+        );
+      }
+    }
+  }
+
   /* ---- 8. The two-step exit for finished work -------------------------- */
   check("DELETE on a not-done card deletes it", deletionOf("building", null) === "delete");
   check("DELETE on a done card parks it", deletionOf("done", null) === "park");
@@ -430,6 +622,54 @@ async function main() {
     "parking is not triggered from the other trays",
     deletionOf("done", "backlog") === "park" && deletionOf("building", "later") === "delete",
   );
+
+  /* ---- 8b. …and the canvas variant, which has no tray to park in -------- */
+  // The canvas stopped drawing DONE THIS WEEK (TD-87), so `canPark:false` is what
+  // WorkspaceContext passes whenever a canvas is mounted. Same two steps, one
+  // fewer place to go: a done card stays in its board's lane until DELETE
+  // archives it, and accepting a REVIEW card just marks it done in place.
+  check(
+    "with no tray, DELETE on a done card archives instead of parking",
+    deletionOf("done", null, { canPark: false }) === "archive",
+  );
+  check(
+    "with no tray, a REVIEW card is still accepted rather than archived",
+    deletionOf("review", null, { canPark: false }) === "complete",
+  );
+  check(
+    "with no tray, a not-done card still just deletes",
+    deletionOf("building", null, { canPark: false }) === "delete",
+  );
+  check(
+    "canPark:true is the default — the board views are untouched",
+    deletionOf("done", null, { canPark: true }) === "park" &&
+      deletionOf("done", null) === "park",
+  );
+
+  /* ---- 8c. A DONE THIS WEEK pin is off-canvas, never INBOX ------------- */
+  // Without this the missing lane reads as "unplaced", and the INBOX reconciler
+  // draws a lane to hold it — finished work coming back as untriaged.
+  {
+    const parked = systemLaneId("doneThisWeek", canvas.id, coveredBoard);
+    const tasks = [{ id: "d1", parentId: null, boardId: coveredBoard }];
+    const map = { d1: { canvasSectionId: parked } as Task };
+    const { unplaced, bySection } = buildSectionMembership([], tasks, map);
+    check(
+      "a doneThisWeek pin renders in no section and is NOT unplaced",
+      unplaced.size === 0 && bySection.size === 0,
+      `unplaced=${unplaced.size} sections=${bySection.size}`,
+    );
+    check(
+      "…so no INBOX lane is built to hold it",
+      boardsNeedingInbox([], tasks, map).size === 0,
+    );
+    // The contrast case: an ordinary unresolvable pin still falls back to INBOX.
+    const strayMap = { d1: { canvasSectionId: systemLaneId("backlog", canvas.id, coveredBoard) } as Task };
+    check(
+      "…while a BACKLOG pin with no lane still falls through to INBOX",
+      boardsNeedingInbox([], tasks, strayMap).size === 1,
+    );
+  }
 
   /* ---- 9. The move is explicable on the timeline ----------------------- */
   {
@@ -458,8 +698,7 @@ async function cleanup() {
     .delete(canvasNodes)
     .where(
       or(
-        inArray(canvasNodes.id, [GROUP_ID, LANE_ID, SYS_GROUP_ID, SYS_LANE_ID]),
-        like(canvasNodes.id, `${weekLaneId(GROUP_ID, null).slice(0, -"noboard".length)}%`),
+        inArray(canvasNodes.id, [LANE_ID, SYS_GROUP_ID, SYS_LANE_ID]),
       ),
     )
     .returning({ id: canvasNodes.id });
@@ -469,6 +708,12 @@ async function cleanup() {
     } catch {
       /* best effort */
     }
+  }
+  if (SCRATCH_BOARD) {
+    // Not inside a bare try/catch that could swallow a scoping mistake: a board
+    // that silently survives cleanup pollutes the sidebar on every run.
+    const gone = await deleteBoard(ME, SCRATCH_BOARD);
+    if (!gone) console.warn(`  ! scratch board ${SCRATCH_BOARD} not deleted`);
   }
   console.log(
     `\nRemoved ${gone.length} throwaway node(s); cleaned up ${scratch.length} scratch task(s).`,

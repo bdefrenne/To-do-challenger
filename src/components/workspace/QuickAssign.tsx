@@ -162,7 +162,7 @@ export function QuickAssign({
       ) : (
         <button
           type="button"
-          title="Assign (press A while hovering the card)"
+          title="Assign (press A while hovering the card — SPACE assigns yourself)"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={toggleOpen}
           className={[

@@ -27,6 +27,23 @@ export interface LogContext {
   actorId: string;
   /** Which surface produced the request. */
   source: LogSource;
+  /**
+   * The WORKING DAY (`YYYY-MM-DD`) any status event written in this request
+   * should be credited to, when that isn't the day the write happens on.
+   *
+   * Absent in every ordinary request — the day is then derived from the event's
+   * own timestamp, which is right. Set only by the work-day close-out, which is
+   * reconciling a day that has already ended: a task nobody ticked off, or work
+   * that never reached the board at all (a phone call written up the next
+   * morning). One field on the context stamps every event the flow writes,
+   * including the create-and-complete of a retro-logged task.
+   *
+   * Rides here for the same reason `source` does: it's a per-request fact that
+   * several mutators need, and threading it through their signatures would put
+   * a `workedOn` parameter on functions that have no business knowing about
+   * work days.
+   */
+  workedOn?: string;
 }
 
 const store = new AsyncLocalStorage<LogContext>();
@@ -34,6 +51,14 @@ const store = new AsyncLocalStorage<LogContext>();
 /** Run `fn` with the given actor/source stamped onto any activity logged inside. */
 export function withLogContext<T>(ctx: LogContext, fn: () => T): T {
   return store.run(ctx, fn);
+}
+
+/** Run `fn` with every status event it writes credited to working day `day`,
+ *  keeping the surrounding actor/source. Used by the work-day close-out; a
+ *  no-op outside a request, where there is no context to extend. */
+export function withWorkedOn<T>(day: string, fn: () => T): T {
+  const ctx = store.getStore();
+  return ctx ? store.run({ ...ctx, workedOn: day }, fn) : fn();
 }
 
 /** The active request's actor/source, or undefined outside a request. */

@@ -13,6 +13,8 @@ import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip } from "@/components/ui/Badge";
 import { PersonAvatar } from "@/components/PersonAvatar";
 import { usePeople } from "@/components/PeopleContext";
+import { lockedCode } from "@/lib/refs";
+import { analyzePrompt, analyzeThenWorkPrompt, workPrompt } from "@/lib/prompts";
 import { formatTime, formatShortDate, formatDue } from "@/lib/format";
 import { STATUS_LABEL, RECURRENCE_LABEL } from "@/lib/statuses";
 import { IMPORTANCE_ORDER, IMPORTANCE_LABEL } from "@/lib/importance";
@@ -100,7 +102,7 @@ function TaskDetailLevel({
     toggleDone,
     childrenOf,
     addComment,
-    taskPrompt,
+    lockTask,
     addAttachment,
     removeAttachment,
     editTask,
@@ -109,7 +111,7 @@ function TaskDetailLevel({
     projects,
     openProjectSettings,
   } = useWorkspace();
-  const { resolveById } = usePeople();
+  const { resolveById, me } = usePeople();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -118,8 +120,9 @@ function TaskDetailLevel({
   // in the lightbox). One index drives both, so selecting persists across open/close.
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-  // Copy buttons: which one just copied (shows "✓ Copied"), and which is
-  // awaiting a server round-trip (shows a spinner). Keys: link/analyze/work/both.
+  // Copy buttons: which one just copied (flashes "✓ Copied" on that button),
+  // and which fired a lock that hasn't landed yet — that shows as a spinner in
+  // the code badge, never on the button. Keys: share/analyze/both/work.
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   // Inline "add subtask" composer.
@@ -143,6 +146,12 @@ function TaskDetailLevel({
   // Keyboard: Escape closes the lightbox (if open) else this modal; when the
   // lightbox is open, ←/→ step the featured image. Only the topmost level
   // listens, so Escape pops one level at a time instead of collapsing the stack.
+  //
+  // "D" toggles done — the modal's only affordance for it, since there's no
+  // button. Same contract as the card shortcut (`useTaskCardShortcuts`): not
+  // done → done through the /complete path so it's credited to today; done →
+  // building, which clears completedAt. Skipped while a text field has focus,
+  // where "d" is a literal character.
   useEffect(() => {
     if (!isTop) return;
     const count = (taskMap[taskId]?.attachments ?? []).length;
@@ -160,11 +169,21 @@ function TaskDetailLevel({
         }
         return;
       }
-      if (e.key === "Escape") closeTask();
+      if (e.key === "Escape") return closeTask();
+      if (e.key.toLowerCase() !== "d" || e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = document.activeElement;
+      if (
+        el instanceof HTMLElement &&
+        (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)
+      )
+        return;
+      e.preventDefault();
+      if (taskMap[taskId]?.status === "done") setStatus(taskId, "building");
+      else toggleDone(taskId);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [isTop, taskId, closeTask, lightboxOpen, taskMap]);
+  }, [isTop, taskId, closeTask, lightboxOpen, taskMap, setStatus, toggleDone]);
 
   // Paste an image anywhere while the topmost modal is open (Ctrl/⌘+V).
   useEffect(() => {
@@ -349,22 +368,29 @@ function TaskDetailLevel({
 
   const lightboxItem = lightboxOpen ? featured : null;
 
-  // Produce a string (sync or via the server) and copy it, flashing "✓ Copied"
-  // on the matching button. Guards against overlapping clicks.
-  const runCopy = async (key: string, produce: () => string | Promise<string>) => {
-    if (busyKey) return;
+  // Copy, right now. The handoff prompts are built here from the same builders
+  // the API uses (`lib/prompts`), so nothing waits on the network: the clipboard
+  // fills on the click itself and the button flashes "✓ Copied" straight away.
+  //
+  // The handoff's side effect — freeze the code, assign the task to me — is
+  // fired and forgotten. It's idempotent and never renumbers, so the prompt just
+  // copied already cites the code the lock will freeze. Its only visible trace
+  // is a spinner in the code badge; no button ever goes disabled for it.
+  const copyText = (key: string, text: string, { lock = false } = {}) => {
+    navigator.clipboard
+      ?.writeText(text)
+      .catch((e) => console.error("[modal] copy failed", key, e));
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 2000);
+    if (!lock) return;
     setBusyKey(key);
-    try {
-      const text = await produce();
-      await navigator.clipboard?.writeText(text);
-      setCopiedKey(key);
-      setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 2000);
-    } catch (e) {
-      console.error("[modal] copy failed", key, e);
-    } finally {
-      setBusyKey(null);
-    }
+    lockTask(taskId)
+      .catch((e) => console.error("[modal] lock failed", key, e))
+      .finally(() => setBusyKey((k) => (k === key ? null : k)));
   };
+
+  // The code every handoff prompt cites: the locked form of what's on screen.
+  const promptCode = lockedCode(task.code ?? task.ref ?? taskId);
 
   // The "task link & info" block: code + title, status, full description, and a
   // deep link that reopens this task (?tasks=<id>, see WorkspaceContext).
@@ -375,8 +401,10 @@ function TaskDetailLevel({
         : "";
     const codeStr = task.code ?? task.ref ?? "";
     const header = codeStr ? `${codeStr} — ${task.title}` : task.title;
-    const body = task.description?.trim() || "(no description)";
-    return `${header}\nStatus: ${STATUS_LABEL[node.status]}\n\n${body}\n\n${url}`;
+    const body = task.description?.trim();
+    return [`${header}\nStatus: ${STATUS_LABEL[node.status]}`, body, url]
+      .filter(Boolean)
+      .join("\n\n");
   };
 
   return (
@@ -399,57 +427,73 @@ function TaskDetailLevel({
           {/* Top row: id/phase left · workflow + copy + close right */}
           <div className="flex items-center justify-between gap-4">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-              {task.code ? (
+              {task.code || busyKey ? (
                 <span
-                  className="rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] font-medium text-muted"
-                  title={task.refLocked ? "Locked code" : "Soft code — not locked yet"}
+                  className="flex items-center gap-1 rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] font-medium text-muted"
+                  title={
+                    busyKey
+                      ? "Locking the code…"
+                      : task.refLocked
+                        ? "Locked code"
+                        : "Soft code — not locked yet"
+                  }
                 >
                   {task.code}
+                  {/* A handoff copy fires an idempotent lock in the background —
+                   *  the wait shows here, on the thing that's actually changing
+                   *  (the soft `*` drops off), never on the button. */}
+                  {busyKey ? (
+                    <span
+                      className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-muted/30 border-t-muted"
+                      aria-hidden
+                    />
+                  ) : null}
+                </span>
+              ) : null}
+              {done ? (
+                <span className="rounded-md border border-buff/25 bg-buff-soft px-1.5 py-0.5 font-mono text-[11px] font-semibold text-buff">
+                  DONE
                 </span>
               ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <Button
-                variant={done ? "success" : "primary"}
-                size="sm"
-                onClick={() => toggleDone(taskId)}
-              >
-                {done ? "✓ Done" : "Mark done"}
-              </Button>
               <CopyButton
-                label="🔗 Link"
-                title="Copy the task's link + info (code, title, status, description)"
-                busy={busyKey === "link"}
-                copied={copiedKey === "link"}
-                onClick={() => runCopy("link", buildInfo)}
+                label="📤 Share"
+                title="Copy the task to share it: code, title, status, description + a link back here"
+                copied={copiedKey === "share"}
+                onClick={() => copyText("share", buildInfo())}
               />
               <CopyButton
                 label="🔍 Analyze"
-                title="Copy a prompt to analyze this task (locks the code)"
-                busy={busyKey === "analyze"}
+                title="Think it through with me — don't build (locks the code)"
                 copied={copiedKey === "analyze"}
-                onClick={() => runCopy("analyze", () => taskPrompt(taskId, "analyze"))}
+                onClick={() =>
+                  copyText("analyze", analyzePrompt(promptCode, task.title, me?.language), {
+                    lock: true,
+                  })
+                }
               />
               <CopyButton
-                label="📋 Plan"
-                title="Copy a prompt to write the technical plan (needs an analysis first)"
-                busy={busyKey === "plan"}
-                copied={copiedKey === "plan"}
-                onClick={() => runCopy("plan", () => taskPrompt(taskId, "plan"))}
-              />
-              <CopyButton
-                label="🔨 Work"
-                title="Lock the code and copy a ready-to-paste work prompt"
-                busy={busyKey === "work"}
-                copied={copiedKey === "work"}
-                onClick={() => runCopy("work", () => taskPrompt(taskId, "work"))}
-              />
-              <CopyButton
-                label="🔍→🔨 Both"
-                title="Lock the code and copy an analyze-then-work prompt"
-                busy={busyKey === "both"}
+                label="🔍→🔨 Analyze → Build"
+                title="Investigate first, tell me what you suggest, then build once I say go (locks the code)"
                 copied={copiedKey === "both"}
-                onClick={() => runCopy("both", () => taskPrompt(taskId, "analyze-work"))}
+                onClick={() =>
+                  copyText(
+                    "both",
+                    analyzeThenWorkPrompt(promptCode, task.title, me?.language),
+                    { lock: true },
+                  )
+                }
+              />
+              <CopyButton
+                label="🔨 Build"
+                title="Go ahead and build it now — no check-in before implementing (locks the code)"
+                copied={copiedKey === "work"}
+                onClick={() =>
+                  copyText("work", workPrompt(promptCode, task.title, me?.language), {
+                    lock: true,
+                  })
+                }
               />
               <button
                 onClick={closeTask}
@@ -494,7 +538,7 @@ function TaskDetailLevel({
             <h2
               onDoubleClick={startEditTitle}
               title="Double-click to edit"
-              className="text-lg font-semibold tracking-tight"
+              className={`text-lg font-semibold tracking-tight ${done ? "text-buff" : ""}`}
             >
               {task.title}
             </h2>
@@ -798,14 +842,13 @@ function TaskDetailLevel({
           {/* Right: meta */}
           <div className="space-y-3">
             <Meta label="Status">
+              {/* Done is a row in the list like any other, but it has to travel
+                  the /complete path so completedAt is set (and cleared on the way
+                  out) — the same split the D shortcut makes. */}
               <StatusSelect
                 status={node.status}
-                onChange={(s) => setStatus(taskId, s)}
-                disabled={done}
+                onChange={(s) => (s === "done" ? toggleDone(taskId) : setStatus(taskId, s))}
               />
-              {done ? (
-                <p className="mt-1.5 text-[11px] text-faint">Reopen to change status.</p>
-              ) : null}
             </Meta>
             <Meta label="Importance">
               <select
@@ -997,34 +1040,35 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** A compact header copy button — shows a spinner while awaiting, then flashes
- *  "✓ Copied". Sized to match the other top-row header buttons. */
+/** A compact header copy button — never disabled, never waiting: it copies on
+ *  the click, keeps its label steady, then flashes "✓ Copied". Any server work
+ *  the copy kicked off shows in the code badge instead, so the row never
+ *  reflows. Sized to match the other header buttons. */
 function CopyButton({
   label,
   title,
-  busy,
   copied,
   onClick,
 }: {
   label: string;
   title: string;
-  busy: boolean;
   copied: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       onClick={onClick}
-      disabled={busy}
       title={title}
-      className="flex items-center gap-1 rounded-md border border-accent/30 bg-accent-soft px-2 py-1 text-xs font-medium text-accent hover:bg-accent/15 disabled:opacity-70"
+      // Copied: flip to the app's green (buff) and go slightly dim + inert for
+      // the flash, so the button reads as "done, nothing more to click here".
+      disabled={copied}
+      className={
+        "flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium " +
+        (copied
+          ? "cursor-default border-buff/30 bg-buff-soft text-buff opacity-70"
+          : "border-accent/30 bg-accent-soft text-accent hover:bg-accent/15 disabled:opacity-70")
+      }
     >
-      {busy ? (
-        <span
-          className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-accent/30 border-t-accent"
-          aria-hidden
-        />
-      ) : null}
       {copied ? "✓ Copied" : label}
     </button>
   );

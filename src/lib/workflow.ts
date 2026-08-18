@@ -43,6 +43,7 @@ beyond the one rule below.
 | \`placement\` | means |
 | --- | --- |
 | \`inbox\` | untriaged — the default, and where anything unfiled shows up |
+| \`today\` | on today's shortlist — the daily counterpart to \`thisWeek\` |
 | \`thisWeek\` | to be done this week, or you're starting on it now |
 | \`backlog\` | triaged, but not scheduled |
 | \`later\` | deliberately deferred — what to pass when the user says "later" |
@@ -50,8 +51,9 @@ beyond the one rule below.
 
 Pass it to \`create_task\` / \`update_task\`. Setting the status to Analyzing or
 beyond already files a task nobody has placed by hand onto THIS WEEK, so the
-normal "create it, then start work" flow needs nothing extra. (If nobody has
-starred a THIS WEEK group on the canvas, everything just stays in INBOX.)
+normal "create it, then start work" flow needs nothing extra. Every project's
+canvas has a THIS WEEK group and the rest of the trays automatically, so filing
+always has somewhere to land.
 
 **To start**, call \`get_task\` to load the full context (description, notes,
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
@@ -124,4 +126,88 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    written; the user may want to view or visually check something first.
    \`update_task\` will refuse \`status: "done"\` for this reason — completion goes
    through \`complete_task\`.
+6. **Subtasks close first.** A parent is done when everything under it is, so
+   \`complete_task\` refuses a task with unfinished subtasks and names them. Close
+   those (each with its own confirmation), or — only if the user asked to finish
+   the whole branch — pass \`withSubtasks: true\`. The rule runs the other way too:
+   nesting unfinished work under a done task reopens it.
+`;
+
+/*
+  The WORK DAY contract — the second half of the process, on the same terms as
+  WORKFLOW above: one constant, every surface derives from it (the MCP
+  instructions, the `finish_work` prompt, and the Finish work view's copy). The
+  steps a person reads and the steps an agent follows cannot drift apart.
+
+  WORKFLOW is about one task's journey. This is about one day's record.
+*/
+export const DAY_CLOSE = `# Working days
+
+A **working day** is one person's day on one project — what to report at the
+standup. Two moments produce something; nothing else is required.
+
+**Nothing starts a day.** There is no clock-in. A day exists because there was
+work in it, and if nobody presses anything the record is still correct — the
+digest reads the event log, not the day. Both rituals below buy you an
+*artifact*, so skipping them costs you the artifact and never the data.
+
+**A working day runs 04:00 → 04:00 local**, not midnight to midnight. Finishing
+something at 01:00 is the end of a long evening, so it counts for the previous
+day. Never reason about "today" from a raw timestamp — the day a moment belongs
+to is decided in one place (\`lib/workday.ts\`) and every read agrees with it.
+
+## Ready for the day → the snapshot
+
+\`ready_for_day\` freezes what the todo looks like right now. That list is
+otherwise lost: TODAY is a mutable bucket, so by evening the morning's plan has
+been edited past recognition, and "was my list clear enough?" becomes
+unanswerable. Pressing it again overwrites — the last arrangement of the morning
+is the real commitment.
+
+It is **not** a crediting boundary. It changes no dates. That's what makes it
+safe to skip.
+
+## Finish work → the standup
+
+\`work_day\` returns everything the close-out needs; \`finish_work\` records the
+result. Walk it with the user:
+
+0. **Any earlier day left open?** \`openDays\` lists working days with their work
+   on them that were never closed out. Raise those FIRST — an unclosed day is work
+   missing from the record, and since nothing nags about it, saying so here is the
+   only thing that catches it. Offer to close them before today's.
+1. **Which of these finished?** \`candidates\` are tasks they actually touched
+   that day, still sitting in a late work status. Proposals, not conclusions —
+   each one still goes through \`complete_task\` with its own \`summary\` and its
+   own confirmation. **Never bulk-complete a day's work**; batch the *asking*,
+   never the deciding.
+2. **What did you do that isn't here?** Work that leaves no trace — a call, a
+   conversation, an errand — cannot be found by reconciling the board, so it has
+   to be asked for. \`log_past_work\` turns each one into a real task, already
+   done, credited to that day and filed into DONE THIS WEEK so it never sits in a
+   triage lane. One record for everything.
+3. **Check the dates.** Anything credited to a day other than the one it was
+   recorded on should be visible, not implied.
+4. **Write the standup.** Group the day's notes into **Progress**, **Blockers**,
+   **Questions** and **To review** (open \`review\` notes); list what shipped with
+   one-line summaries; keep \`handled\` separate from \`shipped\` — say "handled",
+   never "built"; report \`closedUnattributed\` as tasks cleared off the board,
+   never as someone's work. Pass it as \`summary\`, with any non-task points
+   ("out Thursday") as \`bullets\`. Keep it tight enough to paste into a channel.
+
+When \`drift\` is present, it's worth a line: \`doneNotPlanned\` is the day's real
+interruptions, and it's usually the most honest thing in the update.
+
+## Drafted, then sealed
+
+\`finish_work\` leaves the day **drafted** — written up, and still correctable.
+That matters because the standup itself is where the day gets reviewed: things
+get split, something turns out to have been finished. All of that still lands on
+that day.
+
+A day **seals itself** once a later day is drafted. Nothing to press. So
+yesterday stays open through the standup and shuts the moment today is finished.
+Past that, late work is credited to the current day and *labelled* as clearing
+older work — never back-filled into a standup that has already been presented.
+\`finish_work\` refuses a sealed day for that reason.
 `;

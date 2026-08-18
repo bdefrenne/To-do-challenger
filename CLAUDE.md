@@ -34,8 +34,10 @@ Answer those against the MCP, not the source. Useful tools: `list_projects`,
 instructions when creating or modifying anything.
 
 **Todo mapping.** When creating a task here (per the global "always work from
-the todo" rule), file it under the **To Do Challenger** project → **To Do**
-board (`TD`).
+the todo" rule), file it under the **RYDR** project → **TO DO** board (`TD2`).
+(It used to be the *To Do Challenger* project → *To Do* board `TD`; older tasks
+still carry `TD-*` refs. Ben moved it 2026-08-18 so this work sits with the rest
+of the RYDR board set.)
 
 ## Commands
 

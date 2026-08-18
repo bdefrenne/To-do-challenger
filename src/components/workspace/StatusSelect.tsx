@@ -3,13 +3,10 @@
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 
-/** The in-flight statuses, shown as an always-visible vertical pick list.
- *  "done" is intentionally excluded — completion is driven by the Finished
- *  button so `completedAt` stays managed. */
-const PICKABLE = STATUS_ORDER.filter((s) => s !== "done");
-
-/** Vertical status selector: every in-flight status is visible at once, the
- *  current one highlighted; click one to switch. */
+/** Vertical status selector: every status is visible at once — Done included,
+ *  since the modal has no separate done button — the current one highlighted;
+ *  click one to switch. Picking Done is the caller's job to route through the
+ *  /complete path (see the modal) so `completedAt` stays managed. */
 export function StatusSelect({
   status,
   onChange,
@@ -21,7 +18,7 @@ export function StatusSelect({
 }) {
   return (
     <div className="space-y-1">
-      {PICKABLE.map((s) => {
+      {STATUS_ORDER.map((s) => {
         const t = STATUS_TONE[s];
         const current = s === status;
         return (

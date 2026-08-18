@@ -52,6 +52,9 @@ export default function CanvasPage() {
   const [canvas, setCanvas] = useState<Canvas | null>(null);
   const [missing, setMissing] = useState(false);
   const [name, setName] = useState("");
+  // Which project this canvas lays out. CanvasEditor scopes its reconcilers to
+  // it, so the canvas only auto-draws lanes for its own project's boards.
+  const [projectId, setProjectId] = useState<string | null>(null);
   const nameTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // TD-59: show only this assignee's cards, across every group on the canvas.
   // Local UI state only — see CanvasEditor's `filterAssigneeId` prop doc for
@@ -67,6 +70,7 @@ export default function CanvasPage() {
         const { canvas } = await res.json();
         setCanvas(canvas);
         setName(canvas.name);
+        setProjectId(canvas.projectId);
       } else {
         setMissing(true);
       }
@@ -104,7 +108,12 @@ export default function CanvasPage() {
   );
 
   return (
-    <div className="flex h-screen flex-col">
+    // `overflow-hidden` so nothing in this subtree can become a scroll
+    // container: a scrollable ancestor gets scrolled by focus-reveal and its
+    // offset restored on reload, which translates the whole editor off-screen
+    // (TD-133). `min-h-0` on the canvas host so the column flex item can
+    // actually shrink instead of being floored by its content.
+    <div className="flex h-dvh flex-col overflow-hidden">
       <header className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-3">
         <Link
           href="/canvas"
@@ -126,7 +135,7 @@ export default function CanvasPage() {
         <CanvasAssigneeFilter value={filterAssigneeId} onChange={setFilterAssigneeId} />
         <div className="flex-1" />
       </header>
-      <div className="relative flex-1">
+      <div className="relative min-h-0 flex-1">
         {missing ? (
           <div className="grid h-full place-items-center">
             <p className="text-sm text-faint">Canvas not found.</p>
@@ -148,6 +157,7 @@ export default function CanvasPage() {
               <CanvasEditor
                 canvasId={canvasId}
                 canvasName={name}
+                projectId={projectId ?? ""}
                 filterAssigneeId={filterAssigneeId}
               />
               <CanvasConnectionStatus />

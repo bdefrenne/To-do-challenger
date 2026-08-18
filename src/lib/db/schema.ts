@@ -593,10 +593,31 @@ export const taskStatusEvents = pgTable(
     creditedTo: text("credited_to").references(() => users.id, {
       onDelete: "set null",
     }),
+    /**
+     * The WORKING DAY this transition is credited to, when that differs from the
+     * day `at` falls on. Null for almost every row — and null is not "unknown",
+     * it means "derive it from `at`", which is right by default.
+     *
+     * `at` is when we LEARNED and never changes; this is which day the work
+     * BELONGS to. Two facts, because collapsing them is what makes a day's
+     * standup permanently wrong: work written up the next morning (a phone call,
+     * a task nobody ticked off) would land on the wrong day with no way back,
+     * and back-dating `at` instead would destroy the append-only guarantee this
+     * whole table rests on.
+     *
+     * Written by the work-day close-out and the Done view's re-dating; read via
+     * `effectiveDay` so no query re-derives the rule.
+     */
+    workedOn: date("worked_on"),
   },
   (t) => [
     /* "What did X do between two dates" — the digest's only scan. */
     index("task_status_events_credited_at_idx").on(t.creditedTo, t.at),
+    /* The same question for re-dated rows, which the `at` index can't answer. */
+    index("task_status_events_credited_worked_on_idx").on(
+      t.creditedTo,
+      t.workedOn,
+    ),
     /* One task's transitions in order — derives its stints. */
     index("task_status_events_task_at_idx").on(t.taskId, t.at),
     /* "What reached done in this window". */
@@ -759,6 +780,19 @@ export const canvases = pgTable(
     userId: text("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    /** The project this canvas lays out — EXACTLY one canvas per project (see the
+     *  unique index below). That 1:1 is what lets "the project's canvas" be a
+     *  lookup rather than a choice: before it, the server guessed which canvas to
+     *  file a task onto by scanning for a starred THIS WEEK group, then counting
+     *  placement groups, then taking the first by position (TD-136).
+     *
+     *  It scopes the MACHINE's decisions only — which canvas a placement resolves
+     *  to, and which boards a canvas auto-draws lanes for. A section may still be
+     *  bound by hand to any board from any project; the canvas is a workspace,
+     *  not a fence. */
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     /** Last-saved pan/zoom, so reopening restores the view: { x, y, scale }. */
     viewport: jsonb("viewport").notNull().default(sql`'{}'::jsonb`),
@@ -771,7 +805,12 @@ export const canvases = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (t) => [index("canvases_user_idx").on(t.userId)],
+  (t) => [
+    index("canvases_user_idx").on(t.userId),
+    // The 1:1 invariant, enforced. A second canvas for a project would re-open
+    // exactly the ambiguity `project_id` exists to close.
+    uniqueIndex("canvases_project_idx").on(t.projectId),
+  ],
 );
 
 export const canvasNodes = pgTable(
@@ -834,6 +873,83 @@ export const canvasNodes = pgTable(
   ],
 );
 
+/* ---- Work days ----
+   One person's working day on one project: the two artifacts a day can produce,
+   and nothing else.
+
+   What this table deliberately does NOT hold is a list of the day's tasks. That
+   is a QUERY over `task_status_events` — the day's membership is derived, always
+   current, and cannot disagree with the board. Storing it would create a second
+   source of truth that drifts the first time something is closed from Telegram
+   or by a teammate.
+
+   So a day needs no lifecycle and nothing opens it: a day EXISTS because there
+   was activity in it, and a row appears here only when someone produces one of
+   the two artifacts. Skipping both leaves the record complete — the digest reads
+   the event log, not this table.
+
+     ready_at + snapshot  what the todo looked like when you committed to the
+                          day. The only thing here that can't be reconstructed:
+                          TODAY is a mutable bucket, so by evening the morning's
+                          list is genuinely gone. Compared against what actually
+                          shipped, it answers "was my list clear enough?".
+     drafted_at + summary the standup prose. Authored judgement — the why, the
+                          cost, what's next — which was never in the data.
+
+   There is no `sealed` column: a day is sealed once a LATER day for the same
+   (user, project) has been drafted. Derived, so it can't fall out of sync, and
+   it gives exactly the window the standup needs — yesterday stays correctable
+   while you present it, and shuts the moment you draft today. */
+export const workDays = pgTable(
+  "work_days",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Per PROJECT, not global: a project is a team, a board and a standup, so
+     *  the day is the unit that team reports on. */
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    /** The WORKING day (see lib/workday.ts) — a date, not an instant, because
+     *  that's the unit a standup talks about. */
+    day: date("day").notNull(),
+    /** When "Ready for the day" was pressed. Re-pressing overwrites: the last
+     *  commitment of the morning is the real one. */
+    readyAt: timestamp("ready_at", { withTimezone: true }),
+    /** The todo as it stood at `readyAt` — `WorkDaySnapshotEntry[]`. Immutable
+     *  once written; the whole point is that it survives the day's edits. */
+    snapshot: jsonb("snapshot"),
+    /** When "Finish work" ran — the day is drafted, and ready to present. */
+    draftedAt: timestamp("drafted_at", { withTimezone: true }),
+    /** Standup points that aren't about any one task ("out Thursday"). Task-level
+     *  notes stay on the task, where the digest already picks them up. */
+    bullets: text("bullets"),
+    /** The standup write-up. A draft until presented; overwritten, not versioned
+     *  — a daily update doesn't need history. */
+    summary: text("summary"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    /* One row per person per project per day — the upsert target. */
+    uniqueIndex("work_days_user_project_day_idx").on(
+      t.userId,
+      t.projectId,
+      t.day,
+    ),
+    /* "Is the previous day sealed?" — walks this person's days backwards. */
+    index("work_days_user_day_idx").on(t.userId, t.day),
+  ],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type NewProjectRow = typeof projects.$inferInsert;
 export type BoardRow = typeof boards.$inferSelect;
@@ -866,3 +982,5 @@ export type CanvasRow = typeof canvases.$inferSelect;
 export type NewCanvasRow = typeof canvases.$inferInsert;
 export type CanvasNodeRow = typeof canvasNodes.$inferSelect;
 export type NewCanvasNodeRow = typeof canvasNodes.$inferInsert;
+export type WorkDayRow = typeof workDays.$inferSelect;
+export type NewWorkDayRow = typeof workDays.$inferInsert;

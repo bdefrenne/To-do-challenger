@@ -11,29 +11,51 @@
  *
  * `react-markdown` escapes raw HTML by default (no `dangerouslySetInnerHTML`), so
  * this is safe to point at user-authored content.
+ *
+ * SIZE AND TONE ARE PROPS, not classes a caller puts on a wrapper. The root below
+ * sets its own `text-*` and `text-<color>`, and those beat anything inherited from
+ * a parent — so `<div className="text-xs text-muted"><Markdown/></div>` silently
+ * renders at the default size in the default color, which is a bug you can't see
+ * while writing it. Pass `size` / `tone` instead.
  */
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 
+/** Body size. `xs` is for chrome — a card's description, a column head — where the
+ *  markdown is supporting a thing rather than being the thing. */
+const SIZE = {
+  sm: "text-sm leading-relaxed",
+  xs: "text-xs leading-snug",
+} as const;
+
+const TONE = { fg: "text-fg", muted: "text-muted" } as const;
+
 export function Markdown({
   children,
   className = "",
+  size = "sm",
+  tone = "fg",
 }: {
   children: string;
   className?: string;
+  size?: keyof typeof SIZE;
+  tone?: keyof typeof TONE;
 }) {
   return (
     <div
-      className={`text-sm leading-relaxed text-fg [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${className}`}
+      className={`${SIZE[size]} ${TONE[tone]} [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${className}`}
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
+        // Heading and code sizes are RELATIVE (`em`), so they follow `size`
+        // instead of fighting it. At the default `sm` these are the pixel sizes
+        // they always were.
         components={{
-          h1: (p) => <h2 className="mb-1 mt-3 text-base font-semibold" {...p} />,
-          h2: (p) => <h3 className="mb-1 mt-3 text-sm font-semibold" {...p} />,
+          h1: (p) => <h2 className="mb-1 mt-3 text-[1.15em] font-semibold" {...p} />,
+          h2: (p) => <h3 className="mb-1 mt-3 text-[1em] font-semibold" {...p} />,
           h3: (p) => (
-            <h4 className="mb-1 mt-2 text-sm font-semibold text-muted" {...p} />
+            <h4 className="mb-1 mt-2 text-[1em] font-semibold text-muted" {...p} />
           ),
           p: (p) => <p className="mb-2" {...p} />,
           ul: (p) => <ul className="mb-2 list-disc space-y-0.5 pl-5" {...p} />,
@@ -63,7 +85,7 @@ export function Markdown({
             ),
           pre: (p) => (
             <pre
-              className="mb-2 overflow-x-auto rounded-lg bg-surface-3 p-3 font-mono text-[13px]"
+              className="mb-2 overflow-x-auto rounded-lg bg-surface-3 p-3 font-mono text-[0.9em]"
               {...p}
             />
           ),

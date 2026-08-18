@@ -35,6 +35,10 @@ import {
   searchTasks,
   countTasks,
   activityDigest,
+  workDayReview,
+  markDayReady,
+  finishWork,
+  logPastWork,
   TASK_FILTER_KEYS,
   getTask,
   createTask,
@@ -78,7 +82,7 @@ import {
 import { listUsers, getUserById, type PublicUser } from "@/lib/db/users";
 import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
-import { WORKFLOW } from "@/lib/workflow";
+import { WORKFLOW, DAY_CLOSE } from "@/lib/workflow";
 import { langSuffix } from "@/lib/prompts";
 import { capped, type CapOpts } from "@/lib/mcp-response";
 
@@ -112,6 +116,7 @@ const recurrenceEnum = z.enum(["none", "daily", "weekly", "monthly"]);
  *  status. Mirrors `placementSchema` in api.ts. */
 const placementEnum = z.enum([
   "inbox",
+  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -403,7 +408,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). PLACEMENT — which canvas group the task lands in, an axis independent of status: it defaults to `inbox` (untriaged), and creating it at analyzing/building implies `thisWeek`. Pass `placement: \"thisWeek\"` when it's to be done this week or you're about to start on it, `\"backlog\"` when it's triaged but not scheduled, `\"later\"` when the user said later, `\"inbox\"` to force it back to untriaged.",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). Adding an unfinished subtask to a DONE parent reopens that parent to Review (and moves it out of DONE THIS WEEK) — work underneath it means it isn't finished. PLACEMENT — which canvas group the task lands in, an axis independent of status: it defaults to `inbox` (untriaged), and creating it at analyzing/building implies `thisWeek`. Pass `placement: \"today\"` when it's on today's shortlist, `\"thisWeek\"` when it's to be done this week or you're about to start on it, `\"backlog\"` when it's triaged but not scheduled, `\"later\"` when the user said later, `\"inbox\"` to force it back to untriaged.",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -422,7 +427,7 @@ const handler = createMcpHandler(
         placement: placementEnum
           .optional()
           .describe(
-            "Which canvas group to file it in: 'inbox' (untriaged, the default), 'thisWeek' (do it this week, or you're starting now), 'backlog' (triaged, not scheduled), 'later' (deferred), 'doneThisWeek' (finished, awaiting a sweep). Omit to let the status decide.",
+            "Which canvas group to file it in: 'inbox' (untriaged, the default), 'today' (on today's shortlist), 'thisWeek' (do it this week, or you're starting now), 'backlog' (triaged, not scheduled), 'later' (deferred), 'doneThisWeek' (finished, awaiting a sweep). Omit to let the status decide.",
           ),
         thisWeek: z
           .boolean()
@@ -439,7 +444,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `placement` moves the task between the canvas's groups — 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review files it on THIS WEEK automatically, but only for a task nobody has filed by hand. Placement never changes status, and status never changes placement beyond that one rule.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `placement` moves the task between the canvas's groups — 'today', 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review files it on THIS WEEK automatically, but only for a task nobody has filed by hand. Placement never changes status, and status never changes placement beyond that one rule.",
       {
         id: taskHandle,
         title: z.string().min(1).max(500).optional(),
@@ -460,7 +465,7 @@ const handler = createMcpHandler(
         placement: placementEnum
           .optional()
           .describe(
-            "Move it to a canvas group: 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Omit to let the status decide.",
+            "Move it to a canvas group: 'today', 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Omit to let the status decide.",
           ),
         thisWeek: z
           .boolean()
@@ -502,7 +507,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "move_task",
-      "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), canvasSectionId (pin to a canvas Section, or null to unpin), and/or position. Moving into analyzing or building assigns you (existing assignees are kept) and locks the code, exactly as update_task does.",
+      "Reorder, re-nest, or re-file a task: change its status (move between groups), parentId (nest under another task, or null for top level), boardId (move onto a board, or null to unassign — see list_projects), canvasSectionId (pin to a canvas Section, or null to unpin), and/or position. Moving into analyzing or building assigns you (existing assignees are kept) and locks the code, exactly as update_task does. Two rules about parents and children: moving a task to done is refused while its own subtasks are unfinished (use complete_task), and nesting an unfinished task under a DONE parent reopens that parent to Review, since work underneath it means it isn't finished.",
       {
         id: taskHandle,
         status: statusEnum.optional(),
@@ -521,10 +526,16 @@ const handler = createMcpHandler(
 
     server.tool(
       "complete_task",
-      "Mark a task done (default), or reopen it with done:false (sends it back to Planned).",
-      { id: taskHandle, done: z.boolean().optional().default(true) },
-      async ({ id, done }) => {
-        const task = await completeTask(id, done, currentUser(), AI_AUTHOR);
+      "Mark a task done (default), or reopen it with done:false (sends it back to Planned). A PARENT closes after its children: completing one that still has unfinished subtasks is refused, and the error names them — finish those first, or pass withSubtasks:true to close the whole branch (every unfinished descendant, then the task). Only pass it when the human asked to finish the branch; it marks work done that nobody completed one by one. Reopening a task that was parked in DONE THIS WEEK also moves it back to THIS WEEK, since a task that isn\'t done doesn\'t belong in the done tray.",
+      {
+        id: taskHandle,
+        done: z.boolean().optional().default(true),
+        withSubtasks: z.boolean().optional(),
+      },
+      async ({ id, done, withSubtasks }) => {
+        const task = await completeTask(id, done, currentUser(), AI_AUTHOR, {
+          withSubtasks,
+        });
         return task ? text({ task }) : text({ error: "Task not found" });
       },
     );
@@ -749,6 +760,151 @@ const handler = createMcpHandler(
           },
         );
       },
+    );
+
+    /* ----------------------------------------------------------------- */
+    /* WORK DAYS — the day's record. The contract these follow is        */
+    /* `DAY_CLOSE` (in the server instructions), so the steps an agent    */
+    /* walks and the ones the UI shows are the same steps.               */
+    /* ----------------------------------------------------------------- */
+
+    server.tool(
+      "work_day",
+      "Everything the end-of-day close-out needs for one project on one working day, in one read: `day` (the row, with `sealed`), `digest` (what you did — same four disjoint lists as `standup`), `notes`, `candidates` (tasks you actually touched that day and left in a late work status — the \"which of these finished?\" list, PROPOSALS only), and `drift` when a morning snapshot exists (`plannedNotDone`, and `doneNotPlanned` — the day's real interruptions).\n" +
+        "\n" +
+        "`openDays` lists EARLIER working days with the person's work on them that were never closed out. Raise those before writing today's standup — an unclosed day is work missing from the record, and nothing else surfaces it.\n" +
+        "\n" +
+        "A working day runs 04:00 → 04:00 local, so work finished at 01:00 belongs to the previous day. You do NOT need a row to exist: a day exists because there was work in it, and this answers for any date. Walk the close-out per the `DAY_CLOSE` contract, then record it with `finish_work`.",
+      {
+        projectId: z.string().max(120).describe("which project's day (see list_projects)"),
+        day: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe("the working day, YYYY-MM-DD"),
+        tz: z
+          .string()
+          .max(60)
+          .optional()
+          .describe('IANA zone the day is read in, e.g. "Europe/Brussels" (default UTC)'),
+      },
+      async ({ projectId, day, tz }) => {
+        const review = await workDayReview(currentUser(), projectId, day, tz);
+        return text(
+          {
+            day: review.day,
+            ...(review.openDays.length ? { openDays: review.openDays } : {}),
+            ...(review.digest.attribution
+              ? { attribution: review.digest.attribution }
+              : {}),
+            notes: review.notes,
+            candidates: review.candidates.map((t) => projectTask(t, "compact")),
+            shipped: review.digest.shipped.map((e) => ({
+              ...projectTask(e.task, "compact"),
+              summary: e.task.summary,
+            })),
+            handled: review.digest.handled.map((e) =>
+              projectTask(e.task, "compact"),
+            ),
+            worked: review.digest.worked.map((e) => ({
+              ...projectTask(e.task, "compact"),
+              stints: e.stints,
+            })),
+            closedUnattributed: review.digest.closedUnattributed.map((c) => ({
+              ...projectTask(c.task, "compact"),
+              closedBy: c.closedBy,
+            })),
+            ...(review.drift
+              ? {
+                  drift: {
+                    plannedNotDone: review.drift.plannedNotDone,
+                    doneNotPlanned: review.drift.doneNotPlanned.map((t) =>
+                      projectTask(t, "compact"),
+                    ),
+                  },
+                }
+              : {}),
+          },
+          { items: "shipped", narrow: ["projectId", "day"] },
+        );
+      },
+    );
+
+    server.tool(
+      "ready_for_day",
+      "\"Ready for the day\": freeze what's in TODAY for this project right now, so it can be reviewed later against what actually happened (\"was my list clear enough?\"). TODAY is a mutable bucket, so this list is otherwise lost by evening.\n" +
+        "\n" +
+        "Pressing it again overwrites — the last arrangement of the morning is the real commitment. It is NOT a crediting boundary: it changes no dates and nothing depends on it, so skipping it costs only the snapshot.",
+      {
+        projectId: z.string().max(120),
+        day: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe("the working day, YYYY-MM-DD"),
+      },
+      async ({ projectId, day }) =>
+        text({ day: await markDayReady(currentUser(), projectId, day) }),
+    );
+
+    server.tool(
+      "finish_work",
+      "\"Finish work\": record the day's standup write-up and mark it drafted. Call this LAST, after walking the close-out from `work_day` — completing what finished (each through `complete_task`, with its own confirmation) and logging untracked work with `log_past_work`.\n" +
+        "\n" +
+        "This completes NOTHING itself: batch the asking, never the deciding. The day stays correctable after this (things get split at the standup), and seals itself once a LATER day is drafted — so this refuses a day that is already sealed, because late work belongs to the current day rather than to a standup already presented.",
+      {
+        projectId: z.string().max(120),
+        day: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe("the working day, YYYY-MM-DD"),
+        summary: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("the standup write-up — see the DAY_CLOSE contract for the shape"),
+        bullets: z
+          .string()
+          .max(10_000)
+          .optional()
+          .describe('points that aren\'t about any one task ("out Thursday")'),
+      },
+      async ({ projectId, day, summary, bullets }) =>
+        text({
+          day: await finishWork(currentUser(), projectId, day, {
+            summary,
+            bullets,
+          }),
+        }),
+    );
+
+    server.tool(
+      "log_past_work",
+      "Log work that never reached the board — a call, a conversation, an errand. Creates a real task, already done, credited to the working day it actually happened on and filed straight into DONE THIS WEEK (so it never sits in a triage lane).\n" +
+        "\n" +
+        "This is the answer to \"what did you do that isn't here?\" in the close-out: work with no commit and no status change can't be found by reconciling the board, so it has to be asked for. One record for everything — don't keep this kind of work anywhere but the board.",
+      {
+        title: z.string().min(1).max(500),
+        day: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe("the working day the work actually happened on"),
+        boardId: z
+          .string()
+          .max(120)
+          .nullable()
+          .optional()
+          .describe("which board it belongs on (see list_projects)"),
+        description: z.string().max(10_000).optional(),
+      },
+      async ({ title, day, boardId, description }) =>
+        text({
+          task: await logPastWork(currentUser(), {
+            title,
+            day,
+            boardId,
+            description,
+            author: AI_AUTHOR,
+          }),
+        }),
     );
 
     /* ----------------------------------------------------------------- */
@@ -1033,7 +1189,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "bulk_update",
-      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). A patch that sets analyzing or building assigns you on each task and locks its code, as update_task does. Tasks you don't own are silently skipped and returned in `skipped`.",
+      "Apply the SAME change to many tasks at once — the efficient path for edits like 'assign these to Simon', 'move these to Planned', or 'set these to done'. `patch` accepts the same fields as update_task (null clears a nullable field; an empty array clears assignees/dependsOn). A patch that sets analyzing or building assigns you on each task and locks its code, as update_task does. Tasks you don't own are silently skipped and returned in `skipped`. A `status:\'done\'` patch also refuses any task with unfinished subtasks — those come back in `blocked` with their open counts (the rest of the batch still applies), so report them rather than retrying.",
       { ids: z.array(taskHandle).min(1).max(500), patch: updateTaskSchema },
       async ({ ids, patch }) =>
         text(await bulkUpdate(currentUser(), ids, patch, AI_AUTHOR)),
@@ -1053,14 +1209,14 @@ const handler = createMcpHandler(
 
     server.tool(
       "list_canvases",
-      "List the canvases (free-form brainstorming whiteboards). Canvases are team-visible. Returns each canvas's id, name, and timestamps — no nodes. Use get_canvas to read a canvas's contents.",
-      {},
-      async () => text({ canvases: await listCanvases() }),
+      "List the canvases. A canvas is a project's whiteboard — EXACTLY one per project, laying out that project's boards as sections. Canvases are team-visible. Pass `projectId` to get one project's (0 or 1 rows). Returns each canvas's id, projectId, name and timestamps — no nodes. Use get_canvas to read a canvas's contents.",
+      { projectId: z.string().optional() },
+      async ({ projectId }) => text({ canvases: await listCanvases(projectId) }),
     );
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes AND sticky notes. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. `data.thisWeek` marks the THIS WEEK board — the one group the USER makes and stars, where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. `notes` are this canvas's stickies (see add_note/list_notes) — open ones plus resolved ones (resolved stickies stay pinned, dimmed, until deleted).",
+      "Get one canvas by id with all its nodes AND sticky notes. A canvas belongs to exactly one project (`projectId`) and lays out that project's boards; a task's `placement` resolves against ITS OWN project's canvas. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.today`, `data.thisWeek`, `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — today's shortlist, this week's board, triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. THIS WEEK is where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. A tray's lanes are machine-made, but a section you add to a tray by hand is an ordinary section and is PREFERRED over a derived lane, so hand-named lanes are what work actually lands in. `notes` are this canvas's stickies (see add_note/list_notes) — open ones plus resolved ones (resolved stickies stay pinned, dimmed, until deleted).",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);
@@ -1072,10 +1228,10 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_canvas",
-      "Create a new (empty) canvas — a free-form whiteboard for brainstorming.",
-      { name: z.string().min(1).max(120) },
-      async ({ name }) =>
-        text({ canvas: await createCanvas(currentUser(), name) }),
+      "Create a project's (empty) canvas. A project has exactly one canvas, so this fails if it already has one — every project gets one when it's created, so you rarely need this.",
+      { name: z.string().min(1).max(120), projectId: z.string() },
+      async ({ name, projectId }) =>
+        text({ canvas: await createCanvas(currentUser(), name, projectId) }),
     );
 
     /* ----------------------------------------------------------------- */
@@ -1421,6 +1577,69 @@ const handler = createMcpHandler(
     );
 
     server.registerPrompt(
+      "finish_work",
+      {
+        title: "Finish work",
+        description:
+          "Walk the end-of-day close-out for a project and write the standup.",
+        argsSchema: { projectId: z.string(), day: z.string() },
+      },
+      async ({ projectId, day }) => {
+        const review = await workDayReview(currentUser(), projectId, day);
+        return await promptMsg(
+          `Let's close out ${day}. Here's the raw material:\n\n` +
+            `${JSON.stringify(
+              {
+                day: review.day,
+                candidates: review.candidates.map((t) => ({
+                  ref: t.code,
+                  title: t.title,
+                  status: t.status,
+                })),
+                shipped: review.digest.shipped.map((e) => ({
+                  ref: e.task.code,
+                  title: e.task.title,
+                })),
+                handled: review.digest.handled.map((e) => ({
+                  ref: e.task.code,
+                  title: e.task.title,
+                })),
+                worked: review.digest.worked.map((e) => ({
+                  ref: e.task.code,
+                  title: e.task.title,
+                  stints: e.stints,
+                })),
+                closedUnattributed: review.digest.closedUnattributed.map((c) => ({
+                  ref: c.task.code,
+                  title: c.task.title,
+                })),
+                notes: review.notes,
+                drift: review.drift,
+                openDays: review.openDays,
+              },
+              null,
+              2,
+            )}\n\n` +
+            `Now run the **Finish work** flow from the \`DAY_CLOSE\` contract in ` +
+            `your server instructions, in order:\n\n` +
+            `0. If \`openDays\` isn't empty, say so first and ask whether to close ` +
+            `those out before this one — they're days whose work never made it ` +
+            `into any standup.\n` +
+            `1. Ask me which of the \`candidates\` actually finished — one at a ` +
+            `time, each with its own \`summary\`, each through \`complete_task\` ` +
+            `once I confirm. Never bulk-complete them.\n` +
+            `2. Ask me what I did that ISN'T here — calls, conversations, ` +
+            `errands. Anything I name goes in via \`log_past_work\` dated ${day}.\n` +
+            `3. Flag anything whose date looks wrong.\n` +
+            `4. Write the standup in the shape the contract specifies and save it ` +
+            `with \`finish_work\`. If \`drift.doneNotPlanned\` isn't empty, give ` +
+            `the interruptions a line — that's usually the most honest part of ` +
+            `the update.`,
+        );
+      },
+    );
+
+    server.registerPrompt(
       "standup_report",
       {
         title: "Standup",
@@ -1441,8 +1660,9 @@ const handler = createMcpHandler(
     );
   },
   {
-    // The canonical workflow contract, delivered to every client on connect.
-    instructions: WORKFLOW,
+    // The two canonical contracts, delivered to every client on connect: one
+    // task's journey, then one day's record.
+    instructions: `${WORKFLOW}\n\n${DAY_CLOSE}`,
   },
   {
     basePath: "/api",

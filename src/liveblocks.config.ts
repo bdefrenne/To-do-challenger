@@ -46,10 +46,27 @@ declare global {
        *  window size — a laptop and a large monitor sharing offsets would land
        *  on different content. null until their first broadcast. */
       view: { cx: number; cy: number; scale: number } | null;
-      /** The task field this user is currently editing (a soft field-lock), or
-       *  null. Peers highlight it and disable that input so two people don't
-       *  clobber the same field. Ephemeral — auto-released on disconnect. */
-      editing: { taskId: string; field: string } | null;
+      /** What this user is editing, or null. Ephemeral — auto-released on
+       *  disconnect.
+       *
+       *  `taskId` + `field` is the original soft field-lock: peers highlight it
+       *  and disable that input so two people don't clobber the same field.
+       *
+       *  The outline ("text view") adds the three below, and does NOT disable
+       *  anything: rows there are independent task FIELDS, so peers edit
+       *  different rows freely and this is decoration — a ring on the row they're
+       *  on and their caret inside it.
+       *    • `row`  — the field they're in: a task id for a title row, or
+       *      `<taskId>#desc` for a description block. Two people on the SAME row
+       *      is the one unmerged case (last-writer-wins), which the caller shows
+       *      as an amber ring rather than hiding.
+       *    • `caret` — their character offset in that row.
+       *    • `len` — the length of THEIR copy of the text, so a peer whose copy
+       *      hasn't caught up yet can skip drawing rather than draw the caret in
+       *      the wrong place. */
+      editing:
+        | { taskId: string; field: string; row?: string; caret?: number; len?: number }
+        | null;
     };
     Storage: {
       nodes: LiveMap<string, LiveObject<StoredNode>>;

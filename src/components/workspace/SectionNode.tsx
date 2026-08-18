@@ -19,22 +19,16 @@
  * (`node.content`) trails it inline, dimmed and regular weight.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
-import type { CanvasNode as CanvasNodeT, Task } from "@/lib/types";
-import {
-  type OutlineRow,
-  newRow,
-  rowsToUnits,
-  unitsToRows,
-  survivingIds,
-  flattenUnits,
-  type TaskUnit,
-} from "@/lib/outline";
-import type { TaskStatus, Importance, TaskPlacement } from "@/lib/types";
-import { useWorkspace, type DropPos } from "./WorkspaceContext";
+import type { CanvasNode as CanvasNodeT } from "@/lib/types";
+import { type TaskUnit } from "@/lib/outline";
+import type { TaskStatus, Importance } from "@/lib/types";
+import { useWorkspace, type DropPos, type TaskNode } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
+import { refId } from "@/lib/ref-id";
+import { useEventCallback } from "./useEventCallback";
 import {
   isInboxNode,
   systemGroupOf,
@@ -42,8 +36,10 @@ import {
 } from "@/lib/sections";
 import { compareTaskOrder } from "@/lib/task-order";
 import { TaskCardBody } from "./TaskCardBody";
+import { OutlineEditor, type OutlinePeer } from "./OutlineEditor";
+import { useOutlineDraft } from "./useOutlineDraft";
 import { AnchoredPopover } from "./AnchoredPopover";
-import { useCardShortcut } from "./useCardShortcut";
+import { useTaskCardShortcuts } from "./useTaskCardShortcuts";
 import { IMPORTANCE_CARD } from "@/lib/importance";
 import { STATUS_TONE, STATUS_CANVAS_BADGE } from "@/lib/statuses";
 
@@ -59,6 +55,8 @@ const SECTION_DND_MIME = "application/x-section-task";
 /** How each machine-managed tray labels itself in its header. */
 const TRAY_GLYPH: Record<SystemGroup, { icon: string; hint: string }> = {
   inbox: { icon: "⇥", hint: "Inbox — untriaged, nobody has filed these yet" },
+  today: { icon: "☀", hint: "Today — on today's shortlist" },
+  thisWeek: { icon: "★", hint: "This week — what you mean to do this week" },
   backlog: { icon: "☰", hint: "Backlog — triaged, not scheduled" },
   later: { icon: "⏱", hint: "Later — deliberately deferred" },
   doneThisWeek: {
@@ -74,47 +72,76 @@ type Mode = "naming" | "authoring" | "committed";
  *  `buildSectionMembership`): a task pinned to this node, or — if this node is
  *  an INBOX lane — any unpinned task on its board. Arbitrary nesting depth. */
 function useSectionUnits(sectionId: string): TaskUnit[] {
-  const { nodes, taskMap } = useWorkspace();
+  const { childIndex, nodeIndex, taskMap } = useWorkspace();
   const { bySection } = useSectionMembership();
+  // Which of THIS section's tasks changed, as a primitive.
+  //
+  // `taskMap` gets a new identity whenever any one task anywhere changes, so
+  // depending on it rebuilt every section's unit tree for an edit to a task in
+  // one of them — ~223 objects allocated per keystroke while someone typed in an
+  // outline (TD-132). Only a member of this section can change what this tree
+  // looks like, so the dependency is the identity of those members' task objects:
+  // O(members) reference lookups here, and summed over the canvas that is
+  // O(tasks) once, not O(sections × tasks).
+  const members = bySection.get(sectionId);
+  let contentSig = "";
+  if (members) {
+    const parts: number[] = [];
+    for (const id of members) {
+      const t = taskMap[id];
+      parts.push(t ? refId(t) : 0);
+    }
+    contentSig = parts.join(",");
+  }
   return useMemo(() => {
     const members = bySection.get(sectionId);
     if (!members) return [];
+    // Pre-sorted by the index, so this is a filter and never a sort — and it
+    // walks this parent's OWN children, not every task on the canvas. The naive
+    // version cost O(sections x tasks x members) and every task change re-paid
+    // it (TD-132).
     const childrenOf = (parentId: string) =>
-      nodes.filter((n) => n.parentId === parentId && members.has(n.id));
+      (childIndex.get(parentId) ?? []).filter((n) => members.has(n.id));
+    const build = (rows: readonly TaskNode[]): TaskUnit[] =>
+      rows.map((n) => {
+        const t = taskMap[n.id];
+        return {
+          taskId: n.id,
+          title: t?.title ?? "",
+          description: t?.description ?? "",
+          children: build(childrenOf(n.id)),
+          // Carried so a card can render without the whole `taskMap`, and so the
+          // memo boundary below has a cheap identity to compare — see `sameUnit`.
+          task: t,
+        };
+      });
     // Roots of THIS section: top-level tasks, plus any whose parent isn't here
     // too — a subtask whose parent was dragged into another section would
-    // otherwise have no row to hang off and would vanish.
-    const roots = nodes.filter(
-      (n) => members.has(n.id) && (n.parentId === null || !members.has(n.parentId)),
-    );
-    const build = (rows: typeof nodes): TaskUnit[] =>
-      [...rows]
-        .sort(compareTaskOrder)
-        .map((n) => {
-          const t = taskMap[n.id];
-          return {
-            taskId: n.id,
-            title: t?.title ?? "",
-            description: t?.description ?? "",
-            children: build(childrenOf(n.id)),
-          };
-        });
+    // otherwise have no row to hang off and would vanish. Walked over the
+    // section's OWN members rather than every task on the canvas, then put back
+    // into display order.
+    const roots: TaskNode[] = [];
+    for (const id of members) {
+      const n = nodeIndex.get(id);
+      if (n && (n.parentId === null || !members.has(n.parentId))) roots.push(n);
+    }
+    roots.sort(compareTaskOrder);
     return build(roots);
-  }, [sectionId, nodes, taskMap, bySection]);
+    // `taskMap` is read inside but deliberately NOT a dependency: `contentSig`
+    // already captures the only part of it that can change this tree (the identity
+    // of this section's own members). Adding it back would restore the
+    // whole-canvas rebuild this exists to prevent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sectionId, childIndex, nodeIndex, contentSig, bySection]);
 }
 
 /** Does this unit, or any of its descendants, belong to the filtered assignee?
  *  Used to decide whether a unit survives an assignee filter at all — a match
  *  buried a few levels deep keeps its ancestors around too, so the tree isn't
  *  left with orphaned children (see `filterUnitsByAssignee`). */
-function unitMatchesAssignee(
-  unit: TaskUnit,
-  taskMap: Record<string, Task>,
-  assigneeId: string,
-): boolean {
-  const t = unit.taskId ? taskMap[unit.taskId] : undefined;
-  if (t?.assigneeIds?.includes(assigneeId)) return true;
-  return unit.children.some((c) => unitMatchesAssignee(c, taskMap, assigneeId));
+function unitMatchesAssignee(unit: TaskUnit, assigneeId: string): boolean {
+  if (unit.task?.assigneeIds?.includes(assigneeId)) return true;
+  return unit.children.some((c) => unitMatchesAssignee(c, assigneeId));
 }
 
 /** Prune a unit tree down to branches that lead to a match (TD-59: "show only
@@ -125,13 +152,20 @@ function unitMatchesAssignee(
  *  outline authoring (`unitsToRows`) or a save would delete the pruned tasks. */
 function filterUnitsByAssignee(
   units: TaskUnit[],
-  taskMap: Record<string, Task>,
   assigneeId: string | null,
 ): TaskUnit[] {
   if (!assigneeId) return units;
-  return units
-    .filter((u) => unitMatchesAssignee(u, taskMap, assigneeId))
-    .map((u) => ({ ...u, children: filterUnitsByAssignee(u.children, taskMap, assigneeId) }));
+  const kept = units.filter((u) => unitMatchesAssignee(u, assigneeId));
+  const out = kept.map((u) => {
+    const children = filterUnitsByAssignee(u.children, assigneeId);
+    // Nothing pruned below ⇒ hand back the SAME unit. `useSectionUnits` works
+    // hard to keep unit identity stable so cards can memoize; rebuilding every
+    // unit here would throw that away the moment a filter was on (TD-132).
+    return children === u.children ? u : { ...u, children };
+  });
+  return out.every((u, i) => u === units[i]) && out.length === units.length
+    ? units
+    : out;
 }
 
 export function SectionNode({
@@ -187,8 +221,8 @@ export function SectionNode({
   // outline authoring (`unitsToRows` below still seeds from the full `units`),
   // so an assignee filter can never cause a save to delete the tasks it hid.
   const visibleUnits = useMemo(
-    () => filterUnitsByAssignee(units, ws.taskMap, filterAssigneeId),
-    [units, ws.taskMap, filterAssigneeId],
+    () => filterUnitsByAssignee(units, filterAssigneeId),
+    [units, filterAssigneeId],
   );
   // An INBOX lane: a tray showing its board's UNPINNED tasks, so that anything
   // created from the API, MCP or a board view is visible here instead of nowhere.
@@ -232,17 +266,103 @@ export function SectionNode({
       ? { name: peer.info?.name ?? "Someone", color: peer.info?.color ?? "#888" }
       : null;
   }, shallow);
-  const locked = remoteEditor !== null;
   /** Who created this section, for the pre-bind placeholder. A primitive, so it
    *  compares by value and cursors never touch it. */
   const creatorName = useOthers(
     (others) => others.find((o) => o.id === createdBy)?.info?.name ?? "Someone",
   );
 
+  // Who else is in THIS section's outline, and where their caret is.
+  //
+  // The selector returns a STRING, not a Map: a primitive compares by value, so
+  // this re-renders only when this section's own outline presence changes —
+  // never on a peer's canvas cursor, which is broadcast on every pointermove and
+  // once made panning unusable (TD-132). Caret motion does re-render this one
+  // section, at the ~60ms publish throttle below; that's a section with a handful
+  // of rows, not every section on the canvas.
+  const peerSig = useOthers((others) =>
+    others
+      .map((o) => {
+        const e = o.presence.editing;
+        if (!e || e.taskId !== sectionId || !e.row) return "";
+        return [
+          e.row,
+          e.caret ?? "",
+          e.len ?? "",
+          o.info?.name ?? "Someone",
+          o.info?.color ?? "#888",
+        ].join("\u0001");
+      })
+      .filter(Boolean)
+      .join("\u0002"),
+  );
+  const peerFields = useMemo(() => {
+    const map = new Map<string, OutlinePeer[]>();
+    if (!peerSig) return map;
+    for (const entry of peerSig.split("\u0002")) {
+      const [row, caret, len, name, color] = entry.split("\u0001");
+      const list = map.get(row) ?? [];
+      list.push({
+        name,
+        color,
+        caret: caret === "" ? undefined : Number(caret),
+        len: len === "" ? undefined : Number(len),
+      });
+      map.set(row, list);
+    }
+    return map;
+  }, [peerSig]);
+
+  // Publish our own caret, throttled — presence is cheap but not free, and a
+  // trailing update makes sure the final resting position always lands.
+  const [myField, setMyField] = useState<string | null>(null);
+  const caretThrottle = useRef<{ at: number; timer: ReturnType<typeof setTimeout> | null }>({
+    at: 0,
+    timer: null,
+  });
+  const publishCaret = useCallback(
+    (field: string | null, offset: number, len: number) => {
+      setMyField(field);
+      const send = () => {
+        caretThrottle.current.at = Date.now();
+        updateMyPresence({
+          editing: {
+            taskId: sectionId,
+            field: "outline",
+            row: field ?? undefined,
+            caret: offset,
+            len,
+          },
+        });
+      };
+      const since = Date.now() - caretThrottle.current.at;
+      if (since >= 60) {
+        if (caretThrottle.current.timer) {
+          clearTimeout(caretThrottle.current.timer);
+          caretThrottle.current.timer = null;
+        }
+        send();
+        return;
+      }
+      if (caretThrottle.current.timer) return;
+      caretThrottle.current.timer = setTimeout(() => {
+        caretThrottle.current.timer = null;
+        send();
+      }, 60 - since);
+    },
+    [sectionId, updateMyPresence],
+  );
+
   // Task ids this authoring session is allowed to delete = the section's tasks
   // when authoring began, plus any it creates. Guards against deleting a task a
   // PEER adds to this section while we're editing a stale local outline.
-  const knownIdsRef = useRef<Set<string>>(new Set());
+  // Busy flag for the header's BULK sweeps (done-and-archive, delete-all). The
+  // outline's own saving state comes from `useOutlineDraft`; the header spinner
+  // shows either.
+  const [busy, setBusy] = useState(false);
+  // `ws.bulk`, not a local fetch: it chunks past the server's per-batch cap and
+  // reports any op that didn't apply.
+  const bulk = ws.bulk;
 
   // An INBOX lane never goes through naming: its board is fixed by the
   // reconciler, and the "No board" lane is legitimately board-less.
@@ -257,28 +377,29 @@ export function SectionNode({
   // Text-mode display preference (session-only): descriptions grow up to 6 rows
   // by default; toggled to unbounded via the header button. Not persisted.
   const [descExpanded, setDescExpanded] = useState(false);
-  const [rows, setRows] = useState<OutlineRow[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [focus, setFocus] = useState<{ key: string; caret: number } | null>(null);
-  const inputRefs = useRef<Map<string, HTMLInputElement | HTMLTextAreaElement>>(new Map());
+  // The outline machine — shared with the project Boards view, which runs the
+  // same text mode over a board × bucket column. This section supplies the tree
+  // to seed from, the tasks the list owns, and where a new root line is filed
+  // (its own pin); the hook owns the rows, the keys, the autosave and the
+  // delete-safety rules. See `useOutlineDraft`.
+  const outlineTarget = useMemo(() => ({ canvasSectionId: pin }), [pin]);
+  const { rows, saving, inputRefs, setText, onRowKeyDown, seed, flush } = useOutlineDraft({
+    active: mode === "authoring",
+    units,
+    scopeNodes: sectionNodes,
+    boardId,
+    rootTarget: outlineTarget,
+    // Only broadcast keystrokes when someone else is actually in this outline —
+    // a peer applying a text patch rebuilds every section's unit tree on their
+    // canvas, so it isn't worth paying while you type alone.
+    peersPresent: remoteEditor !== null,
+    onLeave: () => setMode("committed"),
+  });
+  const enterAuthoring = useCallback(() => {
+    seed();
+    setMode("authoring");
+  }, [seed]);
 
-  // Autosave plumbing. `rowsRef` gives async saves the latest rows; the content
-  // signature (indent/desc/text, order — NOT taskId) decides when a save is
-  // due, so writing freshly-created ids back onto rows never re-triggers a save.
-  const rowsRef = useRef(rows);
-  useEffect(() => void (rowsRef.current = rows), [rows]);
-  // `save()` deletes tasks not present in `rows`, so it is ONLY valid while
-  // authoring (when rows faithfully mirror the section). In committed mode rows
-  // is [] and must never drive a save — otherwise a remount (React StrictMode,
-  // navigation) would flush an empty outline and wipe every task.
-  const modeRef = useRef(mode);
-  useEffect(() => void (modeRef.current = mode), [mode]);
-  const savedSigRef = useRef<string>("");
-  const savingRef = useRef(false);
-  const pendingRef = useRef(false);
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const contentSig = (rs: OutlineRow[]) =>
-    JSON.stringify(rs.map((r) => [r.indent, r.desc, r.text]));
 
   /* ---------------- content-driven height ---------------- */
   // Mirror the section card's rendered height into stored `node.height`, so the
@@ -312,349 +433,6 @@ export function SectionNode({
     return () => ro.disconnect();
   }, []);
 
-  /* ---------------- authoring: enter / seed ---------------- */
-  const enterAuthoring = useCallback(() => {
-    const seeded = unitsToRows(units);
-    const next = seeded.length ? seeded : [newRow(0)];
-    savedSigRef.current = contentSig(next); // seeded state is already "saved"
-    // Baseline of deletable ids = the tasks this section has right now.
-    knownIdsRef.current = new Set(
-      flattenUnits(units)
-        .map((f) => f.unit.taskId)
-        .filter((id): id is string => !!id),
-    );
-    setRows(next);
-    setMode("authoring");
-    setFocus({ key: next[next.length - 1].key, caret: next[next.length - 1].text.length });
-  }, [units]);
-
-  // Reposition the caret only when `focus` changes (after a structural edit:
-  // new row, merge, role cycle, arrow nav). Depending on `rows` here would
-  // re-run on every keystroke and yank the caret back to the start — typing
-  // the line in reverse. Each structural op sets a fresh `focus` object, so
-  // this fires exactly when we want it to.
-  useEffect(() => {
-    if (!focus) return;
-    const el = inputRefs.current.get(focus.key);
-    if (el) {
-      el.focus();
-      const c = Math.min(focus.caret, el.value.length);
-      el.setSelectionRange(c, c);
-    }
-  }, [focus]);
-
-  /* ---------------- authoring: row edits ---------------- */
-  const setText = (key: string, text: string) =>
-    setRows((rs) => rs.map((r) => (r.key === key ? { ...r, text } : r)));
-
-  /** The deepest indent a task at `index` may take = (nearest task above)+1.
-   *  -1 means there's no task above to nest under (the very first line). */
-  const maxTaskIndent = (index: number) => {
-    for (let i = index - 1; i >= 0; i--) if (!rows[i].desc) return rows[i].indent + 1;
-    return -1;
-  };
-
-  const onRowKeyDown = (
-    e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
-    row: OutlineRow,
-    index: number,
-  ) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      void flush();
-      setMode("committed");
-      return;
-    }
-
-    // ---- Description rows: a plain multiline block ----
-    if (row.desc) {
-      if (e.key === "Tab" && e.shiftKey) {
-        // SHIFT+TAB inside a description: pop the CURRENT line out as a bullet
-        // (a task at the description's own indent = a subtask of its owner),
-        // leaving the lines above as the description; lines below follow it.
-        e.preventDefault();
-        const val = row.text;
-        const caret = e.currentTarget.selectionStart ?? val.length;
-        const lineStart = val.lastIndexOf("\n", caret - 1) + 1;
-        const nl = val.indexOf("\n", caret);
-        const lineEnd = nl === -1 ? val.length : nl;
-        const before = val.slice(0, lineStart).replace(/\n$/, "");
-        const currentLine = val.slice(lineStart, lineEnd);
-        const after = val.slice(lineEnd).replace(/^\n/, "");
-
-        const bullet = newRow(row.indent, false, currentLine);
-        const inserts: OutlineRow[] = [bullet];
-        if (after.trim()) inserts.push(newRow(row.indent + 1, true, after));
-        setRows((rs) => {
-          const copy = rs.slice();
-          if (before.trim()) {
-            copy[index] = { ...row, text: before };
-            copy.splice(index + 1, 0, ...inserts);
-          } else {
-            copy.splice(index, 1, ...inserts); // desc had only this line → replace it
-          }
-          return copy;
-        });
-        setFocus({ key: bullet.key, caret: currentLine.length });
-        return;
-      }
-      if (e.key === "Tab") e.preventDefault(); // forward Tab: no-op (deepest role)
-      // Enter (newline), arrows, Backspace: all native inside the block.
-      return;
-    }
-
-    // ---- Task rows ----
-    if (e.key === "Tab") {
-      e.preventDefault();
-      const max = maxTaskIndent(index);
-      if (max < 0) return; // first line — nothing above to nest under
-      if (e.shiftKey) {
-        // Outdent one level; at the left edge, nothing happens.
-        if (row.indent > 0) {
-          setRows((rs) => rs.map((r) => (r.key === row.key ? { ...r, indent: r.indent - 1 } : r)));
-          setFocus({ key: row.key, caret: e.currentTarget.selectionStart ?? row.text.length });
-        }
-        return;
-      }
-      if (row.indent < max) {
-        // Nest one level deeper (subtask / sub-subtask …).
-        setRows((rs) => rs.map((r) => (r.key === row.key ? { ...r, indent: r.indent + 1 } : r)));
-      } else {
-        // Already as deep as allowed → this line becomes the task's description.
-        setRows((rs) =>
-          rs.map((r) => (r.key === row.key ? { ...r, desc: true, taskId: null } : r)),
-        );
-      }
-      setFocus({ key: row.key, caret: e.currentTarget.selectionStart ?? row.text.length });
-      return;
-    }
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const caret = e.currentTarget.selectionStart ?? row.text.length;
-      // Split at the caret → a new sibling task at the same indent. A bound task
-      // keeps its id on the head (same task, renamed); the tail is a new task.
-      const head = row.text.slice(0, caret);
-      const tail = row.text.slice(caret);
-      const created = newRow(row.indent, false, tail);
-      setRows((rs) => {
-        const copy = rs.slice();
-        copy[index] = { ...row, text: head };
-        copy.splice(index + 1, 0, created);
-        return copy;
-      });
-      setFocus({ key: created.key, caret: 0 });
-      return;
-    }
-    if (e.key === "Backspace" && (e.currentTarget.selectionStart ?? 0) === 0 && index > 0) {
-      // Merge into the previous row (its id/role win); this row is dropped.
-      e.preventDefault();
-      const prev = rows[index - 1];
-      const mergedCaret = prev.text.length;
-      setRows((rs) => {
-        const copy = rs.slice();
-        copy[index - 1] = { ...prev, text: prev.text + row.text };
-        copy.splice(index, 1);
-        return copy;
-      });
-      setFocus({ key: prev.key, caret: mergedCaret });
-      return;
-    }
-    if (e.key === "ArrowUp" && index > 0) {
-      e.preventDefault();
-      const prev = rows[index - 1];
-      setFocus({ key: prev.key, caret: prev.text.length });
-      return;
-    }
-    if (e.key === "ArrowDown" && index < rows.length - 1) {
-      e.preventDefault();
-      const nxt = rows[index + 1];
-      setFocus({ key: nxt.key, caret: nxt.text.length });
-    }
-  };
-
-  /* ---------------- commit: rows → tasks (up to 3 bulk batches) ------------- */
-  // `ws.bulk`, not a local fetch: it chunks past the server's per-batch cap
-  // (an outline this size can exceed it), reports any op that didn't apply, and
-  // guarantees the results line up index-for-index with the ops — which is what
-  // makes pairing a created task's id back to its row safe.
-  const bulk = ws.bulk;
-
-  // Persist the current outline → tasks. Runs on a debounce while you type (and
-  // on demand via flush). Guarded so saves never overlap; a save requested mid-
-  // flight re-runs afterwards. Freshly-created task ids are written back onto the
-  // rows so the NEXT save updates those tasks instead of duplicating them.
-  const save = useCallback(async () => {
-    // Guard: only persist while authoring — rows is the source of truth only
-    // then. Never let an empty committed-mode rows delete the section's tasks.
-    if (!boardId || modeRef.current !== "authoring") return;
-    // Nothing changed since the last save — a bare view toggle, Esc, "done", or
-    // unmount over an untouched outline. Bail before touching state or the
-    // network (this is the same dirty-check the debounced autosave already has;
-    // the direct callers were missing it and re-persisted every task for free).
-    const current = rowsRef.current;
-    const sig = contentSig(current);
-    if (sig === savedSigRef.current) return;
-    if (savingRef.current) {
-      pendingRef.current = true;
-      return;
-    }
-    savingRef.current = true;
-    setSaving(true);
-    try {
-      const built = rowsToUnits(current);
-      // Scoped to the tasks THIS section renders (resolved canvas-wide), never
-      // the board — so saving one section never touches another's tasks.
-      const surviving = survivingIds(built);
-      // Only delete tasks THIS session knows about (baseline + ones it created).
-      // A task a peer added to this section meanwhile isn't in knownIds, so our
-      // stale outline can never delete it.
-      const toDelete = sectionNodes
-        .map((n) => n.id)
-        .filter((id) => knownIdsRef.current.has(id) && !surviving.has(id));
-
-      const flat = flattenUnits(built);
-      const maxDepth = flat.reduce((m, n) => Math.max(m, n.depth), 0);
-
-      // 1. CREATES only, level by level, so a parent always has its id before its
-      // children are created (arbitrary nesting depth). Creating is the sole thing
-      // that needs its own ordered batches — everything else collapses into §2.
-      for (let d = 0; d <= maxDepth; d++) {
-        const level = flat.filter((n) => n.depth === d && !n.unit.taskId);
-        if (!level.length) continue;
-        const ops = level.map((n) => ({
-          op: "create",
-          input: {
-            title: n.unit.title,
-            description: n.unit.description || undefined,
-            boardId,
-            parentId: n.parent?.taskId ?? undefined,
-            // Only roots carry the pin — nested lines inherit their parent's
-            // placement. Null in an INBOX lane, where unpinned IS the membership.
-            ...(n.parent ? {} : { canvasSectionId: pin }),
-          },
-        }));
-        // Pair each new id back to the row that asked for it BY INDEX. A cursor
-        // that only advanced on success would, after one failed create, hand every
-        // later id to the wrong row — stamping a failed row with another task's
-        // identity and orphaning the task that was really created (which the next
-        // save would then create again).
-        const results = await bulk(ops);
-        results.forEach((r, i) => {
-          if (r.op === "create" && r.ok && r.id) level[i].unit.taskId = r.id;
-        });
-      }
-
-      // 2. ONE final batch carrying ONLY what actually changed: content updates,
-      // reorders/reparents, and deletes. /api/tasks/bulk runs ops in array order,
-      // so a lone request suffices (updates → moves → deletes). A plain text edit
-      // that adds/removes/reorders nothing thus becomes a single one-op POST.
-      const finalOps: unknown[] = [];
-
-      // updates — skip tasks whose title AND description are unchanged. Tasks just
-      // created above aren't in taskMap yet, so they fall through here (their
-      // create already carried the right content).
-      for (const n of flat) {
-        const id = n.unit.taskId;
-        if (!id) continue;
-        const t = ws.taskMap[id];
-        if (!t) continue;
-        const nextDesc = n.unit.description || null;
-        if (t.title !== n.unit.title || (t.description ?? null) !== nextDesc) {
-          finalOps.push({ op: "update", id, patch: { title: n.unit.title, description: nextDesc } });
-        }
-      }
-
-      // moves — only for sibling groups whose parent or order changed. Positions
-      // are sparse/fractional, so compare id-sequences, not raw positions; when a
-      // group did change, reassert dense positions (0,1,2,…) for all its members.
-      const currentParent = new Map(sectionNodes.map((n) => [n.id, n.parentId]));
-      const currentOrder = [...sectionNodes]
-        .sort((a, b) => a.position - b.position)
-        .map((n) => n.id);
-      const desiredByParent = new Map<string | null, string[]>();
-      for (const n of flat) {
-        if (!n.unit.taskId) continue;
-        const p = n.parent?.taskId ?? null;
-        const arr = desiredByParent.get(p);
-        if (arr) arr.push(n.unit.taskId);
-        else desiredByParent.set(p, [n.unit.taskId]);
-      }
-      for (const [parentId, desiredIds] of desiredByParent) {
-        const desiredSet = new Set(desiredIds);
-        // Existing tasks are those already in the DB (freshly-created ids aren't
-        // in currentParent). A group is dirty if any moved parent, any is new, or
-        // the existing tasks' order differs from the DB's.
-        const existingDesired = desiredIds.filter((id) => currentParent.has(id));
-        const currentSeq = currentOrder.filter((id) => desiredSet.has(id));
-        const parentChanged = existingDesired.some((id) => currentParent.get(id) !== parentId);
-        const hasNew = desiredIds.length !== existingDesired.length;
-        const orderChanged = existingDesired.join(" ") !== currentSeq.join(" ");
-        if (!parentChanged && !hasNew && !orderChanged) continue;
-        desiredIds.forEach((id, i) =>
-          finalOps.push({ op: "move", id, target: { parentId, position: i } }),
-        );
-      }
-
-      toDelete.forEach((id) => finalOps.push({ op: "delete", id }));
-      if (finalOps.length) await bulk(finalOps);
-
-      // Write freshly-created ids back onto the editor rows (matched by rowKey).
-      // Only touches taskId, so the content signature is unchanged → no re-save.
-      const idByRow = new Map<string, string>();
-      for (const n of flat) if (n.unit.rowKey && n.unit.taskId) idByRow.set(n.unit.rowKey, n.unit.taskId);
-      // Tasks we just created become deletable in later saves of this session.
-      flat.forEach((n) => n.unit.taskId && knownIdsRef.current.add(n.unit.taskId));
-      setRows((rs) =>
-        rs.map((r) => {
-          const id = idByRow.get(r.key);
-          return id && r.taskId !== id ? { ...r, taskId: id } : r;
-        }),
-      );
-      savedSigRef.current = sig;
-      await ws.refresh();
-    } catch (err) {
-      console.error("[section] save failed", err);
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-      if (pendingRef.current) {
-        pendingRef.current = false;
-        void save();
-      }
-    }
-  }, [boardId, ws, bulk, pin, sectionNodes]);
-
-  /** Save now, cancelling any pending debounce (used on toggle / Esc / unmount). */
-  const flush = useCallback(() => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    return save();
-  }, [save]);
-
-  // Debounced autosave: whenever the outline's content changes while authoring,
-  // save ~700ms later. Writing ids back doesn't change the signature, so it
-  // never loops. Flush on leaving authoring / unmount so nothing is lost.
-  useEffect(() => {
-    if (mode !== "authoring" || !boardId) return;
-    if (contentSig(rows) === savedSigRef.current) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => void save(), 700);
-    return () => {
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-    };
-  }, [rows, mode, boardId, save]);
-
-  useEffect(() => {
-    return () => {
-      // Only flush a genuine in-progress authoring session — never a committed
-      // section (rows is [] there, which would delete everything on remount).
-      if (modeRef.current === "authoring" && savedSigRef.current !== contentSig(rowsRef.current)) {
-        void save();
-      }
-    };
-    // Save-on-unmount only; `save` is stable enough and we don't want to re-arm.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // Publish a soft outline-lock while authoring this section, so peers see it's
   // being edited and are blocked from opening it. Cleared on leave/unmount
   // (Liveblocks also drops it automatically if this tab disconnects).
@@ -664,28 +442,6 @@ export function SectionNode({
     return () => updateMyPresence({ editing: null });
   }, [mode, sectionId, updateMyPresence]);
 
-  // Live re-sync (realtime): while authoring, pull in peers' task edits — but
-  // ONLY when our outline has no unsaved changes AND we aren't focused in it, so
-  // we never clobber in-flight typing or steal the caret. This is why text mode
-  // now reflects other users' updates instead of showing a frozen snapshot.
-  useEffect(() => {
-    if (mode !== "authoring") return;
-    if (contentSig(rowsRef.current) !== savedSigRef.current) return; // dirty
-    const active = document.activeElement;
-    const focusedHere = [...inputRefs.current.values()].some((el) => el === active);
-    if (focusedHere) return;
-    const seeded = unitsToRows(units);
-    const next = seeded.length ? seeded : [newRow(0)];
-    const nextSig = contentSig(next);
-    if (nextSig === savedSigRef.current) return; // nothing new upstream
-    savedSigRef.current = nextSig; // adopt as the new clean baseline (no re-save)
-    knownIdsRef.current = new Set(
-      flattenUnits(units)
-        .map((f) => f.unit.taskId)
-        .filter((id): id is string => !!id),
-    );
-    setRows(next);
-  }, [units, mode]);
 
   /* ---------------- the section's own name ---------------- */
   // `data.name` is optional and lives alongside the bound board (`node.content`
@@ -723,14 +479,11 @@ export function SectionNode({
   const bindBoard = (id: string, name: string) => {
     onPatch({ content: name, data: { ...(node.data ?? {}), boardId: id } });
     setMode("committed");
-    // Jump straight into authoring so you can start typing tasks.
+    // Jump straight into authoring so you can start typing tasks. A brand-new
+    // section has no tasks, so seeding gives the single empty line and an empty
+    // deletable set.
     requestAnimationFrame(() => {
-      const seed = [newRow(0)];
-      savedSigRef.current = contentSig(seed);
-      knownIdsRef.current = new Set(); // brand-new section: nothing to delete
-      setRows(seed);
-      setMode("authoring");
-      setFocus(null);
+      enterAuthoring();
     });
   };
 
@@ -751,7 +504,7 @@ export function SectionNode({
     )
       return;
 
-    setSaving(true);
+    setBusy(true);
     try {
       if (n) {
         const topLevel = (members: Set<string>) =>
@@ -780,7 +533,7 @@ export function SectionNode({
     } catch (err) {
       console.error("[section] send-to-master failed", err);
     } finally {
-      setSaving(false);
+      setBusy(false);
     }
   }, [boardId, masterSection, ws, bulk, onRemove, sectionNodes, siblingIds, bySection]);
 
@@ -798,7 +551,7 @@ export function SectionNode({
       )
     )
       return;
-    setSaving(true);
+    setBusy(true);
     try {
       const ops: unknown[] = [];
       for (const nd of sectionNodes)
@@ -813,7 +566,7 @@ export function SectionNode({
     } catch (err) {
       console.error("[section] bulk done+archive failed", err);
     } finally {
-      setSaving(false);
+      setBusy(false);
     }
   }, [sectionNodes, siblingIds, bulk, ws]);
 
@@ -829,7 +582,7 @@ export function SectionNode({
       )
     )
       return;
-    setSaving(true);
+    setBusy(true);
     try {
       const byId = new Map(sectionNodes.map((nd) => [nd.id, nd]));
       const depth = (nd: (typeof sectionNodes)[number]) => {
@@ -847,7 +600,7 @@ export function SectionNode({
     } catch (err) {
       console.error("[section] bulk delete failed", err);
     } finally {
-      setSaving(false);
+      setBusy(false);
     }
   }, [sectionNodes, bulk, ws]);
 
@@ -961,7 +714,7 @@ export function SectionNode({
             ) : null}
           </span>
         )}
-        {saving ? (
+        {saving || busy ? (
           <span
             aria-label="Saving"
             className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-faint border-t-transparent"
@@ -1027,11 +780,17 @@ export function SectionNode({
             onPointerDown={(e) => e.stopPropagation()}
             className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5"
           >
+            {/* No longer gated on `locked`. An outline row is one task FIELD, so
+                peers editing different rows commute — several people can sit in
+                text mode together and the presence ring/caret is decoration, not
+                a permission. (It was a lock only because saving used to diff the
+                whole row list; see useOutlineDraft.) */}
             <ViewToggleBtn
               active={mode === "authoring"}
-              disabled={locked}
-              onClick={() => mode !== "authoring" && !locked && enterAuthoring()}
-              title={locked ? `${remoteEditor?.name} is editing this section` : "Outline"}
+              onClick={() => mode !== "authoring" && enterAuthoring()}
+              title={
+                remoteEditor ? `${remoteEditor.name} is in here too — Outline` : "Outline"
+              }
             >
               ≣
             </ViewToggleBtn>
@@ -1072,21 +831,20 @@ export function SectionNode({
             descCapped={!descExpanded}
             onText={setText}
             onKeyDown={onRowKeyDown}
+            peers={peerFields}
+            myField={myField}
+            onCaret={publishCaret}
           />
         ) : (
           <CommittedList
             units={visibleUnits}
             filterAssigneeId={filterAssigneeId}
-            taskMap={ws.taskMap}
             onOpen={ws.openTask}
             onToggle={ws.toggleDone}
             onStatus={ws.setStatus}
             onAssign={ws.editTask}
             onImportance={(id, v) => ws.editTask(id, { importance: v })}
             onMove={ws.moveNode}
-            onAssignSelf={ws.toggleSelfAssignee}
-            onDelete={ws.deleteTask}
-            onSend={ws.sendToPlacement}
             onAddTask={(title) =>
               ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
             }
@@ -1314,187 +1072,62 @@ function NameBinder({
  *  both title rows (never capped — they just wrap) and description rows. Its
  *  inner textarea is forwarded to `registerRef` so the outline's inputRefs map
  *  and caret-restore effect keep working. */
-function AutoGrowTextarea({
-  value,
-  capped,
-  registerRef,
-  onChange,
-  onKeyDown,
-  placeholder,
-  className,
-}: {
-  value: string;
-  capped: boolean;
-  registerRef: (el: HTMLTextAreaElement | null) => void;
-  onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
-  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
-  placeholder: string;
-  className: string;
-}) {
-  const ref = useRef<HTMLTextAreaElement | null>(null);
-  const MAX_ROWS = 6;
-  const resize = useCallback(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = "auto";
-    if (capped) {
-      const lh = parseFloat(getComputedStyle(el).lineHeight) || 20;
-      const max = lh * MAX_ROWS;
-      el.style.maxHeight = `${max}px`;
-      el.style.height = `${Math.min(el.scrollHeight, max)}px`;
-      el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
-    } else {
-      el.style.maxHeight = "none";
-      el.style.height = `${el.scrollHeight}px`;
-      el.style.overflowY = "hidden";
-    }
-  }, [capped]);
-  useLayoutEffect(resize, [value, capped, resize]);
-  return (
-    <textarea
-      ref={(el) => {
-        ref.current = el;
-        registerRef(el);
-      }}
-      value={value}
-      rows={1}
-      onChange={(e) => {
-        onChange(e);
-        resize();
-      }}
-      onKeyDown={onKeyDown}
-      placeholder={placeholder}
-      className={className}
-    />
-  );
-}
-
-function OutlineEditor({
-  rows,
-  inputRefs,
-  descCapped,
-  onText,
-  onKeyDown,
-}: {
-  rows: OutlineRow[];
-  inputRefs: React.MutableRefObject<Map<string, HTMLInputElement | HTMLTextAreaElement>>;
-  /** Cap description rows at 6 visible rows (then scroll); false = grow unbounded. */
-  descCapped: boolean;
-  onText: (key: string, text: string) => void;
-  onKeyDown: (
-    e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
-    row: OutlineRow,
-    index: number,
-  ) => void;
-}) {
-  return (
-    <div className="space-y-0.5">
-      {rows.map((row, i) => {
-        const pad = row.indent * 16;
-        const setRef = (el: HTMLInputElement | HTMLTextAreaElement | null) => {
-          if (el) inputRefs.current.set(row.key, el);
-          else inputRefs.current.delete(row.key);
-        };
-        return (
-          <div key={row.key} className="flex items-start gap-1.5" style={{ paddingLeft: pad }}>
-            {row.desc ? null : (
-              <span className="mt-0.5 shrink-0 select-none text-xs text-muted">–</span>
-            )}
-            {row.desc ? (
-              // A description is a plain multiline block — italic, no label. It
-              // grows to fit its (wrapped) content, capped at 6 rows unless the
-              // section header toggles "show all". Enter = newline, Shift+Tab
-              // pops a line out (see onRowKeyDown).
-              <AutoGrowTextarea
-                registerRef={setRef}
-                value={row.text}
-                capped={descCapped}
-                onChange={(e) => onText(row.key, e.target.value)}
-                onKeyDown={(e) => onKeyDown(e, row, i)}
-                className="w-full resize-none bg-transparent text-sm italic leading-snug text-muted outline-none"
-                placeholder="description…"
-              />
-            ) : (
-              // A title wraps onto multiple lines when long, but stays single-
-              // value: the task-row branch of onRowKeyDown preventDefaults Enter
-              // (→ new task row), so no literal newline is ever inserted.
-              <AutoGrowTextarea
-                registerRef={setRef}
-                value={row.text}
-                capped={false}
-                onChange={(e) => onText(row.key, e.target.value)}
-                onKeyDown={(e) => onKeyDown(e, row, i)}
-                className="w-full resize-none bg-transparent text-sm leading-snug text-fg outline-none"
-                placeholder="task…"
-              />
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 /* ---------------- committed ---------------- */
 
+/**
+ * The actions a card can take — CALLBACKS ONLY, and held in one object whose
+ * identity never changes for the life of a list (see `CommittedList`).
+ *
+ * Nothing that a card renders FROM belongs in here. It used to carry the whole
+ * `taskMap` and the list's current drop hint, which meant the bag changed
+ * identity on every task change and every dragover, so `memo(TaskCard)` could
+ * never bail out and one edit re-rendered every card on the canvas (TD-132).
+ * A card now reads its own task off `unit.task` and owns its own drop hint.
+ */
 interface CardHandlers {
-  taskMap: Record<string, Task>;
-  /** Set when an assignee filter (TD-59) is active — a card whose task isn't
-   *  directly assigned to this id is dimmed (it's shown only as context for a
-   *  matching descendant, see `filterUnitsByAssignee`). */
-  filterAssigneeId: string | null;
   onOpen: (id: string) => void;
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
-  /** Toggle the viewer as an assignee (SPACE hover shortcut). */
-  onAssignSelf: (id: string) => void;
-  /** Delete the task with an undo window (DELETE hover shortcut). */
-  onDelete: (id: string) => void;
-  /** Fling the task into a canvas group (the ↑ / → / ↓ hover shortcuts). */
-  onSend: (id: string, to: TaskPlacement) => void;
   /** Create a subtask under this task (from the hover "+ Subtask" button). */
   onAddSubtask: (parentId: string, title: string) => void;
-  dropHint: { id: string; pos: "before" | "after" } | null;
-  setDropHint: (h: { id: string; pos: "before" | "after" } | null) => void;
 }
 
-/** One task card + its children, rendered recursively (arbitrary depth). */
-function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHandlers }) {
+interface TaskCardProps {
+  unit: TaskUnit;
+  depth: number;
+  /** Set when an assignee filter (TD-59) is active — a card whose task isn't
+   *  directly assigned to this id is dimmed (it's shown only as context for a
+   *  matching descendant, see `filterUnitsByAssignee`). A prop rather than part
+   *  of `h` because the card RENDERS from it, so memo has to compare it. */
+  filterAssigneeId: string | null;
+  h: CardHandlers;
+}
+
+/** One task card + its children, rendered recursively (arbitrary depth).
+ *
+ *  Memoized (see the export at the bottom of this component): every prop is
+ *  either a primitive, the stable `h`, or a `unit` whose identity `useSectionUnits`
+ *  keeps stable across rebuilds — so a change to ONE task re-renders one card
+ *  instead of all of them. */
+function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [addingSub, setAddingSub] = useState(false);
+  // Which edge a hovered drop would land on. Card-local — as a single hint on the
+  // list it re-rendered every sibling on every dragover. Same shape as the kanban
+  // card's own `dropPos`.
+  const [hint, setHint] = useState<"before" | "after" | null>(null);
   const id = unit.taskId;
-  const t = id ? h.taskMap[id] : undefined;
+  const t = unit.task;
   const done = t?.status === "done";
-  // "D" on the hovered card toggles done: not-done → done (via the checkbox's
-  // old /complete path), done → building (setStatus clears completedAt).
-  useCardShortcut(cardRef, "d", () => {
-    if (!id) return;
-    if (done) h.onStatus(id, "building");
-    else h.onToggle(id);
-  });
-  // "1" / "2" on the hovered card set importance directly (Elevated / High) —
-  // the number shortcuts alongside "I"'s full picker.
-  useCardShortcut(cardRef, "1", () => id && h.onImportance(id, 1));
-  useCardShortcut(cardRef, "2", () => id && h.onImportance(id, 2));
-  // SPACE toggles the viewer as an assignee. Fires in capture + stopPropagation
-  // (via useCardShortcut), so it intercepts the canvas space-to-pan only while a
-  // card is hovered — space still pans everywhere else.
-  useCardShortcut(cardRef, " ", () => id && h.onAssignSelf(id));
-  // DELETE / Backspace removes the task (with a ~5s undo toast), or, for a card
-  // that's DONE, parks it in DONE THIS WEEK — see `deletionOf`. Beats the canvas
-  // editor's own Delete (which removes selected NODES) since it's hover-scoped.
-  useCardShortcut(cardRef, "delete", () => id && h.onDelete(id));
-  useCardShortcut(cardRef, "backspace", () => id && h.onDelete(id));
-  // Arrows triage the hovered card into a group, laid out the way the groups sit
-  // on the canvas: UP to this week's work, RIGHT to the backlog, DOWN to later.
-  // Hover-scoped and fired in capture, so they beat the canvas editor's own
-  // arrow-nudge of selected nodes — the same precedent as SPACE and DELETE.
-  useCardShortcut(cardRef, "arrowup", () => id && h.onSend(id, "thisWeek"));
-  useCardShortcut(cardRef, "arrowright", () => id && h.onSend(id, "backlog"));
-  useCardShortcut(cardRef, "arrowdown", () => id && h.onSend(id, "later"));
+  // The hover keyboard set — D · 1/2 · SPACE · DELETE · ↑→↓ — from the one shared
+  // definition every task card uses. It's hover-scoped and fires in capture, so
+  // it beats the canvas editor's own single-key tools, its Delete (which removes
+  // selected NODES), its space-to-pan and its arrow-nudge. The tray is resolved
+  // from this canvas's own nodes, so nothing needs passing in here.
+  useTaskCardShortcuts(cardRef, id);
   if (!id || !t) return null;
   const ic = IMPORTANCE_CARD[t.importance ?? 0];
   // Status ring + corner badge — canvas only, and only for "started" statuses
@@ -1502,11 +1135,11 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
   // map, so they get no ring/badge (done keeps its green wash below).
   const badge = STATUS_CANVAS_BADGE[t.status];
   const statusTone = STATUS_TONE[t.status];
-  const hint = h.dropHint?.id === id ? h.dropHint.pos : null;
+
   // Filtered-in only as context for a matching descendant (TD-59) — dim it so
   // the actual match still reads as the point of the filter.
-  const dimmedByFilter = h.filterAssigneeId
-    ? !(t.assigneeIds ?? []).includes(h.filterAssigneeId)
+  const dimmedByFilter = filterAssigneeId
+    ? !(t.assigneeIds ?? []).includes(filterAssigneeId)
     : false;
   const half = (e: React.DragEvent) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1528,14 +1161,19 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
           if (!e.dataTransfer.types.includes(SECTION_DND_MIME)) return;
           e.preventDefault();
           e.stopPropagation(); // over a card → not the section's blank-area zone
-          h.setDropHint({ id, pos: half(e) });
+          setHint(half(e));
         }}
-        onDragLeave={() => h.dropHint?.id === id && h.setDropHint(null)}
+        onDragLeave={(e) => {
+          // Ignore leaves into a child element — dragging across a control inside
+          // the card fires dragleave on the way past, and reacting makes the line
+          // flicker.
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHint(null);
+        }}
         onDrop={(e) => {
           e.stopPropagation(); // a card handled it — don't also fire the body zone
           const dragId = e.dataTransfer.getData(SECTION_DND_MIME);
           const pos = half(e);
-          h.setDropHint(null);
+          setHint(null);
           if (dragId && dragId !== id) h.onMove(dragId, id, pos);
         }}
         // The whole card is the open target (not just the title). Interactive
@@ -1584,7 +1222,13 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
       {unit.children.length || addingSub ? (
         <div className="mt-1.5 space-y-1.5">
           {unit.children.map((c) => (
-            <TaskCard key={c.taskId ?? c.title} unit={c} depth={depth + 1} h={h} />
+            <TaskCard
+              key={c.taskId ?? c.title}
+              unit={c}
+              depth={depth + 1}
+              filterAssigneeId={filterAssigneeId}
+              h={h}
+            />
           ))}
           {addingSub ? (
             <div style={{ marginLeft: 12 }}>
@@ -1600,6 +1244,33 @@ function TaskCard({ unit, depth, h }: { unit: TaskUnit; depth: number; h: CardHa
     </div>
   );
 }
+
+/** Does this unit describe the same thing as that one? Compares TASK IDENTITY
+ *  rather than fields: `taskMap` entries are replaced only when that task
+ *  actually changes, so one reference check settles a card's whole content.
+ *  Recurses because a card renders its own descendants. */
+const sameUnit = (a: TaskUnit, b: TaskUnit): boolean =>
+  a.taskId === b.taskId &&
+  a.task === b.task &&
+  a.children.length === b.children.length &&
+  a.children.every((c, i) => sameUnit(c, b.children[i]));
+
+/**
+ * The memo boundary that makes a big canvas cheap (TD-132).
+ *
+ * `useSectionUnits` allocates a fresh unit tree on every rebuild, so the default
+ * shallow compare would never match — hence the structural `sameUnit` on that one
+ * prop. Everything else is a primitive or the stable `h`, so a change to ONE task
+ * re-renders ONE card instead of every card on the canvas.
+ */
+const TaskCard = memo(
+  TaskCardInner,
+  (prev, next) =>
+    prev.depth === next.depth &&
+    prev.filterAssigneeId === next.filterAssigneeId &&
+    prev.h === next.h &&
+    sameUnit(prev.unit, next.unit),
+);
 
 /**
  * Inline task/subtask composer — the "+ Add task" / "+ Subtask" input. Mirrors
@@ -1674,16 +1345,12 @@ function InlineTaskComposer({
 function CommittedList({
   units,
   filterAssigneeId,
-  taskMap,
   onOpen,
   onToggle,
   onStatus,
   onAssign,
   onImportance,
   onMove,
-  onAssignSelf,
-  onDelete,
-  onSend,
   onAddTask,
   onAddSubtask,
   onDropIntoSection,
@@ -1691,28 +1358,46 @@ function CommittedList({
   units: TaskUnit[];
   /** TD-59: dims a card kept only as context for a matching descendant. */
   filterAssigneeId: string | null;
-  taskMap: Record<string, Task>;
   onOpen: (id: string) => void;
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
-  onAssignSelf: (id: string) => void;
-  onDelete: (id: string) => void;
-  onSend: (id: string, to: TaskPlacement) => void;
   onAddTask: (title: string) => void;
   onAddSubtask: (parentId: string, title: string) => void;
   /** Drop a card into THIS section's blank area (or an empty section) — lands it
    *  at the end as a top-level card, moving it (and its subtree) here. */
   onDropIntoSection: (dragId: string) => void;
 }) {
-  const [dropHint, setDropHint] = useState<{ id: string; pos: "before" | "after" } | null>(null);
   // True while a section-task drag hovers the list's blank area (not a card) —
   // draws a dashed ring so it reads as "drop here to move into this section".
   const [overSection, setOverSection] = useState(false);
 
-  const h: CardHandlers = { taskMap, filterAssigneeId, onOpen, onToggle, onStatus, onAssign, onImportance, onMove, onAssignSelf, onDelete, onSend, onAddSubtask, dropHint, setDropHint };
+  /* ONE handler bag with ONE identity for the life of the list — the memo
+   * boundary on `TaskCard` rests on it. Each entry is wrapped so its identity
+   * holds while still calling the current closure: these arrive off the workspace
+   * context, which rebuilds them every render, so passing them straight down made
+   * every card re-render on every task change (TD-132). */
+  const sOpen = useEventCallback(onOpen);
+  const sToggle = useEventCallback(onToggle);
+  const sStatus = useEventCallback(onStatus);
+  const sAssign = useEventCallback(onAssign);
+  const sImportance = useEventCallback(onImportance);
+  const sMove = useEventCallback(onMove);
+  const sAddSubtask = useEventCallback(onAddSubtask);
+  const h = useMemo<CardHandlers>(
+    () => ({
+      onOpen: sOpen,
+      onToggle: sToggle,
+      onStatus: sStatus,
+      onAssign: sAssign,
+      onImportance: sImportance,
+      onMove: sMove,
+      onAddSubtask: sAddSubtask,
+    }),
+    [sOpen, sToggle, sStatus, sAssign, sImportance, sMove, sAddSubtask],
+  );
   return (
     <div
       // Section-level drop zone. Card drops stopPropagation, so this fires only
@@ -1739,7 +1424,13 @@ function CommittedList({
       ].join(" ")}
     >
       {units.map((u) => (
-        <TaskCard key={u.taskId ?? u.title} unit={u} depth={0} h={h} />
+        <TaskCard
+          key={u.taskId ?? u.title}
+          unit={u}
+          depth={0}
+          filterAssigneeId={filterAssigneeId}
+          h={h}
+        />
       ))}
       {/* Always-present "+ Add task" composer at the bottom of the list. */}
       <InlineTaskComposer label="Add task" onSubmit={onAddTask} />

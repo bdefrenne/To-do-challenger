@@ -57,20 +57,19 @@ import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
 import { MIN_SECTION_HEIGHT } from "./SectionNode";
 import { SectionMembershipProvider } from "./SectionMembershipContext";
 import {
-  anchorTrioGroupIds,
+  anchoredTrayGroupIds,
   boardsFiledInSystemGroup,
   boardsNeedingInbox,
-  boardsNeedingWeekLane,
   buildSectionMembership,
   isInboxNode,
-  isThisWeekGroup,
+  isPinnedGroup,
+  DEAD_GROUP_KEYS,
   laneBoardId,
   masterSectionsByBoard,
+  LEGACY_WEEK_LANE_PREFIX,
   systemGroupId,
   systemGroupOf,
   systemLaneId,
-  thisWeekGroupId,
-  weekLaneId,
   SYSTEM_GROUPS,
   SYSTEM_GROUP_TITLE,
   type SystemGroup,
@@ -89,7 +88,19 @@ interface Viewport {
   scale: number;
 }
 
-const MIN_SCALE = 0.2;
+/** Dot-grid spacing in canvas units, and the smallest on-screen dot pitch we
+ *  tolerate — below that the grid reads as grey noise, so the step doubles. */
+const GRID_STEP = 24;
+const MIN_GRID_PITCH = 12;
+/** Breathing room between the tray hull and the tray boxes it wraps. */
+const TRAY_HULL_PAD = 20;
+
+// 1%, not a "readable" floor: `fitViewport` clamps to MIN_SCALE too, so the
+// floor doubles as a cap on how much canvas a fit can frame — at 0.2 a canvas
+// wider than ~5 screens simply could not be fitted, which is how this board
+// spends its life. Nothing scales with the floor (every node is in the DOM at
+// every zoom, and the grid pitch steps up on its own), so going lower is free.
+const MIN_SCALE = 0.01;
 const MAX_SCALE = 3;
 /** How long it takes to glide onto a peer's view. Long enough to read as travel
  *  (so you keep your bearings), short enough not to feel like waiting. */
@@ -100,7 +111,51 @@ const MAX_PLACE = 480;
  *  when they're first anchored into a stack (see the "Anchor BACKLOG/LATER"
  *  effect). Matches the tray-column gap the system-group reconciler already
  *  uses (`NEW_GROUP_SIZE.height + 120`). */
-const TRIO_GAP = 120;
+const TRAY_GAP = 120;
+
+/** The trays the CANVAS draws — `SYSTEM_GROUPS` minus DONE THIS WEEK.
+ *
+ *  The full list stays as it is in `sections.ts`: it drives `PLACEMENT_ORDER`,
+ *  `trayOfPlacement`, `PLACEMENT_BAR` and the project Boards view, all of which
+ *  still want the bucket. Only the canvas stops rendering a lane for it. */
+const CANVAS_SYSTEM_GROUPS = SYSTEM_GROUPS.filter((k) => k !== "doneThisWeek");
+
+/** Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
+ *  hand-made. Superseded by `systemLaneId("thisWeek", …)`; swept below once
+ *  `scripts/repair-week-lane-ids.ts` has moved their pins. */
+const isLegacyWeekLane = (n: CanvasNode, weekGroupId: string): boolean =>
+  n.kind === "section" &&
+  n.id.startsWith(LEGACY_WEEK_LANE_PREFIX) &&
+  n.data?.groupId === weekGroupId;
+
+/**
+ * Top-left of the tray column: clear of user content, to the LEFT of everything.
+ *
+ * Measured against USER nodes only. Include the trays themselves and each new
+ * one lands left of the last, so the column marches off to infinity as the set
+ * grows — and, worse, any drift in one tray becomes the base for the next.
+ */
+function trayColumnBase(
+  nodes: readonly CanvasNode[],
+  excludeId?: string,
+): { x: number; y: number } {
+  const anchors = nodes.filter(
+    (n) =>
+      n.kind !== "draw" && systemGroupOf(n) === null && n.id !== excludeId,
+  );
+  const minX = anchors.length ? Math.min(...anchors.map((n) => n.x)) : 0;
+  const minY = anchors.length ? Math.min(...anchors.map((n) => n.y)) : 0;
+  return {
+    x: Math.round(minX - NEW_GROUP_SIZE.width - 120),
+    y: Math.round(minY),
+  };
+}
+
+/** How far below the tray base an UNPINNED group has to sit before it counts as
+ *  drift rather than an arrangement. Deliberately generous: nobody parks a tray
+ *  four screens down on purpose, and anything they DID place by hand carries
+ *  `pinned` and is exempt regardless. */
+const TRAY_DRIFT_LIMIT = 4000;
 const uid = () => crypto.randomUUID();
 
 /** The task ids a text note links to (drawn as connectors to their cards). */
@@ -181,17 +236,29 @@ const groupMembers = (nodes: CanvasNode[], groupId: string): CanvasNode[] =>
     .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
     .sort((a, b) => a.position - b.position);
 
-/** A lane's slot in the INBOX column. Lanes used to all be created with
- *  `position: 0`, which left their order to a tie-break (storage insertion order)
- *  — so it could differ between clients and shuffle on reload. Derived from the
- *  board id instead: arbitrary but STABLE everywhere, with the "No board"
- *  catch-all pinned last. Kept well inside the fractional range the drop math
- *  uses, so a lane can still be re-slotted by hand. */
-const lanePosition = (boardId: string | null): number => {
-  if (boardId === null) return 1000;
-  let h = 0;
-  for (let i = 0; i < boardId.length; i++) h = (h * 31 + boardId.charCodeAt(i)) % 997;
-  return h;
+/** A lane's slot in its tray: the board's own index in the project, i.e. the
+ *  SIDEBAR order (TD-138).
+ *
+ *  Was a hash of the board id — stable everywhere, which fixed the original bug
+ *  (lanes all created at `position: 0`, so their order fell to storage insertion
+ *  order and shuffled between clients), but arbitrary: every tray ordered its
+ *  boards differently and none matched the sidebar or the project Boards view.
+ *  With every tray holding every board, the same order in each is what makes the
+ *  trays read as one grid — same columns, same order, every band.
+ *
+ *  "No board" isn't a board and has no sidebar slot, so it stays pinned last.
+ *  Kept well inside the fractional range the drop math uses, so a lane can still
+ *  be re-slotted by hand. */
+const NO_BOARD_POSITION = 1000;
+const lanePosition = (
+  boardId: string | null,
+  boardOrder: Map<string, number>,
+): number => {
+  if (boardId === null) return NO_BOARD_POSITION;
+  const i = boardOrder.get(boardId);
+  // A board the project doesn't list (another project's, bound by hand) sorts
+  // after the project's own, before "No board".
+  return i === undefined ? NO_BOARD_POSITION - 1 : i;
 };
 
 /** How far outside a group's box the drag cursor still counts as "inside" — a
@@ -369,12 +436,17 @@ const loadViewport = (canvasId: string): { viewport: Viewport; restored: boolean
     const raw = localStorage.getItem(`canvas-vp:${canvasId}`);
     if (raw) {
       const vp = JSON.parse(raw);
+      // `Number.isFinite`, not `typeof === "number"`: NaN and ±Infinity are
+      // numbers, and a NaN in the transform blanks the canvas with no way back.
+      // Scale is clamped too — a stored value outside the zoom range would let
+      // the buttons zoom past their own limits.
       if (
-        typeof vp?.x === "number" &&
-        typeof vp?.y === "number" &&
-        typeof vp?.scale === "number"
+        Number.isFinite(vp?.x) &&
+        Number.isFinite(vp?.y) &&
+        Number.isFinite(vp?.scale)
       ) {
-        return { viewport: vp, restored: true };
+        const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, vp.scale));
+        return { viewport: { x: vp.x, y: vp.y, scale }, restored: true };
       }
     }
   } catch {
@@ -453,10 +525,14 @@ const loadPen = (canvasId: string): Pen => {
 export function CanvasEditor({
   canvasId,
   canvasName,
+  projectId,
   filterAssigneeId = null,
 }: {
   canvasId: string;
   canvasName: string;
+  /** The project this canvas lays out. Scopes which boards the reconcilers draw
+   *  lanes for — see `canvasTaskNodes`. */
+  projectId: string;
   /** Show only this assignee's cards across every section (TD-59). Render-only
    *  — never patched into Liveblocks storage, so it can't fight over section
    *  heights with peers who have a different (or no) filter active. */
@@ -501,6 +577,43 @@ export function CanvasEditor({
     () => (nodesMap ? Object.values(nodesMap).map((n) => ({ ...n })) : []),
     [nodesMap],
   );
+
+  /**
+   * The tasks THIS canvas is responsible for.
+   *
+   * A canvas belongs to one project (TD-136) and draws lanes for that project's
+   * boards. Without this filter the reconcilers read the whole workspace, so a
+   * RYDR canvas would materialise an INBOX lane for a To Do Challenger board the
+   * moment a TDC task went unpinned — the client-side half of the same bug the
+   * server had, and the reason project-scoping `resolvePlacementSection` alone
+   * isn't enough.
+   *
+   * Two ways in, because scoping must not break a section someone bound by hand:
+   *   • the task's board belongs to this canvas's project (or, for a board-less
+   *     task, the task itself does), or
+   *   • it's explicitly pinned to a node ON this canvas — a cross-project lane
+   *     the user placed deliberately still shows its cards.
+   *
+   * So the machine only ever auto-draws for its own project, while anything a
+   * human pinned here keeps rendering.
+   */
+  const canvasTaskNodes = useMemo(() => {
+    const own = new Set<string>();
+    for (const p of projects) {
+      if (p.id !== projectId) continue;
+      for (const b of p.boards ?? []) own.add(b.id);
+    }
+    const here = new Set(nodes.map((n) => n.id));
+    return taskNodes.filter((t) => {
+      if (t.boardId) {
+        if (own.has(t.boardId)) return true;
+      } else if (taskMap[t.id]?.projectId === projectId) {
+        return true;
+      }
+      const pin = taskMap[t.id]?.canvasSectionId ?? null;
+      return pin !== null && here.has(pin);
+    });
+  }, [taskNodes, taskMap, projects, projectId, nodes]);
 
   // This editor only mounts client-side (after the canvas fetch resolves), so
   // reading localStorage in the initializer is safe — no SSR/hydration mismatch.
@@ -752,6 +865,46 @@ export function CanvasEditor({
     return m;
   }, [projects]);
 
+  /** This project's boards, in SIDEBAR order — the ordering every tray uses for
+   *  its lanes, and the set every tray holds a lane for (TD-138). `p.boards`
+   *  arrives sorted by `boards.position`, the same order the sidebar and the
+   *  project Boards view's columns read. */
+  const projectBoards = useMemo(
+    () => projects.find((p) => p.id === projectId)?.boards ?? [],
+    [projects, projectId],
+  );
+  const boardOrder = useMemo(
+    () => new Map(projectBoards.map((b, i) => [b.id, i])),
+    [projectBoards],
+  );
+
+  /**
+   * What the two reconcilers below actually depend on: WHICH sections and groups
+   * exist, and what each one is (its flags, its board, its group, its slot).
+   *
+   * Deliberately geometry-free, and for the same reason `sectionsKey` is. Every
+   * pointermove of a drag patches storage — that's how a node's new x/y reaches
+   * the screen — which gives `nodes` a fresh identity, and both reconcilers were
+   * keyed on that. So each drag frame re-ran five membership passes over every
+   * task on the canvas (`boardsNeedingInbox` alone builds a whole
+   * `SectionMembership`), which is exactly the work a drag can least afford
+   * (TD-132). Where a group SITS still matters when one is created — the effects
+   * read it live off `nodesRef`, so a create always places against current
+   * geometry.
+   *
+   * Only sections and groups are encoded: a `draw` node's `data` carries its whole
+   * point list, and stringifying that per frame would reintroduce the cost this
+   * removes.
+   */
+  const structureKey = useMemo(
+    () =>
+      nodes
+        .filter((n) => n.kind === "section" || n.kind === "section_group")
+        .map((n) => `${n.id}:${n.kind}:${n.position}:${JSON.stringify(n.data ?? {})}`)
+        .join("|"),
+    [nodes],
+  );
+
   /**
    * Reconcile the machine-managed groups and their per-board lanes — the same
    * derive-and-mirror-back shape as the group layout above.
@@ -775,49 +928,85 @@ export function CanvasEditor({
    */
   useEffect(() => {
     if (!nodesMap) return;
+    // Read live rather than closed over: this effect is keyed on `structureKey`,
+    // which deliberately ignores geometry, so the closure's `nodes` could be a few
+    // drag frames stale — and `trayColumnBase` below is pure geometry.
+    const nodes = nodesRef.current;
     // Where the tray column starts. Measured against USER content only — include
     // the trays and each new one would be placed left of the last, so the column
     // would march off to infinity as the set grew.
-    const anchors = nodes.filter(
-      (n) => n.kind !== "draw" && systemGroupOf(n) === null,
-    );
-    const baseX = Math.round(
-      (anchors.length ? Math.min(...anchors.map((n) => n.x)) : 0) -
-        NEW_GROUP_SIZE.width -
-        120,
-    );
-    const baseY = Math.round(
-      anchors.length ? Math.min(...anchors.map((n) => n.y)) : 0,
-    );
+    const { x: baseX, y: baseY } = trayColumnBase(nodes);
     const nodeIds = new Set(nodes.map((n) => n.id));
     const creates: StoredNode[] = [];
     const removes: string[] = [];
+
+    // DONE THIS WEEK is a placement bucket, not a canvas tray. Finished work
+    // stays in its own board's lane with the green wash until it's archived —
+    // `archivedAt` is what takes it off every active surface. The bucket itself
+    // is untouched: the project Boards view still renders its band and its
+    // "Clear Done" sweep (TD-87).
+    //
+    // Sweep any tray a previous version left behind, so it clears itself from
+    // storage on next load rather than sitting there forever.
+    const retired = systemGroupId("doneThisWeek", canvasId);
+    removes.push(
+      ...nodes
+        .filter((n) => n.id === retired || systemGroupOf(n) === "doneThisWeek")
+        .map((n) => n.id),
+    );
+
+    // Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
+    // hand-made (TD-137). The reconciler now creates `thisWeek-<canvasId>-…`
+    // lanes for the same boards, so leaving these would double every lane in the
+    // group. Their pins are rewritten by `npm run repair:week-lane-ids`, which
+    // must run BEFORE a canvas is opened — a pin left naming a swept node reads
+    // as unplaced and the card falls back to INBOX.
+    const weekGroupId = systemGroupId("thisWeek", canvasId);
+    removes.push(
+      ...nodes.filter((n) => isLegacyWeekLane(n, weekGroupId)).map((n) => n.id),
+    );
     const repairs: { id: string; patch: Partial<StoredNode> }[] = [];
 
-    SYSTEM_GROUPS.forEach((kind, i) => {
+    CANVAS_SYSTEM_GROUPS.forEach((kind, i) => {
       const groupId = systemGroupId(kind, canvasId);
       const group = nodes.find((n) => n.id === groupId);
       const existingLanes = nodes.filter(
         (n) => n.kind === "section" && systemGroupOf(n) === kind,
       );
-      const wanted =
-        kind === "inbox"
-          ? boardsNeedingInbox(nodes, taskNodes, taskMap)
-          : boardsFiledInSystemGroup(kind, canvasId, taskNodes, taskMap);
+      // EVERY board of this project gets a lane in EVERY tray, always (TD-138).
+      // Lanes used to be created on demand and removed when the last card left,
+      // so the trays were ragged and each ordered its boards differently. A
+      // board is a column now: same columns, same order, every band — which is
+      // what lets you read down the trays as one grid, and matches the project
+      // Boards view exactly.
+      //
+      // Plus the "No board" catch-all, which IS still on demand: it isn't a
+      // board, has no sidebar slot, and an empty one would be a column headed by
+      // nothing.
+      const wanted = new Set<string | null>(projectBoards.map((b) => b.id));
+      // Guarded: `boardsNeedingInbox` builds a whole `SectionMembership`, and
+      // asking it about a case that usually doesn't exist would pay that cost on
+      // every reconcile (the class of work TD-132 was about). No board-less task
+      // anywhere ⇒ no "No board" lane, without resolving anything.
+      const anyBoardless = canvasTaskNodes.some((t) => t.boardId === null);
+      if (
+        anyBoardless &&
+        (kind === "inbox"
+          ? boardsNeedingInbox(nodes, canvasTaskNodes, taskMap).has(null)
+          : boardsFiledInSystemGroup(kind, canvasId, canvasTaskNodes, taskMap).has(
+              null,
+            ))
+      )
+        wanted.add(null);
       const wantedIds = new Set(
         [...wanted].map((b) => systemLaneId(kind, canvasId, b)),
       );
 
-      // Lanes whose board has nothing here any more — drop them, so an emptied
-      // tray shrinks away instead of leaving a wall of empty boxes.
+      // A machine lane whose board has left the project (or a "No board" lane
+      // with nothing board-less left) — nothing here holds it open any more.
       removes.push(
         ...existingLanes.filter((n) => !wantedIds.has(n.id)).map((n) => n.id),
       );
-      if (kind === "inbox" && !wanted.size) {
-        // Nothing to triage: the INBOX group goes too.
-        if (group) removes.push(groupId);
-        return;
-      }
 
       if (!group)
         creates.push({
@@ -838,7 +1027,24 @@ export function CanvasEditor({
           data: { [kind]: true, layout: "portrait" },
         });
 
+      // Boards this group already covers by hand. `resolvePlacementSection`
+      // prefers an existing member over a derived lane, so adding a machine one
+      // beside it would give the board two columns and send work to whichever
+      // won the tie-break. Your own named lanes stay the board's lane.
+      const covered = new Set(
+        nodes
+          .filter(
+            (n) =>
+              n.kind === "section" &&
+              n.data?.groupId === groupId &&
+              systemGroupOf(n) === null,
+          )
+          .map((n) => laneBoardId(n))
+          .filter((b): b is string => b !== null),
+      );
+
       for (const boardId of wanted) {
+        if (boardId !== null && covered.has(boardId)) continue;
         const laneId = systemLaneId(kind, canvasId, boardId);
         if (nodeIds.has(laneId)) continue;
         creates.push({
@@ -851,7 +1057,7 @@ export function CanvasEditor({
           width: NEW_SECTION_SIZE.width,
           height: MIN_SECTION_HEIGHT,
           color: null,
-          position: lanePosition(boardId),
+          position: lanePosition(boardId, boardOrder),
           data: {
             [kind]: true,
             groupId,
@@ -867,19 +1073,30 @@ export function CanvasEditor({
       // orphaned lane still exists. A non-member is invisible to
       // `computeGroupLayout`, so it kept stale coordinates forever and piled up
       // on its neighbours. The reconciler owns these lanes, so it repairs them.
+      // Dead flags on this tray's own group: `pinned` meant something else
+      // (every group in a drag, which froze the arrangement), `anchoredToWeek`
+      // gated an anchor that no longer exists. Left in place they read as live
+      // state to the next person, which is precisely how `anchoredToWeek` cost a
+      // day of archaeology. The reconciler owns this group, so it cleans it.
+      if (group && DEAD_GROUP_KEYS.some((k) => k in (group.data ?? {}))) {
+        const cleaned = { ...(group.data ?? {}) };
+        for (const k of DEAD_GROUP_KEYS) delete cleaned[k];
+        repairs.push({ id: groupId, patch: { data: cleaned as StoredNode["data"] } });
+      }
+
       repairs.push(
         ...existingLanes
           .filter(
             (n) =>
               wantedIds.has(n.id) &&
               (n.data?.groupId !== groupId ||
-                n.position !== lanePosition(laneBoardId(n))),
+                n.position !== lanePosition(laneBoardId(n), boardOrder)),
           )
           .map((n) => ({
             id: n.id,
             patch: {
               data: { ...(n.data ?? {}), groupId } as StoredNode["data"],
-              position: lanePosition(laneBoardId(n)),
+              position: lanePosition(laneBoardId(n), boardOrder),
             },
           })),
       );
@@ -890,99 +1107,99 @@ export function CanvasEditor({
     if (repairs.length) patchMany(repairs);
   }, [
     nodesMap,
-    nodes,
-    taskNodes,
+    // `nodes` is read through `nodesRef`, not closed over — `structureKey` is the
+    // part of it this depends on. See `structureKey`.
+    structureKey,
+    canvasTaskNodes,
     taskMap,
     canvasId,
     boardNames,
+    boardOrder,
+    projectBoards,
     putNode,
     removeMany,
     patchMany,
   ]);
 
   /**
-   * Keep BACKLOG pinned directly under THIS WEEK, and LATER directly under
-   * BACKLOG — continuously, not just the first time all three exist together.
-   * `computeGroupLayout` keeps auto-fitting each group's box to its own
-   * content forever (a task added, a note expanded, a lane created all grow
-   * it), so a one-time snapshot of the neighbour's height goes stale the
-   * moment that neighbour grows, and the frames start to overlap.
+   * Arrange the trays around THIS WEEK — TODAY above it, INBOX to its LEFT,
+   * BACKLOG under it, LATER under BACKLOG — but only for as long as nobody has
+   * said otherwise.
    *
-   * Re-deriving position from the live sibling height on every change is safe
-   * against dragging: grabbing any one of the trio translates all three by an
-   * equal delta (see `anchorTrioGroupIds` in `onNodePointerDown`), which
-   * preserves the exact gap this effect expects — so after a drag the
-   * derived position already matches where the drag put them and `place`
-   * below is a no-op.
+   * THIS WEEK is the head because it's the one you work out of. The column
+   * around it reads as a timescale: TODAY above (nearest), then this week, then
+   * BACKLOG and LATER as what you push DOWN into. INBOX sits beside the whole
+   * thing because triage is a sideways move — what's arrived, not yet a when.
+   *
+   * The stacking has to be continuous rather than a one-time placement, because
+   * `computeGroupLayout` keeps auto-fitting each group's box to its own content
+   * forever (a task added, a note expanded, a lane created all grow it), so a
+   * snapshot of the neighbour's height goes stale the moment it grows and the
+   * frames start to overlap.
+   *
+   * But continuous derivation must never outrank a human. A group carrying
+   * `pinned` was dragged somewhere deliberately, so this leaves it exactly where
+   * it is and hangs the rest of the stack off its real position. Without that
+   * guard the position is derived rather than stored, dragging BACKLOG snaps it
+   * back on the next render, and — worse — it can be driven by a feedback loop:
+   * the THIS WEEK fallback below used to seed itself from BACKLOG while this
+   * effect seeded BACKLOG from THIS WEEK, which marched the whole trio ~2,100px
+   * down the canvas on every materialisation until it was off-screen (BEN-74).
    */
   useEffect(() => {
     if (!nodesMap) return;
-    const weekId = thisWeekGroupId(nodes);
-    if (!weekId) return;
-    const week = nodes.find((n) => n.id === weekId);
+    const week = nodes.find(
+      (n) => n.id === systemGroupId("thisWeek", canvasId),
+    );
     if (!week) return;
+    const inbox = nodes.find((n) => n.id === systemGroupId("inbox", canvasId));
+    const today = nodes.find((n) => n.id === systemGroupId("today", canvasId));
     const backlog = nodes.find((n) => n.id === systemGroupId("backlog", canvasId));
     const later = nodes.find((n) => n.id === systemGroupId("later", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
-    const place = (group: CanvasNode | undefined, x: number, y: number) => {
-      if (group && (group.x !== x || group.y !== y)) {
+    /** Place a group unless a human already has. Returns where it actually
+     *  ended up — pinned or not — so the next one down follows the truth on
+     *  screen rather than where this effect wishes it were. */
+    const place = (
+      group: CanvasNode | undefined,
+      x: number,
+      y: number,
+    ): CanvasNode | null => {
+      if (!group) return null;
+      if (isPinnedGroup(group)) return group;
+      if (group.x !== x || group.y !== y) {
         patches.push({ id: group.id, patch: { x, y } });
       }
+      return { ...group, x, y };
     };
-    let nextY = week.y + week.height + TRIO_GAP;
-    if (backlog) {
-      place(backlog, week.x, nextY);
-      nextY += backlog.height + TRIO_GAP;
+    // RESCUE. The head of the stack is placed once, at creation, and nothing
+    // ever moves it again — so a canvas that ran the old ratcheting code is left
+    // with the trio thousands of px below everything, looking deleted, with no
+    // path back. Pull it home if it has drifted absurdly far and nobody has
+    // claimed its position. `pinned` is the whole safety argument: a group you
+    // put somewhere is exempt no matter how far out it sits.
+    const home = trayColumnBase(nodes, week.id);
+    if (!isPinnedGroup(week) && week.y - home.y > TRAY_DRIFT_LIMIT) {
+      patchMany([{ id: week.id, patch: { x: home.x, y: home.y } }]);
+      return; // BACKLOG/LATER follow on the next pass, off the corrected head
     }
-    place(later, week.x, nextY);
+
+    // THIS WEEK owns its own position; everything else hangs off it.
+    let above = week;
+    above = place(backlog, above.x, above.y + above.height + TRAY_GAP) ?? above;
+    place(later, above.x, above.y + above.height + TRAY_GAP);
+    // TODAY above, INBOX to the left. Both measured from their OWN size, so a
+    // tray that has grown (every board gets a lane now — TD-138) still sits
+    // flush against THIS WEEK instead of overlapping it or drifting away.
+    //
+    // Anchoring upward is safe here in a way it wasn't for the old fallback:
+    // TODAY's position is derived from `week`, and nothing derives `week` from
+    // TODAY, so growth moves TODAY's top edge and stops. A cycle in that
+    // direction is what marched the whole arrangement off-screen (BEN-74).
+    if (today) place(today, week.x, week.y - today.height - TRAY_GAP);
+    if (inbox) place(inbox, week.x - inbox.width - TRAY_GAP, week.y);
     if (patches.length) patchMany(patches);
   }, [nodesMap, nodes, canvasId, patchMany]);
-
-  /* ---- THIS WEEK: materialise the lane an agent's placement is waiting on ---- */
-
-  /**
-   * When something files a task on the THIS WEEK group for a board the group
-   * doesn't cover yet, the pin names the lane's DERIVED id (`weekLaneId`) and
-   * this creates the node — the client half of `resolveThisWeekSection`.
-   *
-   * It has to happen here rather than server-side because nodes live in
-   * Liveblocks storage: a row the server inserted wouldn't reach an open canvas
-   * until storage re-hydrated, whereas tasks arrive on the ≤2s poll. So the
-   * server pins to the id the lane WILL have, and the placement shows up live.
-   *
-   * Unlike the INBOX reconciler above, this only ever CREATES. The group is
-   * hand-curated, so once a lane exists it's an ordinary section the user owns —
-   * renameable, movable, deletable, and never auto-removed when it empties.
-   */
-  useEffect(() => {
-    if (!nodesMap) return;
-    const groupId = thisWeekGroupId(nodes);
-    if (!groupId) return;
-    const missing = boardsNeedingWeekLane(nodes, taskNodes, taskMap);
-    if (!missing.size) return;
-    // Append after the group's current members, so a new lane never shoves its
-    // way into the middle of an arrangement the user built by hand.
-    let next =
-      Math.max(0, ...groupMembers(nodes, groupId).map((m) => m.position)) + 1;
-    for (const boardId of missing) {
-      putNode({
-        id: weekLaneId(groupId, boardId),
-        kind: "section",
-        content: boardId ? (boardNames.get(boardId) ?? "") : "",
-        // computeGroupLayout owns the real position; these are just a first frame.
-        x: 0,
-        y: 0,
-        width: NEW_SECTION_SIZE.width,
-        height: MIN_SECTION_HEIGHT,
-        color: null,
-        position: next++,
-        data: {
-          groupId,
-          ...(boardId ? { boardId } : { name: "No board" }),
-        },
-      });
-    }
-  }, [nodesMap, nodes, taskNodes, taskMap, boardNames, putNode]);
 
   /** Identity of the section set as far as membership and placement are
    *  concerned: which sections exist and which board each system lane serves.
@@ -1030,8 +1247,8 @@ export function CanvasEditor({
   /** Which Section shows which tasks, for this whole canvas. One pass, shared
    *  by every Section via context — see SectionMembershipContext. */
   const membership = useMemo(
-    () => buildSectionMembership(sectionNodes, taskNodes, taskMap),
-    [sectionNodes, taskNodes, taskMap],
+    () => buildSectionMembership(sectionNodes, canvasTaskNodes, taskMap),
+    [sectionNodes, canvasTaskNodes, taskMap],
   );
 
   /**
@@ -1049,12 +1266,8 @@ export function CanvasEditor({
     (placement: TaskPlacement, boardId: string | null): string | null => {
       if (placement === "inbox") return null;
       const all = nodesRef.current;
-      const groupId =
-        placement === "thisWeek"
-          ? thisWeekGroupId(all)
-          : systemGroupId(placement, canvasId);
-      // Nothing starred THIS WEEK — there's no such destination on this canvas.
-      if (!groupId) return null;
+      // Every bucket's group has a derived id now, THIS WEEK included (TD-137).
+      const groupId = systemGroupId(placement, canvasId);
 
       // An existing member for this board always wins, so the user's own lanes
       // are what cards land in. Same ordering as `masterSectionsByBoard` and the
@@ -1069,10 +1282,7 @@ export function CanvasEditor({
         .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1))[0];
       if (existing) return existing.id;
 
-      const laneId =
-        placement === "thisWeek"
-          ? weekLaneId(groupId, boardId)
-          : systemLaneId(placement, canvasId, boardId);
+      const laneId = systemLaneId(placement, canvasId, boardId);
       if (!all.some((n) => n.id === laneId)) {
         putNode({
           id: laneId,
@@ -1084,15 +1294,11 @@ export function CanvasEditor({
           width: NEW_SECTION_SIZE.width,
           height: MIN_SECTION_HEIGHT,
           color: null,
-          // THIS WEEK is hand-arranged, so a new lane APPENDS rather than
-          // shoving its way into the middle of it. A system tray is sorted by
-          // the same board hash its reconciler uses.
-          position:
-            placement === "thisWeek"
-              ? Math.max(0, ...groupMembers(all, groupId).map((m) => m.position)) + 1
-              : lanePosition(boardId),
+          // Sorted by the same sidebar order the reconciler uses, so a lane
+          // materialised here lands in the column it would have had anyway.
+          position: lanePosition(boardId, boardOrder),
           data: {
-            ...(placement === "thisWeek" ? {} : { [placement]: true }),
+            [placement]: true,
             groupId,
             ...(boardId ? { boardId } : { name: "No board" }),
           },
@@ -1100,7 +1306,7 @@ export function CanvasEditor({
       }
       return laneId;
     },
-    [canvasId, boardNames, putNode],
+    [canvasId, boardNames, boardOrder, putNode],
   );
 
   // Lend the resolution to WorkspaceContext so its shared drag paths can re-pin
@@ -1610,8 +1816,9 @@ export function CanvasEditor({
   }, [linksKey, linkDrag]);
 
   /* -------- zoom -------- */
-  const zoomAt = useCallback(
-    (clientX: number, clientY: number, factor: number) => {
+  /** Rescale about a screen point, keeping whatever sits under it fixed. */
+  const zoomAbout = useCallback(
+    (clientX: number, clientY: number, nextScaleOf: (current: number) => number) => {
       // Cached rect: a wheel-driven zoom fires continuously, and reading it live
       // forces a layout flush per tick right after the transform changed.
       const rect = containerRect();
@@ -1619,12 +1826,24 @@ export function CanvasEditor({
       setViewport((vp) => {
         const mx = clientX - rect.left;
         const my = clientY - rect.top;
-        const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, vp.scale * factor));
+        const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, nextScaleOf(vp.scale)));
         const k = next / vp.scale;
         return { scale: next, x: mx - (mx - vp.x) * k, y: my - (my - vp.y) * k };
       });
     },
     [containerRect, cancelJump],
+  );
+
+  const zoomAt = useCallback(
+    (clientX: number, clientY: number, factor: number) =>
+      zoomAbout(clientX, clientY, (scale) => scale * factor),
+    [zoomAbout],
+  );
+
+  const zoomToAt = useCallback(
+    (clientX: number, clientY: number, scale: number) =>
+      zoomAbout(clientX, clientY, () => scale),
+    [zoomAbout],
   );
 
   /* -------- fit to content -------- */
@@ -1722,6 +1941,39 @@ export function CanvasEditor({
       if (boundsKey) fitTo(); // empty canvas: nothing to frame, just reveal it
       setPendingFit(false);
     }, wait);
+    return () => clearTimeout(t);
+  }, [pendingFit, nodesMap, boundsKey, fitTo]);
+
+  // Rescue a restored view that frames NOTHING. A saved viewport is per-user and
+  // long-lived, so a stale one (content moved away, a bug wrote a bad camera)
+  // opens the canvas on blank grid with no clue which way to pan — and the fit
+  // above never runs, because there IS a saved view. So: once per mount, after
+  // the content has settled, if not one node's screen box overlaps the
+  // container, fall back to a fit.
+  //
+  // Deliberately "no overlap AT ALL", not "mostly off-screen": panning into
+  // whitespace next to your work is a normal thing to do, and this must never
+  // yank the camera back from a view the user chose.
+  const rescuedRef = useRef(false);
+  useEffect(() => {
+    if (pendingFit) return; // the first-visit fit owns the camera
+    if (rescuedRef.current) return;
+    if (!nodesMap || !boundsKey) return;
+    const t = setTimeout(() => {
+      if (rescuedRef.current) return;
+      const b = boundsOf(nodesRef.current);
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!b || !rect?.width || !rect.height) return;
+      rescuedRef.current = true;
+      const vp = vpRef.current;
+      const left = b.minX * vp.scale + vp.x;
+      const top = b.minY * vp.scale + vp.y;
+      const right = b.maxX * vp.scale + vp.x;
+      const bottom = b.maxY * vp.scale + vp.y;
+      const offScreen =
+        right <= 0 || bottom <= 0 || left >= rect.width || top >= rect.height;
+      if (offScreen) fitTo();
+    }, 400);
     return () => clearTimeout(t);
   }, [pendingFit, nodesMap, boundsKey, fitTo]);
 
@@ -1952,12 +2204,12 @@ export function CanvasEditor({
       const moveIds = new Set(sel);
       if (node.kind === "section_group") {
         for (const m of groupMembers(nodesRef.current, node.id)) moveIds.add(m.id);
-        // THIS WEEK / BACKLOG / LATER travel as one rigid unit — grabbing any
-        // one of the three drags the other two along with it, preserving
-        // whatever relative offset they currently sit at.
-        const trio = anchorTrioGroupIds(nodesRef.current, canvasId);
-        if (trio.has(node.id)) {
-          for (const gid of trio) {
+        // The trays arranged around THIS WEEK travel as one rigid unit —
+        // grabbing any one drags the others along, preserving whatever relative
+        // offset they currently sit at.
+        const anchored = anchoredTrayGroupIds(nodesRef.current, canvasId);
+        if (anchored.has(node.id)) {
+          for (const gid of anchored) {
             if (gid === node.id) continue;
             moveIds.add(gid);
             for (const m of groupMembers(nodesRef.current, gid)) moveIds.add(m.id);
@@ -2031,6 +2283,28 @@ export function CanvasEditor({
         if (moved) {
           history.resume();
           setDraggingIds(new Set());
+          // The group you GRABBED is the one you meant to place, so only that
+          // one stops being auto-arranged (see `isPinnedGroup`). The others
+          // travelled with it and go on being arranged around it — flagging
+          // them all is what froze the whole layout after a single drag.
+          // Re-read: `node` is a pointerdown snapshot, so merging its `data`
+          // would revert anything written during the drag (a peer renaming the
+          // group, the reconciler cleaning a dead key).
+          const dragged =
+            node.kind === "section_group"
+              ? (nodesRef.current.find((n) => n.id === node.id) ?? node)
+              : null;
+          if (dragged && !isPinnedGroup(dragged)) {
+            const cur = dragged;
+            patchMany([
+              {
+                id: node.id,
+                patch: {
+                  data: { ...(cur.data ?? {}), placed: true } as StoredNode["data"],
+                },
+              },
+            ]);
+          }
           // Settle a dragged section into (or out of) a group by where the CURSOR
           // released. Inside a group → set membership + a slot; the layout mirror
           // then snaps it into place. Outside all groups → release it.
@@ -2257,25 +2531,6 @@ export function CanvasEditor({
         patchMany([{ id, patch: patch as Partial<StoredNode> }]),
       resizeStart: () => history.pause(),
       resizeEnd: () => history.resume(),
-      setThisWeek: (node, thisWeek) => {
-        const updates: { id: string; patch: Partial<StoredNode> }[] = [
-          { id: node.id, patch: { data: { ...node.data, thisWeek } } },
-        ];
-        // One THIS WEEK group per canvas: marking this one demotes any other.
-        // Server-side resolution picks a single group, so two flagged groups
-        // would silently make one of them a decoy.
-        if (thisWeek) {
-          for (const other of nodesRef.current) {
-            if (other.id !== node.id && isThisWeekGroup(other)) {
-              updates.push({
-                id: other.id,
-                patch: { data: { ...other.data, thisWeek: false } },
-              });
-            }
-          }
-        }
-        patchMany(updates);
-      },
       remove: (id) => {
         deleteNodes([id]);
         setSelected((s) => {
@@ -2300,6 +2555,33 @@ export function CanvasEditor({
     return slotCaretRect(g, members, dropSlotIndex, groupLayoutOf(g));
   }, [dropSlotIndex, groupDropTarget, nodes, draggingIds]);
 
+  // The purple hull around the machine-managed trays (INBOX / TODAY / THIS WEEK
+  // / BACKLOG / LATER). Those five travel as one rigid unit when you drag any of
+  // them (see `anchoredTrayGroupIds`), and nothing on screen said so — the
+  // outline is that fact, drawn. Derived from the trays' live boxes each render,
+  // so it tracks the arrangement (and a re-derived group height) without any
+  // stored state of its own; it is not a node, so it can't be selected, dragged
+  // or deleted.
+  const trayHull = useMemo(() => {
+    const ids = anchoredTrayGroupIds(nodes, canvasId);
+    if (ids.size < 2) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      if (!ids.has(n.id)) continue;
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + (n.width ?? 0));
+      maxY = Math.max(maxY, n.y + (n.height ?? 0));
+    }
+    if (!Number.isFinite(minX)) return null;
+    return {
+      x: minX - TRAY_HULL_PAD,
+      y: minY - TRAY_HULL_PAD,
+      w: maxX - minX + TRAY_HULL_PAD * 2,
+      h: maxY - minY + TRAY_HULL_PAD * 2,
+    };
+  }, [nodes, canvasId]);
+
   // Frames render behind everything (they're backdrops); text + sections layer
   // by z-order among themselves.
   // Section groups are backdrops for their members, so they render in a back
@@ -2317,12 +2599,22 @@ export function CanvasEditor({
   // board's master and this week's work can't drift apart (see
   // `masterSectionsByBoard`, which the server's SQL twin mirrors).
   const masterByBoard = new Map<string, { id: string; name: string }>();
-  for (const [bid, n] of masterSectionsByBoard(nodes)) {
+  for (const [bid, n] of masterSectionsByBoard(nodes, canvasId)) {
     // Label it the way its header reads: its own name if it has one, else the
     // board's (`content`) — this feeds siblings' "Send to …" button.
     const own = ((n.data?.name as string | undefined) ?? "").trim();
     masterByBoard.set(bid, { id: n.id, name: own || n.content });
   }
+
+  // Dot grid geometry. The spacing steps up in CANVAS units as you zoom out, so
+  // the on-screen pitch stays legible instead of collapsing to a 4.8px mush at
+  // MIN_SCALE. The offset is reduced mod one tile: a repeating background is
+  // periodic in its tile, so this paints identically to the raw pan while
+  // keeping `background-position` small.
+  let gridStep = GRID_STEP;
+  while (gridStep * viewport.scale < MIN_GRID_PITCH) gridStep *= 2;
+  const gridTile = gridStep * viewport.scale;
+  const gridOffset = (v: number) => ((v % gridTile) + gridTile) % gridTile;
 
   const cursor = spaceDown
     ? "grab"
@@ -2457,7 +2749,7 @@ export function CanvasEditor({
       <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-lg border border-border bg-surface p-1 text-sm shadow-sm">
         <ToolBtn onClick={() => zoomAtCenter(0.8)} title="Zoom out">−</ToolBtn>
         <button
-          onClick={() => setViewport((v) => ({ ...v, scale: 1 }))}
+          onClick={() => zoomToAtCenter(1)}
           className="min-w-[3rem] rounded px-2 py-1 text-center text-xs text-muted hover:bg-surface-2"
           title="Reset zoom"
         >
@@ -2491,8 +2783,8 @@ export function CanvasEditor({
         style={{
           cursor,
           backgroundImage: "radial-gradient(circle, var(--color-border-strong) 1px, transparent 1px)",
-          backgroundSize: `${24 * viewport.scale}px ${24 * viewport.scale}px`,
-          backgroundPosition: `${viewport.x}px ${viewport.y}px`,
+          backgroundSize: `${gridTile}px ${gridTile}px`,
+          backgroundPosition: `${gridOffset(viewport.x)}px ${gridOffset(viewport.y)}px`,
         }}
       >
         <div
@@ -2509,6 +2801,21 @@ export function CanvasEditor({
             opacity: pendingFit ? 0 : undefined,
           }}
         >
+          {/* The trays' shared outline. First sibling with no z-index, so it
+              paints behind every node — a backdrop, never a target
+              (`pointer-events-none` keeps clicks going to the canvas beneath). */}
+          {trayHull ? (
+            <div
+              className="pointer-events-none absolute rounded-2xl border-2 border-accent/40 bg-accent/[0.04]"
+              style={{
+                left: trayHull.x,
+                top: trayHull.y,
+                width: trayHull.w,
+                height: trayHull.h,
+              }}
+            />
+          ) : null}
+
           {ordered.map((node) => {
             const bid = node.data?.boardId as string | undefined;
             const master = bid ? masterByBoard.get(bid) : undefined;
@@ -2793,6 +3100,13 @@ export function CanvasEditor({
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
     zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+
+  /** Snap to an absolute zoom level without moving what's under the centre. */
+  function zoomToAtCenter(scale: number) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    zoomToAt(rect.left + rect.width / 2, rect.top + rect.height / 2, scale);
   }
 
   function submitStickyDraft() {

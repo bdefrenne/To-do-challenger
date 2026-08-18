@@ -15,7 +15,82 @@ import { useEffect, useRef, type RefObject } from "react";
  *
  * `onFire` is held in a ref so the listener is registered once, not on every
  * render (callers pass a fresh closure each time).
+ *
+ * ONE window listener serves every card, not one per (card × key). Each card
+ * registers nine of these, so on a canvas with a couple of hundred cards the
+ * naive version put ~2,000 capture-phase listeners on `window` — and every
+ * keystroke ANYWHERE in the app (typing a title, filtering assignees) had to run
+ * all of them, each calling `matches(":hover")`, which forces a style resolution.
+ * The shared listener below resolves hover ONCE per keypress and then does map
+ * lookups, which is what makes typing over a full canvas feel instant.
  */
+
+/** One live registration: which element to resolve a card from, and what to
+ *  fire. `fireRef` rather than a function so re-renders never re-register. */
+interface Entry {
+  ref: RefObject<HTMLElement | null>;
+  fireRef: { current: () => void };
+}
+
+/** key (lower-case, as `useCardShortcut` receives it) → the cards listening. */
+const registry = new Map<string, Set<Entry>>();
+/** Installed with the first entry, removed with the last — so a page carrying no
+ *  cards (and SSR) never has a listener at all. */
+let listening = false;
+
+function onKey(e: KeyboardEvent) {
+  const entries = registry.get(e.key.toLowerCase());
+  if (!entries?.size) return;
+  // Ignore auto-repeat: each card shortcut is one discrete action, and it stops
+  // a held key (e.g. SPACE mid-pan drifting over a card) from firing repeatedly.
+  if (e.repeat) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const ae = document.activeElement;
+  if (
+    ae instanceof HTMLElement &&
+    (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)
+  ) {
+    return;
+  }
+  // The one expensive step, paid once for the whole registry instead of once per
+  // entry. Cards never nest inside each other (a subtask card is a SIBLING of
+  // its parent's card, under a shared wrapper), so this is a set of at most one
+  // — but it stays a set so a future nesting can't silently drop a card.
+  const hovered = document.querySelectorAll("[data-card]:hover");
+  if (!hovered.length) return;
+  const hoveredCards = new Set<Element>(hovered);
+  let fired = false;
+  // Snapshot: a handler can unmount cards (DELETE), which would otherwise
+  // mutate the set we're iterating.
+  for (const entry of [...entries]) {
+    const card = entry.ref.current?.closest("[data-card]");
+    if (!card || !hoveredCards.has(card)) continue;
+    fired = true;
+    entry.fireRef.current();
+  }
+  if (!fired) return;
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+function register(key: string, entry: Entry): () => void {
+  let entries = registry.get(key);
+  if (!entries) registry.set(key, (entries = new Set()));
+  entries.add(entry);
+  if (!listening) {
+    listening = true;
+    window.addEventListener("keydown", onKey, true);
+  }
+  return () => {
+    entries.delete(entry);
+    if (entries.size === 0) registry.delete(key);
+    if (listening && registry.size === 0) {
+      listening = false;
+      window.removeEventListener("keydown", onKey, true);
+    }
+  };
+}
+
 export function useCardShortcut(
   ref: RefObject<HTMLElement | null>,
   key: string,
@@ -24,28 +99,5 @@ export function useCardShortcut(
   const fireRef = useRef(onFire);
   useEffect(() => void (fireRef.current = onFire));
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== key) return;
-      // Ignore auto-repeat: each card shortcut is one discrete action, and it
-      // stops a held key (e.g. SPACE mid-pan drifting over a card) from firing
-      // repeatedly.
-      if (e.repeat) return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const ae = document.activeElement;
-      if (
-        ae instanceof HTMLElement &&
-        (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)
-      ) {
-        return;
-      }
-      const card = ref.current?.closest("[data-card]");
-      if (!card || !card.matches(":hover")) return;
-      e.preventDefault();
-      e.stopPropagation();
-      fireRef.current();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [ref, key]);
+  useEffect(() => register(key, { ref, fireRef }), [ref, key]);
 }

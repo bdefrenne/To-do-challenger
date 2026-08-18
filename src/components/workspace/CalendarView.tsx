@@ -27,6 +27,7 @@ import {
 import { useWorkspace } from "./WorkspaceContext";
 import { STATUS_TONE, STATUS_LABEL } from "@/lib/statuses";
 import type { Task } from "@/lib/types";
+import { startOfWeek, addDays, ymd, fromYmd } from "@/lib/dates";
 
 /* ---- Normalized event shape (mirrors src/lib/google/calendar.ts) ---- */
 interface CalendarEvent {
@@ -71,24 +72,6 @@ const MONTHS_FULL = [
   "July", "August", "September", "October", "November", "December",
 ];
 
-function startOfWeek(d: Date): Date {
-  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const mondayOffset = (x.getDay() + 6) % 7; // Sun=0 → 6, Mon=1 → 0, …
-  x.setDate(x.getDate() - mondayOffset);
-  return x;
-}
-function addDays(d: Date, n: number): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
-}
-function ymd(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-    d.getDate(),
-  ).padStart(2, "0")}`;
-}
-function fromYmd(s: string): Date {
-  const [y, m, d] = s.split("-").map(Number);
-  return new Date(y, m - 1, d);
-}
 
 /** Which day cells an event occupies (all-day events span; end is exclusive). */
 function eventDayKeys(e: CalendarEvent): string[] {

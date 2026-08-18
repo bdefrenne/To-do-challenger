@@ -25,9 +25,20 @@ export interface TaskCardHandlers {
  * its own drag semantics. The pickers reveal on `group-hover/card`, so the
  * wrapping container MUST carry the `group/card` class.
  */
-export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
+export function TaskCardBody({
+  task,
+  h,
+  neutralDone = false,
+}: {
+  task: Task;
+  h: TaskCardHandlers;
+  /** Stop treating done as a visual state — see `TaskCard`'s own prop. On the
+   *  Done view every card is done, so the green title says nothing and the
+   *  hidden description costs the only content there is to read. */
+  neutralDone?: boolean;
+}) {
   const id = task.id;
-  const done = task.status === "done";
+  const done = task.status === "done" && !neutralDone;
   // Scope the assign picker to the task's project members (mirrors the task
   // modal). Empty/undefined members ⇒ QuickAssign falls back to the whole
   // roster. `projectId` is set whenever the task is on a board/canvas section.
@@ -50,8 +61,13 @@ export function TaskCardBody({ task, h }: { task: Task; h: TaskCardHandlers }) {
         {task.title}
       </button>
       {task.description && !done ? (
-        <div className="mt-0.5 line-clamp-6 text-xs italic text-muted">
-          <Markdown>{task.description}</Markdown>
+        /* Size and tone are PROPS — set on the wrapper they lose to Markdown's
+           own root classes, which is how this rendered at `text-sm text-fg` for
+           a long time while asking for neither. */
+        <div className="mt-0.5 line-clamp-6 italic">
+          <Markdown size="xs" tone="muted">
+            {task.description}
+          </Markdown>
         </div>
       ) : null}
       <div className="mt-1 flex items-center gap-2">

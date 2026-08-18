@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   useCallback,
+  useMemo,
   type ReactNode,
 } from "react";
 import type {
@@ -20,7 +21,13 @@ import type {
   NoteType,
   TaskCommit,
 } from "@/lib/types";
-import { deletionOf, type SystemGroup } from "@/lib/sections";
+import {
+  deletionOf,
+  placementOfTask,
+  trayOfPlacement,
+  type PlacementMap,
+  type SystemGroup,
+} from "@/lib/sections";
 import { compareTaskOrder, insertRelative } from "@/lib/task-order";
 import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
 
@@ -39,8 +46,24 @@ import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
 /** Position of a drop relative to the target row. */
 export type DropPos = "before" | "after" | "inside";
 
+/**
+ * Where exactly a filed card should land: next to `targetId`, within the run the
+ * user can SEE (`orderedIds`, in `compareTaskOrder` order, over exactly the
+ * cards rendered in the destination column).
+ *
+ * The run has to be the rendered one — position is minted per (status, parent)
+ * and never renumbered, so any list that mixes statuses (a canvas Section, a
+ * Boards-view column) routinely holds ties. `insertRelative` + a dense restamp
+ * is the only way to make a drop index a real position; interpolating a gap is
+ * degenerate whenever the neighbours tie.
+ */
+export type PlaceAt = {
+  targetId: string;
+  pos: "before" | "after";
+  orderedIds: readonly string[];
+};
+
 /** Which handoff prompt to copy — see `src/lib/prompts.ts`. */
-export type PromptKind = "analyze" | "plan" | "work" | "analyze-work";
 
 /** Ordered tree node: parentId = nesting, position = order within group. */
 /**
@@ -128,9 +151,26 @@ interface WorkspaceContextValue {
   addSubtask: (parentId: string, title: string) => Promise<void>;
   childrenOf: (id: string | null) => TaskNode[];
   nodeById: (id: string) => TaskNode | undefined;
+  /** The same two answers as indexes, for callers that ask about MANY tasks.
+   *
+   *  `childrenOf`/`nodeById` scan the whole tree per call, which is fine for a
+   *  modal asking about one task and quadratic for a view walking hundreds. The
+   *  canvas is that view: every Section resolves its own subtree, so a per-call
+   *  scan made the cost O(sections × tasks) and every task change re-paid it
+   *  (TD-132). Both are rebuilt only when `nodes` changes, and `childIndex`'s
+   *  arrays are pre-sorted in `compareTaskOrder`, so a lookup is just a lookup.
+   *
+   *  Treat the arrays as READ-ONLY — they're shared by every caller. */
+  childIndex: Map<string | null, TaskNode[]>;
+  nodeIndex: Map<string, TaskNode>;
   /** Canvas-only: lend this context your Section resolution so the shared drag
    *  paths can re-pin correctly. Pass null on unmount. */
   registerPlacement: (resolver: PlacementResolver | null) => void;
+  /** Hand over a fetched `sectionId → placement` map (/api/placements) so the
+   *  workspace can name a card's bucket exactly, even one pinned to a hand-made
+   *  section inside a system group. Without it the pin id still answers for every
+   *  machine-made lane — see `placementOf`. */
+  registerPlacementMap: (map: PlacementMap) => void;
   start: (id: string) => void;
   toggleDone: (id: string) => void;
   setStatus: (id: string, status: TaskStatus) => void;
@@ -141,13 +181,20 @@ interface WorkspaceContextValue {
   editTask: (id: string, patch: TaskEdit) => void;
   /** Live edit for high-frequency text (description/title while typing): instant
    *  to peers, Postgres write batched ~10s (or flushed via `flushEdits`). */
-  editTaskLive: (id: string, patch: TaskEdit) => void;
+  editTaskLive: (
+    id: string,
+    patch: TaskEdit,
+    opts?: { optimistic?: boolean; broadcast?: boolean },
+  ) => void;
   /** Force-write any pending batched edits now (call on blur / before close). */
   flushEdits: () => Promise<void>;
   /** Toggle the current user in/out of a task's assignees — the canvas SPACE
    *  hover shortcut. No-op when the viewer isn't a known user. */
   toggleSelfAssignee: (id: string) => void;
-  /** Delete a task with a ~5s undo window — the canvas DELETE hover shortcut.
+  /** Delete a task with a ~5s undo window — the DELETE hover shortcut. What it
+   *  actually does follows `deletionOf` (delete · park · archive); pass
+   *  `opts.tray` off canvas when the view knows which bucket the card renders in,
+   *  so parking and the archiving second press work there too.
    *  See `undoDelete` (cancel) and `pendingDeletes` (the toast). */
   deleteTask: (id: string) => void;
   /** Cancel a pending delete and restore the task; no id ⇒ most recent (LIFO).
@@ -163,8 +210,9 @@ interface WorkspaceContextValue {
   /** Re-pin a dragged card (and re-home its subtree's board). `targetPin` is what
    *  to write: a Section node id, or **null** to unpin — which is how a card
    *  belongs to an INBOX lane. */
-  /** Send a card to a canvas group: THIS WEEK (end of the list), BACKLOG or
-   *  LATER (top), DONE THIS WEEK, or INBOX (unpinned). The hover arrows' path. */
+  /** Send a card to a group: THIS WEEK (end of the list), BACKLOG or LATER (top),
+   *  DONE THIS WEEK, or INBOX (unpinned). The hover arrows' path — on canvas it
+   *  moves the node, off canvas it files via `fileTask`. */
   sendToPlacement: (id: string, to: TaskPlacement) => void;
   /** The latest arrow-key send, for its undo toast (overwritten each time, not
    *  a queue — see `pendingSend`'s declaration for why). */
@@ -177,12 +225,38 @@ interface WorkspaceContextValue {
     dragId: string,
     targetPin: string | null,
     targetBoardId: string | null,
-    opts?: { targetId?: string; pos?: DropPos; siblingIds?: Set<string> },
+    opts?: {
+      targetId?: string;
+      pos?: DropPos;
+      siblingIds?: Set<string>;
+      status?: TaskStatus;
+    },
   ) => void;
   dropToGroup: (dragId: string, status: TaskStatus) => void;
   /** Move a task onto a board (optionally also set its status). */
   moveToBoard: (id: string, boardId: string, status?: TaskStatus) => void;
-  addTask: (status: TaskStatus, title: string, boardId?: string | null) => void;
+  /** File a task on a board AND in a placement bucket in one write — the
+   *  project Boards view's drop. Unlike `sendToPlacement` this needs no mounted
+   *  canvas: the server resolves the bucket to a pin (`resolvePlacementSection`).
+   *  Resolves once the write has landed and the refetch has run. */
+  fileTask: (
+    id: string,
+    boardId: string,
+    placement: TaskPlacement,
+    opts?: { status?: TaskStatus; at?: PlaceAt },
+  ) => Promise<void>;
+  /** `fileTask` for a whole set of cards on ONE board — a column sweep, in one
+   *  bulk batch rather than one request per card. Status is left alone. */
+  fileTasks: (ids: string[], placement: TaskPlacement) => Promise<void>;
+  /** Buckets requested by a `fileTask` still in flight (taskId → placement) —
+   *  read these over the resolved pins so a filed card shows where it's going. */
+  pendingPlacements: Record<string, TaskPlacement>;
+  addTask: (
+    status: TaskStatus,
+    title: string,
+    boardId?: string | null,
+    placement?: TaskPlacement,
+  ) => void;
   /** Create a task inside a canvas Section, optionally nested under `parentId`.
    *  Optimistic, like `addTask`. */
   addSectionTask: (input: {
@@ -200,7 +274,6 @@ interface WorkspaceContextValue {
   lockTask: (id: string) => Promise<string>;
   /** Return a ready-to-paste handoff prompt by kind. Every kind locks the code
    *  first (the analyze handoff is the first commitment). */
-  taskPrompt: (id: string, kind: PromptKind) => Promise<string>;
   /** Add a note to a task (decision or standup callout), then reload its detail. */
   addNote: (
     id: string,
@@ -295,6 +368,20 @@ interface WorkspaceContextValue {
   /** Transient user-facing message (e.g. a concurrent-edit conflict). */
   notice: string | null;
   clearNotice: () => void;
+  /** A completion the subtask rule refused, awaiting an answer: finish the whole
+   *  branch, or leave it. Null when there's nothing pending. Unlike `notice` this
+   *  does NOT auto-dismiss — it's a question, and the answer writes data. */
+  pendingComplete: {
+    taskId: string;
+    taskTitle: string;
+    openCount: number;
+  } | null;
+  /** Complete a task AND every unfinished task under it (the pending prompt's
+   *  "Complete all" answer). Deliberately the only way to cascade a completion —
+   *  nothing does it implicitly. */
+  completeBranch: (id: string) => void;
+  /** Dismiss the prompt without completing anything. */
+  clearPendingComplete: () => void;
   /** Id of the project whose settings modal is open (from anywhere — e.g. the
    *  assignee picker's "Edit Project Members"), or null. */
   projectSettingsId: string | null;
@@ -320,6 +407,13 @@ const OVERLAY_TTL_MS = 30000;
 // Grace period between a canvas DELETE and the real Postgres delete — the window
 // in which the "Deleted · Undo" toast (or Ctrl+Z) can bring the task back.
 const UNDO_WINDOW_MS = 5000;
+/* The three fields a LIST read deliberately leaves in Postgres (PLAT-403,
+   `LIST_TASK_COLUMNS`) — they're ~2/3 of a board payload and render on one
+   surface. Only the detail read (`loadLogs` → GET /api/tasks/:id) carries them,
+   and it marks "not fetched" as ABSENT (vs `null` for "has none"). So a
+   list-driven map replace has to graft the fetched values forward, or an open
+   modal's Analysis / Technical Plan / Summary blank out on the next poll. */
+const WORKING_FIELDS = ["analysisSummary", "plan", "summary"] as const;
 
 /** A partial task edit the client can PATCH. */
 export type TaskEdit = Partial<
@@ -414,6 +508,53 @@ async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   return (res.status === 204 ? null : await res.json()) as T;
 }
 
+/**
+ * The server's own sentence for a rejected write, or null if it didn't send one.
+ *
+ * Read off `body.error` rather than `ApiError.message`, which is prefixed with
+ * the status code for the console's benefit — "400: …" in a toast reads as a
+ * crash rather than as the rule it is. Only worth showing for a `ValidationError`
+ * (400), where the message is written for a person; other statuses carry
+ * framework text.
+ */
+/** A refused completion, as the server describes it — see `openSubtasksError`
+ *  (db/service.ts) and `RuleDetails` (api.ts). */
+interface OpenSubtasksRule {
+  code: "open_subtasks";
+  taskId: string;
+  taskTitle: string;
+  openCount: number;
+}
+
+/**
+ * Is this the "finish the subtasks first" refusal? If so, hand back its payload
+ * so the caller can offer the branch completion instead of only reporting a wall.
+ *
+ * Guarded field by field rather than cast: the body is JSON off the wire, and a
+ * toast with an undefined count in it is worse than the generic message.
+ */
+function openSubtasksRule(e: ApiError): OpenSubtasksRule | null {
+  const b = e.body;
+  if (!b || typeof b !== "object") return null;
+  const d = b as Record<string, unknown>;
+  if (d.code !== "open_subtasks") return null;
+  if (typeof d.taskId !== "string" || typeof d.openCount !== "number") return null;
+  return {
+    code: "open_subtasks",
+    taskId: d.taskId,
+    taskTitle: typeof d.taskTitle === "string" ? d.taskTitle : "this task",
+    openCount: d.openCount,
+  };
+}
+
+function ruleMessage(e: ApiError): string | null {
+  const detail =
+    e.body && typeof e.body === "object" && "error" in e.body
+      ? String((e.body as { error: unknown }).error)
+      : "";
+  return detail.trim() || null;
+}
+
 function isDescendant(nodes: TaskNode[], ancestorId: string, nodeId: string): boolean {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   let cur = byId.get(nodeId);
@@ -445,6 +586,10 @@ export function WorkspaceProvider({
   const [openTaskIds, setOpenTaskIds] = useState<string[]>([]);
   // Transient, user-facing message (e.g. a write was rejected as a conflict).
   const [notice, setNotice] = useState<string | null>(null);
+  // A completion the subtask rule refused, waiting on an answer (see
+  // `openSubtasksRule` and the CompleteBranchPrompt toast in AppShell).
+  const [pendingComplete, setPendingComplete] =
+    useState<OpenSubtasksRule | null>(null);
   // Project whose settings modal is open globally (opened from the assignee
   // picker's "Edit Project Members", the sidebar gear, etc.). AppShell renders
   // the single ProjectModal driven by this.
@@ -486,6 +631,9 @@ export function WorkspaceProvider({
   // `pendingEdits` = MY edits not yet written to Postgres; flushed on a debounce.
   const pendingEditsRef = useRef<Map<string, TaskEdit>>(new Map());
   const editFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latest `flushEdits`, so a failed flush can re-arm its own retry without it
+  // and `scheduleEditFlush` having to depend on each other.
+  const flushEditsRef = useRef<() => Promise<void>>(async () => {});
   // Latest taskMap for the (possibly delayed) flush's expected-updatedAt token.
   const taskMapRef = useRef<Record<string, Task>>({});
   useEffect(() => void (taskMapRef.current = taskMap), [taskMap]);
@@ -502,6 +650,22 @@ export function WorkspaceProvider({
   const registerPlacement = useCallback((resolver: PlacementResolver | null) => {
     placementRef.current = resolver;
   }, []);
+
+  // A fetched `sectionId → placement` map, when some view has one to lend (only
+  // the project Boards view fetches it today). Empty is a working default: every
+  // machine-made lane id NAMES its bucket, which is what `placementOfDerivedId`
+  // reads — the map only adds hand-made sections sitting inside a group.
+  const placementMapRef = useRef<PlacementMap>({});
+  const registerPlacementMap = useCallback((map: PlacementMap) => {
+    placementMapRef.current = map;
+  }, []);
+
+  // Buckets requested but not yet confirmed — see `fileTask`. A view that renders
+  // by bucket reads these on top of the resolved pins, so a filed card appears
+  // where it's going for the round trip rather than sitting in its old band.
+  const [pendingPlacements, setPendingPlacements] = useState<
+    Record<string, TaskPlacement>
+  >({});
 
   // Tasks removed on the canvas but not yet committed to Postgres — kept alive
   // for the ~5s undo window (Gmail-style). `fetchAll` filters these ids so a
@@ -606,6 +770,20 @@ export function WorkspaceProvider({
           map[id] = { ...server, ...entry.patch };
         }
       }
+      // Carry the working fields forward: this map came from a list read, which
+      // doesn't select them, and replacing an entry wholesale would drop the
+      // copy a detail read had already put there. Absent ⇒ keep what we know;
+      // an explicit `null` from a detail read still reads as "has none".
+      const known = taskMapRef.current;
+      for (const [id, row] of Object.entries(map)) {
+        const before = known[id];
+        if (!before) continue;
+        for (const f of WORKING_FIELDS) {
+          if (row[f] === undefined && before[f] !== undefined) {
+            map[id] = { ...map[id], [f]: before[f] };
+          }
+        }
+      }
       lastAppliedRef.current = map;
       setTaskMap(map);
       return true;
@@ -689,6 +867,10 @@ export function WorkspaceProvider({
   // opened, after posting/attaching, and by the poll so a comment Claude
   // leaves shows up in the open thread live.
   const loadLogs = useCallback((id: string) => {
+    // Same reconcile generation the list reads snapshot: this response may
+    // predate a write started after we asked, and it's also the ONLY read that
+    // carries the working fields, so it can't just be skipped wholesale.
+    const seq = reconcileSeq.current;
     api<{
       task: Task;
       logs: TaskLogEntry[];
@@ -699,9 +881,46 @@ export function WorkspaceProvider({
         setLogs((prev) => ({ ...prev, [id]: r.logs }));
         setNotes((prev) => ({ ...prev, [id]: r.notes ?? [] }));
         setCommits((prev) => ({ ...prev, [id]: r.commits ?? [] }));
-        // Keep the task map fresh (code/phase/summaries may have changed).
-        if (r.task)
-          setTaskMap((prev) => ({ ...prev, [id]: { ...prev[id], ...r.task } }));
+        // Keep the task map fresh (code/phase/summaries may have changed) — but
+        // under the SAME reconcile rules as `applyTaskMap`, which this used to
+        // bypass entirely (TD-62). Without them, a detail read landing inside
+        // the ~10s `editTaskLive` window wrote the stale server text back over
+        // a description/title you were still typing, and re-seeding the editor
+        // from it then persisted the old text over the new one. The thread
+        // (logs/notes/commits) above is unconditional — it has no local edits
+        // to lose, so a racing mutation is no reason to drop it.
+        if (!r.task) return;
+        const overlay = overlayRef.current.get(id)?.patch;
+        // A write started after we asked, so this row may predate it. Don't drop
+        // the response outright — it's the only carrier of the working fields,
+        // and this is the read that fills them in when a modal opens. Merge it
+        // MONOTONICALLY instead: fill fields we don't have, overwrite nothing.
+        // The racing write's own reconcile applies the rest a moment later.
+        const raced = reconcileSeq.current !== seq;
+        const fromServer = raced
+          ? Object.fromEntries(
+              Object.entries(r.task).filter(
+                ([k, v]) =>
+                  v !== undefined &&
+                  (taskMapRef.current[id] as unknown as Record<string, unknown> | undefined)?.[
+                    k
+                  ] === undefined,
+              ),
+            )
+          : r.task;
+        // The delta base too: `fetchDelta` carries unchanged rows forward from
+        // here, so leaving the older copy in place would revert this row on the
+        // next poll that doesn't happen to list it as changed. This one holds
+        // SERVER truth only — never the overlay. `applyTaskMap` retires an
+        // overlay entry once the server value matches it, and a carried-forward
+        // row seeded with our own unwritten text would satisfy that check while
+        // Postgres still had the old value.
+        lastAppliedRef.current = {
+          ...lastAppliedRef.current,
+          [id]: { ...lastAppliedRef.current[id], ...fromServer },
+        };
+        // The DISPLAY map keeps the live edit on top of the fresh row.
+        setTaskMap((prev) => ({ ...prev, [id]: { ...prev[id], ...fromServer, ...overlay } }));
       })
       .catch((e) => console.error("[workspace] failed to load task detail", e));
   }, []);
@@ -709,8 +928,16 @@ export function WorkspaceProvider({
   // Load one canvas's stickies (open + resolved). Used when a canvas mounts,
   // and by the poll/remote-refresh loop while `openCanvasIdRef` names one.
   const loadCanvasNotes = useCallback((canvasId: string) => {
+    // This replaces the whole list, so it needs the same generation guard as a
+    // task read: a note the user just dragged or resolved has an optimistic
+    // position/state that a snapshot taken before that PATCH would undo (the
+    // sticky visibly snapping back until the next refetch).
+    const seq = reconcileSeq.current;
     api<{ notes: Note[] }>(`/api/canvases/${canvasId}/notes`)
-      .then((r) => setCanvasNotes((prev) => ({ ...prev, [canvasId]: r.notes })))
+      .then((r) => {
+        if (reconcileSeq.current !== seq) return;
+        setCanvasNotes((prev) => ({ ...prev, [canvasId]: r.notes }));
+      })
       .catch((e) => console.error("[workspace] failed to load canvas notes", e));
   }, []);
 
@@ -880,12 +1107,23 @@ export function WorkspaceProvider({
         // Never fail silently: the finally-refetch below reverts the optimistic
         // update, and a card sliding back with no explanation is indistinguishable
         // from the app losing your change. A 409 gets the specific story (another
-        // writer won); everything else gets the generic one.
-        setNotice(
-          e instanceof ApiError && e.status === 409
-            ? "This task changed elsewhere — reloaded with the latest version."
-            : "Couldn’t save that — reloaded the latest.",
-        );
+        // writer won); a 400 is a business rule the server can explain better than
+        // we can, so it speaks for itself (e.g. "can't complete X: 3 subtasks
+        // aren't done"); everything else gets the generic one.
+        // One rule is actionable rather than just reportable: a completion held
+        // up by unfinished subtasks. It gets a prompt with a way forward instead
+        // of a dead-end notice — otherwise DELETE on a Review parent (which means
+        // "complete") has no answer at all.
+        const rule =
+          e instanceof ApiError && e.status === 400 ? openSubtasksRule(e) : null;
+        if (rule) setPendingComplete(rule);
+        else
+          setNotice(
+            e instanceof ApiError && e.status === 409
+              ? "This task changed elsewhere — reloaded with the latest version."
+              : (e instanceof ApiError && e.status === 400 && ruleMessage(e)) ||
+                "Couldn’t save that — reloaded the latest.",
+          );
       } finally {
         inflight.current--;
         // Only the last op in a burst reconciles (fewer fetches); the guard in
@@ -1036,6 +1274,27 @@ export function WorkspaceProvider({
     editTask(id, { assigneeIds: next });
   }
 
+  /**
+   * Which bucket a card is in, as well as this client can tell it WITHOUT a
+   * canvas: the target of a `fileTask` still in flight, else its pin — read
+   * through a lent map when there is one, and otherwise out of the pin id itself,
+   * since every lane the machine makes has a derived id that names its bucket
+   * (`placementOfDerivedId`). A mounted canvas knows better and answers for
+   * itself (`PlacementResolver.groupOf`); this is what makes DELETE mean the same
+   * thing on the board views, which have no canvas to ask.
+   */
+  function placementOf(id: string): TaskPlacement {
+    return (
+      pendingPlacements[id] ??
+      placementOfTask(
+        id,
+        taskMapRef.current,
+        (child) => nodesRef.current.find((n) => n.id === child)?.parentId ?? null,
+        placementMapRef.current,
+      )
+    );
+  }
+
   /** Fire the deferred DELETE once a task's undo window has lapsed. */
   const commitDelete = useCallback(
     (id: string) => {
@@ -1061,39 +1320,74 @@ export function WorkspaceProvider({
    * commit to Postgres after UNDO_WINDOW_MS unless `undoDelete` cancels first.
    * The removed node is snapshotted so undo can restore it.
    *
-   * Finished work exits in TWO steps (`deletionOf`): the first Delete on a done
-   * card PARKS it in DONE THIS WEEK, and only a second Delete from there archives
-   * it. So the week's finished work stays visible until it's swept, and the
-   * irreversible-looking step always takes a deliberate second press. A card that
-   * was never done still deletes on the first press — parking it would put a
-   * not-done card in a group called DONE THIS WEEK.
+   * Finished work exits in TWO steps (`deletionOf`), so the irreversible-looking
+   * step always takes a deliberate second press. A card that was never done
+   * still deletes on the first press.
    *
-   * Parking needs a canvas: the lanes live in its Liveblocks storage. On the
-   * board views (no `placementRef`) there's nowhere to park, so a done card
-   * archives on the first press exactly as it always has.
+   * What the two steps ARE depends on whether the surface has a DONE THIS WEEK
+   * tray to park in, which is the one thing that differs between surfaces:
+   *
+   *   • Off the canvas (project Boards, kanban, table) — first Delete on a done
+   *     card parks it in DONE THIS WEEK via `fileTask`, which owns the bucket
+   *     resolution server-side; a second Delete from the tray archives it. A
+   *     REVIEW card is accepted by that same press: marked done AND parked.
+   *   • On the canvas — there is no tray (TD-87). A done card stays in its own
+   *     board's lane wearing the green wash, and Delete archives it. A REVIEW
+   *     card is marked done and left where it is, so the second press is what
+   *     takes it off the board.
+   *
+   * Both read the card's current tray the same way — the canvas from its nodes,
+   * everyone else from `placementOf` — and both ask `deletionOf`, so neither the
+   * caller nor the keyboard shortcut has to know which surface it's on.
    */
   function deleteTask(id: string) {
     const task = taskMapRef.current[id];
     if (!task || pendingDeleteRef.current.has(id)) return;
     const placement = placementRef.current;
-    const action = placement
-      ? deletionOf(task.status, placement.groupOf(id))
-      : task.status === "done"
-        ? "archive"
-        : "delete";
-    if (action === "park" && placement) {
-      const boardId = task.boardId ?? null;
-      const lane = placement.laneFor("doneThisWeek", boardId);
-      // No lane resolvable (shouldn't happen — the reconciler keeps the group
-      // alive — but a canvas mid-hydration could say null). Archive instead of
-      // silently doing nothing.
-      if (lane) {
-        moveNodeIntoSection(id, lane, boardId, {
-          siblingIds: placement.membersOf(lane),
-        });
+    const boardId = task.boardId ?? null;
+    const tray = placement ? placement.groupOf(id) : trayOfPlacement(placementOf(id));
+    // A mounted canvas has no DONE THIS WEEK tray to park into (TD-87), so on
+    // the canvas a done card archives on this press instead of parking, and an
+    // accepted REVIEW card is simply marked done and left in its lane.
+    const canPark = !placement;
+    const action = deletionOf(task.status, tray, { canPark });
+    if (action === "park" || action === "complete") {
+      // REVIEW → accept it: done AND parked in ONE write. `moveTask` sets
+      // completedAt, stamps statusSince and records the status event alongside the
+      // pin, so there's no second request to race the first (`mutate` doesn't
+      // serialise — two writes fired in a tick land in whatever order the network
+      // gives, and a refetch between them would show a half-applied card).
+      const status = action === "complete" ? ("done" as const) : undefined;
+      // Parking only happens off the canvas now, so there is no lane to pin to
+      // client-side: let the server resolve the bucket, in the same write that
+      // accepts a REVIEW card. Needs a board — the buckets are per-board lanes,
+      // so a board-less task has nowhere to go.
+      if (canPark && boardId) {
+        void fileTask(id, boardId, "doneThisWeek", { status });
+        return;
+      }
+      // Nowhere to park: on the canvas by design, and off it when the task has no
+      // board (the buckets are per-board lanes). Either way an accepted card is
+      // still accepted — it's marked done and stays where it is, and the next
+      // press archives it as a done card.
+      if (status) {
+        mutate(
+          () => patchStatusLocal(id, status),
+          () =>
+            api(`/api/tasks/${id}/complete`, {
+              method: "POST",
+              body: JSON.stringify({ done: true }),
+            }),
+        );
         return;
       }
     }
+    // Any edit still sitting in the batch would PATCH a row that's gone: the
+    // delete commits in UNDO_WINDOW_MS, the edit debounce runs for EDIT_FLUSH_MS.
+    // Flushing rather than dropping keeps the value the undo snapshot carries.
+    // Through the ref, not `flushEdits` itself — reading the memoized callback
+    // from this plain function is what makes the React Compiler give up on it.
+    if (pendingEditsRef.current.size) void flushEditsRef.current();
     const mode: "delete" | "archive" = action === "delete" ? "delete" : "archive";
     const node = nodesRef.current.find((n) => n.id === id);
     setTaskMap((prev) => {
@@ -1158,14 +1452,47 @@ export function WorkspaceProvider({
     pendingEditsRef.current.clear();
     inflight.current++;
     try {
-      await Promise.all(edits.map(([id, patch]) => patchTask(id, patch)));
-    } catch (e) {
-      console.error("[workspace] edit flush failed", e);
-      setNotice(
-        e instanceof ApiError && e.status === 409
-          ? "This task changed elsewhere — reloaded with the latest version."
-          : "Couldn’t save your edit — reloaded the latest.",
+      // Settled per task, not all-or-nothing: `Promise.all` rejects on the first
+      // failure, which left the other tasks' verdicts unknown while the buffer
+      // had already been cleared — so one task's conflict could discard another
+      // task's keystrokes.
+      const results = await Promise.allSettled(
+        edits.map(([id, patch]) => patchTask(id, patch)),
       );
+      let conflicted = false;
+      let retrying = false;
+      results.forEach((res, i) => {
+        if (res.status === "fulfilled") return;
+        const [id, patch] = edits[i];
+        console.error("[workspace] edit flush failed", res.reason);
+        if (res.reason instanceof ApiError && res.reason.status === 409) {
+          // Another writer won. Dropping our buffered text is the point of the
+          // guard — but the overlay has to go too, or the reload below would
+          // leave OUR rejected text on screen while the toast claims the latest
+          // version is showing.
+          conflicted = true;
+          overlayRef.current.delete(id);
+        } else {
+          // A transient failure is not a conflict, and these are keystrokes:
+          // put the buffer back rather than silently discarding what was typed.
+          // Anything typed since we cleared it is newer, so it wins the merge.
+          retrying = true;
+          pendingEditsRef.current.set(id, {
+            ...patch,
+            ...(pendingEditsRef.current.get(id) ?? {}),
+          });
+        }
+      });
+      if (retrying) {
+        if (editFlushTimer.current) clearTimeout(editFlushTimer.current);
+        editFlushTimer.current = setTimeout(
+          () => void flushEditsRef.current(),
+          EDIT_FLUSH_MS,
+        );
+      }
+      if (conflicted)
+        setNotice("This task changed elsewhere — reloaded with the latest version.");
+      else if (retrying) setNotice("Couldn’t save your edit — retrying.");
     } finally {
       inflight.current--;
       await fetchAll(); // overlay reconciles: confirmed patches drop out
@@ -1175,6 +1502,8 @@ export function WorkspaceProvider({
     // patchTask is a stable hoisted declaration reading refs — no dep needed.
   }, [fetchAll, refreshVersion, emitLocalChange]);
 
+  useEffect(() => void (flushEditsRef.current = flushEdits), [flushEdits]);
+
   const scheduleEditFlush = useCallback(() => {
     if (editFlushTimer.current) clearTimeout(editFlushTimer.current);
     editFlushTimer.current = setTimeout(() => void flushEdits(), EDIT_FLUSH_MS);
@@ -1183,14 +1512,35 @@ export function WorkspaceProvider({
   /** Live edit for high-frequency text (title/description): apply optimistically,
    *  broadcast the delta so peers update instantly, and DEFER the Postgres write
    *  (batched ~10s / flushed on blur/close). Contrast `editTask`, which persists
-   *  immediately — use this only for fields that change on every keystroke. */
-  function editTaskLive(id: string, patch: TaskEdit) {
+   *  immediately — use this only for fields that change on every keystroke.
+   *
+   *  Both parts are optional because BOTH cost real work at 8 keystrokes/second:
+   *
+   *  • `optimistic: false` skips the `taskMap` write. That write changes
+   *    `taskMap`'s identity, which is a dependency of `useSectionUnits` — so one
+   *    character rebuilds the unit tree in EVERY section on the canvas (the
+   *    TD-132 cascade, per keystroke). A caller that already renders the text
+   *    from its own state, like the outline's rows, doesn't need it: the queued
+   *    write and the overlay land it in `taskMap` at the flush instead.
+   *  • `broadcast: false` skips the room event. A peer applying a patch pays the
+   *    same cascade on THEIR canvas, so per-keystroke broadcasting is only worth
+   *    it when someone is actually watching that text — the outline asks presence
+   *    and passes false when you're editing alone, which is the common case.
+   *
+   *  The overlay is always set, so whichever path lands the value can't be
+   *  reverted by an interim refetch. */
+  function editTaskLive(
+    id: string,
+    patch: TaskEdit,
+    { optimistic = true, broadcast = true }: { optimistic?: boolean; broadcast?: boolean } = {},
+  ) {
     overlayRef.current.set(id, {
       patch: { ...(overlayRef.current.get(id)?.patch ?? {}), ...patch },
       at: Date.now(),
     });
-    setTaskMap((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...patch } } : prev));
-    emitLocalChange({ kind: "patch", taskId: id, patch });
+    if (optimistic)
+      setTaskMap((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...patch } } : prev));
+    if (broadcast) emitLocalChange({ kind: "patch", taskId: id, patch });
     pendingEditsRef.current.set(id, { ...(pendingEditsRef.current.get(id) ?? {}), ...patch });
     scheduleEditFlush();
   }
@@ -1223,6 +1573,22 @@ export function WorkspaceProvider({
     mutate(
       () => patchStatusLocal(id, nowDone ? "done" : "todo"),
       () => api(`/api/tasks/${id}/complete`, { method: "POST", body: JSON.stringify({ done: nowDone }) }),
+    );
+  }
+
+  /** Answer the pending prompt: close the branch bottom-up on the server (see
+   *  `completeTask`'s `withSubtasks`), then reconcile. The optimistic step only
+   *  marks the parent — the descendants arrive with the refetch, since the client
+   *  doesn't know which of them were open. */
+  function completeBranch(id: string) {
+    setPendingComplete(null);
+    mutate(
+      () => patchStatusLocal(id, "done"),
+      () =>
+        api(`/api/tasks/${id}/complete`, {
+          method: "POST",
+          body: JSON.stringify({ done: true, withSubtasks: true }),
+        }),
     );
   }
 
@@ -1398,14 +1764,28 @@ export function WorkspaceProvider({
    * decided to defer is the thing you'll want to see first when you come back to
    * the pile. INBOX is `laneFor` → null, i.e. simply unpinned.
    *
-   * No-op without a mounted canvas, or when the card is already there — the
-   * groups are canvas furniture, so there's nothing to move it to (or nothing to
-   * do) in either case.
+   * Without a mounted canvas (the project Boards view, a board's kanban) the same
+   * arrows go through `fileTask`: the server resolves the bucket to a pin, so the
+   * gesture works off canvas — it just can't place the card WITHIN the lane the
+   * way the canvas does. The undo toast still works: a send is reversed by
+   * re-pinning the card to the pin it had, which needs no canvas either.
+   *
+   * No-op when the card is already there, or when it has no board (the buckets
+   * are per-board lanes, so there's nowhere to file it).
    */
   function sendToPlacement(id: string, to: TaskPlacement) {
     const placement = placementRef.current;
     const task = taskMap[id];
-    if (!placement || !task) return;
+    if (!task) return;
+    if (!placement) {
+      const boardId = task.boardId ?? null;
+      if (!boardId) return;
+      if (placementOf(id) === to) return; // already there — same guard as below
+      const fromPin = task.canvasSectionId ?? null;
+      void fileTask(id, boardId, to);
+      setPendingSend({ id, title: task.title, to, fromPin });
+      return;
+    }
     const boardId = task.boardId ?? null;
     const lane = placement.laneFor(to, boardId);
     if (to !== "inbox" && !lane) return; // no such group on this canvas
@@ -1459,10 +1839,19 @@ export function WorkspaceProvider({
     dragId: string,
     targetPin: string | null,
     targetBoardId: string | null,
-    opts?: { targetId?: string; pos?: DropPos; siblingIds?: Set<string> },
+    opts?: {
+      targetId?: string;
+      pos?: DropPos;
+      siblingIds?: Set<string>;
+      /** Change the card's status in the SAME write as the move — one request, so
+       *  the two can't land out of order. DELETE accepting a review card uses it
+       *  (done + parked); `moveTask` handles completedAt and the status event. */
+      status?: TaskStatus;
+    },
   ) {
     const rel =
       opts?.targetId && opts.pos ? { targetId: opts.targetId, pos: opts.pos } : undefined;
+    const status = opts?.status;
     const drag = nodes.find((n) => n.id === dragId);
     if (!drag) return;
     if (rel && (rel.targetId === dragId || isDescendant(nodes, dragId, rel.targetId))) return;
@@ -1517,9 +1906,16 @@ export function WorkspaceProvider({
       position = (sibs[sibs.length - 1]?.position ?? 0) + 1;
     }
 
-    // No-op guard: same pin, same spot, same board.
+    // No-op guard: same pin, same spot, same board — unless there's a status to
+    // write, which is a real change even when nothing moves.
     const dragPin = taskMap[dragId]?.canvasSectionId ?? null;
-    if (!boardChanged && dragPin === targetPin && drag.parentId === parentId && drag.position === position)
+    if (
+      !status &&
+      !boardChanged &&
+      dragPin === targetPin &&
+      drag.parentId === parentId &&
+      drag.position === position
+    )
       return;
 
     // Build the bulk batch. `canvasSectionId` is a scalar column, so re-pinning
@@ -1556,6 +1952,7 @@ export function WorkspaceProvider({
         position,
         canvasSectionId: targetPin,
         ...(boardChanged ? { boardId: targetBoardId } : {}),
+        ...(status ? { status } : {}),
       },
     });
     // Restamp the rest of the target run, so the index the card was dropped at is
@@ -1572,6 +1969,7 @@ export function WorkspaceProvider({
 
     mutate(
       () => {
+        if (status) patchStatusLocal(dragId, status);
         setTaskMap((prev) => {
           const next = { ...prev };
           for (const id of subtree) {
@@ -1663,6 +2061,187 @@ export function WorkspaceProvider({
           method: "POST",
           body: JSON.stringify({ boardId, parentId: null, status: nextStatus }),
         }),
+    );
+  }
+
+  /**
+   * File a card on a board and in a bucket at once — one `move` write, since
+   * moving boards and re-filing are the same server operation and the pin has to
+   * be resolved against the NEW board (a Section belongs to one board).
+   *
+   * `opts.at` places it EXACTLY where it was dropped (see `PlaceAt`) instead of
+   * appending it to the end of the column — the project Boards view's card-on-card
+   * drop. Without it the card lands last, which is what dropping on the column's
+   * empty space means.
+   *
+   * The optimistic half can't cover the pin — that's the server's to compute — so
+   * instead the requested bucket is published as a `pendingPlacements` override
+   * for as long as the write is in flight, and a view that renders by bucket shows
+   * the card there meanwhile. Kept HERE rather than in the caller so every path
+   * into this function (a drop, an arrow send, a DELETE parking a done card) gets
+   * the same instant feedback. Status is left alone — a bucket is not a status, and
+   * filing a card must never silently complete or restart it.
+   */
+  async function fileTask(
+    id: string,
+    boardId: string,
+    placement: TaskPlacement,
+    opts?: { status?: TaskStatus; at?: PlaceAt },
+  ) {
+    const node = nodes.find((n) => n.id === id);
+    if (!node) return;
+    const boardChanged = node.boardId !== boardId;
+    setPendingPlacements((prev) => ({ ...prev, [id]: placement }));
+    try {
+      await fileTaskWrite(id, boardId, boardChanged, placement, opts?.status, opts?.at);
+    } finally {
+      // Clear it either way: on success the refetched pin says the same thing, and
+      // on failure the card belongs back wherever the server still thinks it is.
+      setPendingPlacements((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  }
+
+  /**
+   * `fileTask` for a SET of cards, in one bulk batch — what a column sweep needs
+   * ("Clear Done" on a band's board column files every done card in it into DONE
+   * THIS WEEK).
+   *
+   * One batch rather than N calls to `fileTask`: each of those is its own request
+   * AND its own `mutate`, so twenty done cards would mean twenty writes and
+   * twenty refetches racing each other. Sweeping is bounded by the column, not by
+   * anything the user picked one at a time, so the batch is the honest shape.
+   *
+   * No `boardId` argument: every card is already on the board whose column it's
+   * rendered in, so this never moves a card between boards — and stating a board
+   * on a `move` is what makes the server recompute (and possibly clear) a pin.
+   * Status is left alone for the same reason `fileTask` leaves it alone: a bucket
+   * is not a status.
+   */
+  async function fileTasks(ids: string[], placement: TaskPlacement) {
+    if (!ids.length) return;
+    setPendingPlacements((prev) => {
+      const next = { ...prev };
+      for (const id of ids) next[id] = placement;
+      return next;
+    });
+    try {
+      await mutate(null, () =>
+        bulk(ids.map((id) => ({ op: "move", id, target: { placement } }))),
+      );
+    } finally {
+      setPendingPlacements((prev) => {
+        const next = { ...prev };
+        for (const id of ids) delete next[id];
+        return next;
+      });
+    }
+  }
+
+  /** The write half of `fileTask`, split out so the override above wraps it. */
+  async function fileTaskWrite(
+    id: string,
+    boardId: string,
+    boardChanged: boolean,
+    placement: TaskPlacement,
+    status?: TaskStatus,
+    at?: PlaceAt,
+  ) {
+    if (at) return fileTaskAtWrite(id, boardId, boardChanged, placement, status, at);
+    await mutate(
+      () => {
+        // `status` rides along so completing and filing are ONE write (see
+        // `deleteTask`); `moveTask` sets completedAt and records the status event.
+        if (status) patchStatusLocal(id, status);
+        if (boardChanged)
+          setNodes((prev) =>
+            prev.map((n) => (n.id === id ? { ...n, boardId, parentId: null } : n)),
+          );
+      },
+      () =>
+        api(`/api/tasks/${id}/move`, {
+          method: "POST",
+          body: JSON.stringify({
+            boardId,
+            ...(boardChanged ? { parentId: null } : {}),
+            ...(status ? { status } : {}),
+            placement,
+          }),
+        }),
+    );
+  }
+
+  /**
+   * `fileTaskWrite` with an INDEX: the card lands next to the card it was dropped
+   * on rather than at the end of the column.
+   *
+   * The index is made real by RESTAMPING the destination run with dense
+   * positions, exactly as `moveNode`/`moveNodeIntoSection` do — see `PlaceAt` for
+   * why interpolating a gap can't work here. So this is one `/api/tasks/bulk`
+   * batch rather than one move: the dragged card carries board + bucket +
+   * position together (a board change clears a pin the caller didn't state, so
+   * splitting them would undo the filing), and each neighbour that actually
+   * shifts carries its new position. A run restamped once is dense, so later
+   * drops touch only the span that moved.
+   */
+  async function fileTaskAtWrite(
+    id: string,
+    boardId: string,
+    boardChanged: boolean,
+    placement: TaskPlacement,
+    status: TaskStatus | undefined,
+    at: PlaceAt,
+  ) {
+    const orderedIds = insertRelative(at.orderedIds, id, at.targetId, at.pos);
+    // Dropped right back where it already sits, on the same board: nothing to
+    // write. (A different band always changes the sequence — the card isn't in
+    // that column's run to begin with.)
+    if (!boardChanged && !status && orderedIds.join() === at.orderedIds.join())
+      return;
+    const posById = new Map(orderedIds.map((x, i) => [x, i]));
+    const position = posById.get(id) ?? orderedIds.length;
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+
+    const ops: unknown[] = [
+      {
+        op: "move",
+        id,
+        target: {
+          boardId,
+          placement,
+          position,
+          ...(boardChanged ? { parentId: null } : {}),
+          ...(status ? { status } : {}),
+        },
+      },
+    ];
+    for (const [otherId, p] of posById) {
+      if (otherId === id) continue;
+      if (byId.get(otherId)?.position === p) continue;
+      ops.push({ op: "move", id: otherId, target: { position: p } });
+    }
+
+    await mutate(
+      () => {
+        if (status) patchStatusLocal(id, status);
+        setNodes((prev) =>
+          prev.map((n) => {
+            const p = posById.get(n.id);
+            if (n.id === id)
+              return {
+                ...n,
+                position,
+                ...(boardChanged ? { boardId, parentId: null } : {}),
+              };
+            return p !== undefined && p !== n.position ? { ...n, position: p } : n;
+          }),
+        );
+      },
+      () => bulk(ops),
     );
   }
 
@@ -1782,7 +2361,12 @@ export function WorkspaceProvider({
   };
 
   /* ---- Create ---- */
-  function addTask(status: TaskStatus, title: string, boardId: string | null = null) {
+  function addTask(
+    status: TaskStatus,
+    title: string,
+    boardId: string | null = null,
+    placement?: TaskPlacement,
+  ) {
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
     const maxPos = Math.max(
@@ -1795,7 +2379,26 @@ export function WorkspaceProvider({
       () => {
         setTaskMap((prev) => ({
           ...prev,
-          [tempId]: { id: tempId, title, status, assigneeIds: [], boardId, updatedAt: now },
+          [tempId]: {
+            id: tempId,
+            title,
+            status,
+            assigneeIds: [],
+            boardId,
+            updatedAt: now,
+            // Placeholder pin so a view that groups by bucket shows the new card
+            // in the bucket it was typed into, rather than flashing in INBOX for
+            // a round trip. Only the PREFIX is meaningful (`placementOfDerivedId`
+            // reads it); the real pin is the server's to compute and lands with
+            // the response below. Display-only, and it never leaves the client —
+            // the create request carries `placement`, not this.
+            ...(placement && placement !== "inbox"
+              ? {
+                  canvasSectionId:
+                    placement === "thisWeek" ? "wk-pending" : `${placement}-pending`,
+                }
+              : {}),
+          },
         }));
         setNodes((prev) => [
           ...prev,
@@ -1805,7 +2408,13 @@ export function WorkspaceProvider({
       () =>
         api("/api/tasks", {
           method: "POST",
-          body: JSON.stringify({ title, status, assigneeIds: [], boardId }),
+          body: JSON.stringify({
+            title,
+            status,
+            assigneeIds: [],
+            boardId,
+            ...(placement ? { placement } : {}),
+          }),
         }),
       {
         // Swap the optimistic temp row for the real one in a single commit — no
@@ -1984,25 +2593,14 @@ export function WorkspaceProvider({
 
   /* ---- Workflow: lock / notes / summaries ---- */
 
-  // Lock the code (freeze it) and return the ready-to-paste work prompt. The
-  // server is idempotent, so a second click just re-returns the same prompt.
+  // Lock the code (freeze it) and assign the task to me — the handoff side
+  // effect behind every Copy-prompt click. Idempotent, so repeat clicks are
+  // free; the modal fires this and ignores the prompt it returns (it builds its
+  // own client-side, so the clipboard never waits on the network).
   async function lockTask(id: string): Promise<string> {
     const res = await api<{ task: Task; prompt: string }>(
       `/api/tasks/${id}/lock`,
       { method: "POST" },
-    );
-    setTaskMap((prev) =>
-      prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
-    );
-    return res.prompt;
-  }
-
-  // Return a handoff prompt by kind. "work"/"analyze-work" lock the code
-  // server-side, so merge the returned task back (its code may have hardened).
-  async function taskPrompt(id: string, kind: PromptKind): Promise<string> {
-    const res = await api<{ task: Task; prompt: string }>(
-      `/api/tasks/${id}/prompt`,
-      { method: "POST", body: JSON.stringify({ kind }) },
     );
     setTaskMap((prev) =>
       prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
@@ -2069,6 +2667,10 @@ export function WorkspaceProvider({
   // Liveblocks storage, and low-frequency — they don't go through `mutate`
   // (which reconciles the whole task/project list; unnecessary here). Each
   // one pings peers in the room directly via `emitLocalChange`.
+  //
+  // They DO bump the reconcile generation, though: `loadCanvasNotes` replaces
+  // the list wholesale, and skipping `mutate` used to mean nothing told an
+  // in-flight refetch that these optimistic values are newer than its snapshot.
   async function addCanvasNote(
     canvasId: string,
     x: number,
@@ -2078,6 +2680,7 @@ export function WorkspaceProvider({
   ) {
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
+    reconcileSeq.current++;
     setCanvasNotes((prev) => ({
       ...prev,
       [canvasId]: [
@@ -2117,6 +2720,7 @@ export function WorkspaceProvider({
   }
 
   async function moveCanvasNote(canvasId: string, noteId: string, x: number, y: number) {
+    reconcileSeq.current++;
     setCanvasNotes((prev) => ({
       ...prev,
       [canvasId]: (prev[canvasId] ?? []).map((n) => (n.id === noteId ? { ...n, x, y } : n)),
@@ -2131,6 +2735,7 @@ export function WorkspaceProvider({
 
   async function resolveCanvasNote(canvasId: string, noteId: string, resolved: boolean) {
     const now = new Date().toISOString();
+    reconcileSeq.current++;
     setCanvasNotes((prev) => ({
       ...prev,
       [canvasId]: (prev[canvasId] ?? []).map((n) =>
@@ -2150,6 +2755,7 @@ export function WorkspaceProvider({
 
   async function deleteCanvasNote(canvasId: string, noteId: string) {
     const prevForCanvas = canvasNotes[canvasId] ?? [];
+    reconcileSeq.current++;
     setCanvasNotes((prev) => ({
       ...prev,
       [canvasId]: prevForCanvas.filter((n) => n.id !== noteId),
@@ -2207,9 +2813,30 @@ export function WorkspaceProvider({
     loadLogs(taskId);
   }
 
-  const childrenOf = (id: string | null) =>
-    nodes.filter((n) => n.parentId === id).sort(compareTaskOrder);
-  const nodeById = (id: string) => nodes.find((n) => n.id === id);
+  /* The tree, indexed once per `nodes` change — see `childIndex` on the context
+   * type for why. Both helpers below read the indexes, so a caller that was
+   * already scanning per call gets the same answers for free. */
+  const nodeIndex = useMemo(() => {
+    const m = new Map<string, TaskNode>();
+    for (const n of nodes) m.set(n.id, n);
+    return m;
+  }, [nodes]);
+  const childIndex = useMemo(() => {
+    const m = new Map<string | null, TaskNode[]>();
+    for (const n of nodes) {
+      const siblings = m.get(n.parentId);
+      if (siblings) siblings.push(n);
+      else m.set(n.parentId, [n]);
+    }
+    // Sorted here, once, so every lookup is already in display order.
+    for (const siblings of m.values()) siblings.sort(compareTaskOrder);
+    return m;
+  }, [nodes]);
+
+  // Fresh arrays: these are the one-task callers, and handing out the shared
+  // index array would let a caller sort or splice it under everyone else.
+  const childrenOf = (id: string | null) => [...(childIndex.get(id) ?? [])];
+  const nodeById = (id: string) => nodeIndex.get(id);
 
   return (
     <WorkspaceContext.Provider
@@ -2233,6 +2860,8 @@ export function WorkspaceProvider({
         addSubtask,
         childrenOf,
         nodeById,
+        childIndex,
+        nodeIndex,
         registerPlacement,
         start,
         toggleDone,
@@ -2252,11 +2881,14 @@ export function WorkspaceProvider({
         moveNodeIntoSection,
         dropToGroup,
         moveToBoard,
+        fileTask,
+        fileTasks,
+        pendingPlacements,
+        registerPlacementMap,
         addTask,
         addSectionTask,
         addComment,
         lockTask,
-        taskPrompt,
         addNote,
         resolveNote,
         editWorkflow,
@@ -2283,6 +2915,9 @@ export function WorkspaceProvider({
         refreshFromRemote,
         notice,
         clearNotice: () => setNotice(null),
+        pendingComplete,
+        completeBranch,
+        clearPendingComplete: () => setPendingComplete(null),
         projectSettingsId,
         openProjectSettings: setProjectSettingsId,
         closeProjectSettings: () => setProjectSettingsId(null),

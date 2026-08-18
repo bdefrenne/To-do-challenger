@@ -17,11 +17,44 @@ edit and a human edit go through the exact same door.
   a REST API (`src/app/api/*`), and an **MCP server** (`src/app/api/mcp`).
 - **Hierarchy:** Project → Board → Task. Tasks carry Jira-style refs
   (`PREFIX-seq`) whose prefix resolves board → project → user.
+- **One canvas per project.** A canvas is that project's whiteboard, laying its
+  boards out as sections inside machine-managed trays — INBOX · TODAY · THIS
+  WEEK · BACKLOG · LATER. Every tray holds a lane for **every** board, in
+  sidebar order, so the trays read as one grid: same columns, same order, every
+  band — the project Boards view, laid out in space. The 1:1 is enforced, and
+  it's what lets the server answer "which canvas does this task's placement go
+  on?" with a lookup instead of a guess. Two things stay yours: a section you
+  make inside a tray is an ordinary section and is *preferred* over a
+  machine-made lane, so your own named lanes are what work lands in; and a group
+  you drag stays where you put it.
 - **Per-user isolation:** the web app authenticates with a signed session
   cookie; MCP/REST use per-user **bearer tokens**, so a user's Claude only ever
   sees and edits that user's data.
 - **Projects & boards** each have: name, shortname (`code`), color, picture,
   `gitFolder`, and a Markdown description mirrored to this file.
+- **Process model:** a task's journey (`Backlog → … → Done`) and a **working
+  day**'s record are the two contracts, written once in `src/lib/workflow.ts`
+  and read by every surface — so the steps a person sees and the steps an agent
+  follows can't drift. A working day runs 04:00 → 04:00 local
+  (`src/lib/workday.ts`), and closing one out produces the standup.
+- **Keyboard-first cards:** hovering any task card — on the canvas, the project
+  Boards view, a board's kanban or the task list — gives the same keys, from one
+  definition (`useTaskCardShortcuts`): **D** done, **S/I/A** pickers, **1/2**
+  importance, **SPACE** assign yourself, **DELETE** the delete flow (finished
+  work always takes a second, deliberate press before it leaves: off the canvas
+  it parks in DONE THIS WEEK first, on the canvas — which has no such tray — it
+  sits in its board's lane until DELETE archives it), **↑/→/↓** file it in THIS
+  WEEK / BACKLOG / LATER. **?** shows the cheatsheet.
+- **Live co-editing in a section's text view.** A canvas section flips between
+  cards and an **outline** — one editable document over its task list. Several
+  people can be in it at once and edit **different rows simultaneously**: a row is
+  one task field, so each keystroke is an independent patch that peers apply
+  without a database read (~RTT, no polling), and structure (create / nest /
+  reorder / delete) is saved as real operations against fractional sort keys
+  instead of a whole-list diff — which is what makes concurrent edits commute
+  instead of overwriting each other. You see who is on which line and **their
+  caret**, as a vertical bar at their exact character. Two people in the *same*
+  field is the one case that can't merge: last write wins, and the row says so.
 - **Integrations:** Vercel Blob (pictures), Google Calendar, a Telegram bot.
 
 ## Constraints

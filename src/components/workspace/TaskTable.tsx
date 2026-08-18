@@ -32,8 +32,6 @@ export function TaskTable({
     toggleDone,
     setStatus,
     editTask,
-    toggleSelfAssignee,
-    deleteTask,
     openProjectSettings,
     moveNode,
     dropToGroup,
@@ -115,8 +113,6 @@ export function TaskTable({
           onSetStatus={(s) => setStatus(node.id, s)}
           onImportance={(v) => editTask(node.id, { importance: v })}
           onAssign={(id, patch) => editTask(id, patch)}
-          onAssignSelf={() => toggleSelfAssignee(node.id)}
-          onDelete={() => deleteTask(node.id)}
           memberIds={taskProject?.members}
           onEditMembers={
             taskProject ? () => openProjectSettings(taskProject.id) : undefined

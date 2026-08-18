@@ -22,7 +22,7 @@
  *      need to know about canvases at all.
  */
 
-import type { CanvasNode, Task, TaskStatus } from "./types";
+import type { CanvasNode, Task, TaskPlacement, TaskStatus } from "./types";
 
 /* --------------------------- System groups ---------------------------
  * Three groups on every canvas are MACHINE-MANAGED: the editor creates them,
@@ -31,6 +31,10 @@ import type { CanvasNode, Task, TaskStatus } from "./types";
  *
  *   INBOX           untriaged. The odd one out: its lanes mean "unpinned", so a
  *                   task lands here by having no pin at all (`isInboxNode`).
+ *   TODAY           on today's shortlist — the daily counterpart to THIS WEEK.
+ *                   Machine-managed rather than hand-starred, so it exists on
+ *                   every canvas and agents can file into it without the user
+ *                   having made a group first. A real pin.
  *   BACKLOG         triaged, not scheduled. A real pin.
  *   LATER           deliberately deferred. A real pin.
  *   DONE THIS WEEK  finished, not yet swept. The holding pen that makes deleting
@@ -42,12 +46,21 @@ import type { CanvasNode, Task, TaskStatus } from "./types";
  * Each group carries its kind as a `data` flag (`data.backlog === true`), set on
  * the `section_group` AND on every lane inside it, so a node can be classified
  * without walking to its parent. */
-export type SystemGroup = "inbox" | "backlog" | "later" | "doneThisWeek";
+export type SystemGroup =
+  | "inbox"
+  | "today"
+  | "thisWeek"
+  | "backlog"
+  | "later"
+  | "doneThisWeek";
 
-/** The four kinds in display order — also the order they're stacked down the
- *  left of a canvas: what's arriving, what's parked, what's finished. */
+/** The five kinds in display order — also the order they're stacked down the
+ *  left of a canvas: what's arriving, what's on today's list, what's parked,
+ *  what's finished. */
 export const SYSTEM_GROUPS: readonly SystemGroup[] = [
   "inbox",
+  "today",
+  "thisWeek",
   "backlog",
   "later",
   "doneThisWeek",
@@ -56,6 +69,8 @@ export const SYSTEM_GROUPS: readonly SystemGroup[] = [
 /** Header text for each system group's container. */
 export const SYSTEM_GROUP_TITLE: Record<SystemGroup, string> = {
   inbox: "INBOX",
+  today: "TODAY",
+  thisWeek: "THIS WEEK",
   backlog: "BACKLOG",
   later: "LATER",
   doneThisWeek: "DONE THIS WEEK",
@@ -105,6 +120,8 @@ export const systemLaneId = (
 
 /** What pressing DELETE on a card actually does. */
 export type DeleteAction =
+  /** Mark it done, then park it — DELETE on a card that's in REVIEW accepts it. */
+  | "complete"
   /** Move it to DONE THIS WEEK — finished, but still on the board to be swept. */
   | "park"
   /** Leave the canvas for the Archived view. Restorable. */
@@ -120,18 +137,44 @@ export type DeleteAction =
  * finished work stays visible until you sweep it (nothing clears the group on a
  * timer — the section header's Bulk menu empties it in one go).
  *
+ * A card in REVIEW is finished work waiting to be accepted, so DELETE means
+ * "accept it": it's marked done and parked in the same one press. The archiving
+ * second press then works exactly as it does for a card that was already done.
+ *
  * A card that was never done is a different thing: it's junk you never started,
  * so it deletes on the first press as it always has. Parking it would put a
  * not-done card in a group called DONE THIS WEEK.
  *
+ * The two steps still hold where there IS a tray to park in. On the canvas there
+ * isn't one (TD-87), so the pair becomes REVIEW → done-in-place → archived: the
+ * card stays in its own board's lane, visibly finished, until a second press
+ * takes it off the board. Same shape, one fewer place for it to go.
+ *
  * @param tray the machine-managed group the card currently sits in, if any
+ * @param opts.canPark whether the calling surface HAS a DONE THIS WEEK tray to
+ *   park into. Defaults true; the canvas passes false.
  */
+/** The machine-managed tray a placement bucket corresponds to. Every bucket now
+ *  has one — THIS WEEK used to be the exception, the one group a user made and
+ *  starred by hand (TD-137). Kept as a named function rather than inlined: it's
+ *  the seam where the two vocabularies (`TaskPlacement`, `SystemGroup`) meet,
+ *  and it's what lets a view that renders by bucket answer `deletionOf`'s
+ *  `tray` question without a canvas to ask. */
+export const trayOfPlacement = (p: TaskPlacement): SystemGroup | null => p;
+
 export function deletionOf(
   status: TaskStatus,
   tray: SystemGroup | null,
+  opts?: { canPark?: boolean },
 ): DeleteAction {
   if (tray === "doneThisWeek") return "archive";
-  return status === "done" ? "park" : "delete";
+  if (status === "review") return "complete";
+  if (status !== "done") return "delete";
+  // Nowhere to park — the canvas has no DONE THIS WEEK tray, so a done card
+  // just sits in its board's lane wearing the green wash until it's archived,
+  // and DELETE is what archives it. Still not silent: the usual undo window
+  // applies, and archiving is reversible from the Archived view.
+  return opts?.canPark === false ? "archive" : "park";
 }
 
 /** Stable id for a canvas's INBOX group. */
@@ -143,66 +186,48 @@ export const inboxLaneId = (canvasId: string, boardId: string | null): string =>
   systemLaneId("inbox", canvasId, boardId);
 
 /* ---------------------------- THIS WEEK ----------------------------
- * One `section_group` per canvas can be starred THIS WEEK (`data.thisWeek`),
- * naming the board an agent should drop work onto when it's for this week — or
- * when the agent is starting on it right now. Everything else stays unpinned and
- * shows up in INBOX.
+ * THIS WEEK is where an agent drops work that's for this week — or that it's
+ * starting on right now. Everything else stays unpinned and shows up in INBOX.
  *
- * The star is the ONLY star: every section inside the flagged group is by that
- * fact its board's MASTER — the target of sibling sections' "Send to" button.
- * There used to be a second, independent `data.master` flag per section, which
- * meant a board's master could sit outside the THIS WEEK group and the two could
- * disagree about where this week's work goes. Now one flag answers both.
+ * It is an ORDINARY SYSTEM GROUP (TD-137). It used to be the one exception: a
+ * group the user made, named, and starred, found by its `data.thisWeek` flag,
+ * with lanes under a `wk-<groupId>-<boardId>` scheme of their own. That
+ * exception is where its whole failure class came from — being hand-made, it
+ * could be deleted, could simply not exist until a pin happened to materialise
+ * it, left its lanes orphaned when it went, and had its position set once at
+ * creation with nothing to correct it.
  *
- * Unlike the system groups above, this one is HAND-CURATED: the user makes it,
- * names it, and arranges its sections. The only machine part is materialising a
- * lane for a board the group doesn't cover yet (see `boardsNeedingWeekLane`), and
- * even then the lane is an ordinary section afterwards — renameable, movable,
- * deletable, and never auto-removed when it empties. */
-
-/** The `data` flag marking the one group that is "this week". */
-export const isThisWeekGroup = (n: Pick<CanvasNode, "kind" | "data">): boolean =>
-  n.kind === "section_group" && n.data?.thisWeek === true;
-
-/** The canvas's THIS WEEK group, or null. Ties break on node id so every client
- *  agrees even if two groups somehow carry the flag. */
-export const thisWeekGroupId = (
-  canvasNodes: readonly CanvasNode[],
-): string | null => {
-  const flagged = canvasNodes.filter(isThisWeekGroup).map((n) => n.id).sort();
-  return flagged[0] ?? null;
-};
-
-/**
- * Stable id for one board's lane inside the THIS WEEK group.
+ * Now the reconciler owns it like any other tray: derived id
+ * (`systemGroupId("thisWeek", canvasId)`), derived lanes
+ * (`systemLaneId("thisWeek", …)`), created and repaired automatically.
  *
- * Derived for the same reason INBOX lane ids are — but here it also lets the
- * SERVER pin a task to a lane that doesn't exist yet. Canvas nodes live in
- * Liveblocks storage, so a row the server inserts is invisible to an open canvas
- * until storage re-hydrates; tasks, which poll, are not. So the server pins to
- * the id the lane WILL have and the canvas materialises it on the next poll
- * (`boardsNeedingWeekLane`), which makes the placement show up live.
- */
-export const weekLaneId = (groupId: string, boardId: string | null): string =>
-  `wk-${groupId}-${boardId ?? "noboard"}`;
+ * What survives from the hand-made era, because it was the good part: a section
+ * you make yourself inside the group is still an ordinary section — renameable,
+ * movable, and PREFERRED over a derived lane by `resolvePlacementSection`, so
+ * your own "Platform"/"Racing" lanes stay the thing work lands in. The
+ * reconciler only ever creates and removes lanes carrying the `data.thisWeek`
+ * flag, so it can't touch them.
+ *
+ * Each board's lane here is by that fact its board's MASTER — the target of
+ * sibling sections' "Send to" button. That used to be what the star meant; it's
+ * now simply what being the THIS WEEK lane means, which is the same rule with
+ * nothing left to set by hand. */
 
 /**
  * Each board's MASTER section: the lane it has inside the THIS WEEK group.
- * Empty when no group is starred — then no board has a master and no section
- * offers "Send to …", which is the honest answer rather than a stale one.
  *
  * Ties break on `position` then `id` — the same order as
- * `resolveThisWeekSection`'s `ORDER BY position, id`, so a group that somehow
+ * `resolvePlacementSection`'s `ORDER BY position, id`, so a group that somehow
  * holds two lanes for one board resolves identically on both tiers. Without
  * that, the server would file a task into one lane while the UI pointed at the
  * other.
  */
 export const masterSectionsByBoard = (
   canvasNodes: readonly CanvasNode[],
+  canvasId: string,
 ): Map<string, CanvasNode> => {
-  const groupId = thisWeekGroupId(canvasNodes);
+  const groupId = systemGroupId("thisWeek", canvasId);
   const byBoard = new Map<string, CanvasNode>();
-  if (!groupId) return byBoard;
   const lanes = canvasNodes
     .filter((n) => n.kind === "section" && n.data?.groupId === groupId)
     .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1));
@@ -214,24 +239,75 @@ export const masterSectionsByBoard = (
 };
 
 /**
- * The ids of the THIS WEEK / BACKLOG / LATER trio that travel together as one
- * rigid unit on the canvas — grabbing any one of the three drags the other
- * two along with it, preserving whatever relative offset they currently sit
- * at (see `onNodePointerDown` in CanvasEditor). This is purely a MOVEMENT
- * grouping, layered on top of the ordinary system-group/THIS WEEK identity
- * above — it doesn't change membership, pinning, or the reconciler.
+ * A lane id from the era when THIS WEEK was hand-made: `wk-<groupId>-<boardId>`.
  *
- * Only ids that actually exist on this canvas come back, so the trio
- * degrades gracefully: no starred THIS WEEK group yet, or BACKLOG/LATER not
- * materialised yet, just means fewer nodes travel together.
+ * Kept ONLY so old pins keep reading as THIS WEEK (`placementOfDerivedId`) and
+ * so the reconciler can recognise and sweep the superseded nodes. Nothing writes
+ * this shape any more — new lanes are `systemLaneId("thisWeek", …)`. Pins are
+ * rewritten by `scripts/repair-week-lane-ids.ts`.
  */
-export function anchorTrioGroupIds(
+export const LEGACY_WEEK_LANE_PREFIX = "wk-";
+
+/**
+ * The ids of the trays arranged around THIS WEEK — TODAY above, INBOX to its
+ * left, BACKLOG and LATER below — which travel together as one rigid unit on
+ * the canvas.
+ * Grabbing any one of them drags the others along, preserving whatever relative
+ * offset they currently sit at (see `onNodePointerDown` in CanvasEditor).
+ *
+ * Purely a MOVEMENT grouping, layered on top of ordinary system-group identity:
+ * it doesn't change membership, pinning, or the reconciler. It exists so the
+ * arrangement the anchor effect maintains survives a drag — moving one tray out
+ * from under the others would just be undone on the next render.
+ *
+ * Only ids that actually exist on this canvas come back, so it degrades
+ * gracefully: a tray not materialised yet simply doesn't travel.
+ */
+/**
+ * Has a human placed this group by hand?
+ *
+ * Auto-placement is a convenience for a group nobody has touched — the tray
+ * column, and the trays arranged around THIS WEEK. The moment someone drags one,
+ * that position is the answer and nothing may recompute it: a layout you
+ * arranged and that silently springs back is worse than no layout at all.
+ *
+ * Set on the group you GRABBED, and only that one. The anchored trays travel
+ * together, so an earlier version flagged every group in the drag — reasoning
+ * that it would be odd for two of them to spring back. The consequence was that
+ * one drag of any tray pinned all five at once and killed the arrangement rules
+ * permanently: nothing could place TODAY above THIS WEEK or INBOX beside it ever
+ * again, and the boxes were left overlapping wherever that drag had put them.
+ * Pinning only the grabbed group gives the behaviour that was actually wanted —
+ * the whole arrangement moves with your hand, the group you held stays put, and
+ * the others go on being arranged around it.
+ *
+ * Reads `data.placed`, not the old `data.pinned`: rows written under the
+ * every-group rule carry a `pinned` that means something this code no longer
+ * means, and there is no way to tell those apart from a deliberate one. The
+ * reconciler strips the dead key from its own trays (see `CanvasEditor`) rather
+ * than leaving it to confuse the next reader, which is exactly what the
+ * long-dead `anchoredToWeek` flag did.
+ *
+ * The flag lives in Liveblocks storage alongside x/y, so it is SHARED — one
+ * arrangement everyone sees, not a per-viewer preference.
+ */
+export const isPinnedGroup = (n: Pick<CanvasNode, "data">): boolean =>
+  n.data?.placed === true;
+
+/** Keys a group may carry that no longer mean anything: `pinned` from the
+ *  every-group-in-the-drag rule, `anchoredToWeek` from an opt-in anchor that was
+ *  deleted years of commits ago and read nowhere. */
+export const DEAD_GROUP_KEYS = ["pinned", "anchoredToWeek"] as const;
+
+export function anchoredTrayGroupIds(
   canvasNodes: readonly CanvasNode[],
   canvasId: string,
 ): Set<string> {
   const existing = new Set(canvasNodes.map((n) => n.id));
   const ids = [
-    thisWeekGroupId(canvasNodes),
+    systemGroupId("thisWeek", canvasId),
+    systemGroupId("today", canvasId),
+    systemGroupId("inbox", canvasId),
     systemGroupId("backlog", canvasId),
     systemGroupId("later", canvasId),
   ].filter((id): id is string => id !== null && existing.has(id));
@@ -273,6 +349,15 @@ export interface SectionMembership {
  * task/node change — a per-Section scan would be O(sections × tasks), and this
  * canvas already has 18 sections against hundreds of tasks.
  */
+/**
+ * "This task belongs on no canvas section, and that is the correct answer" —
+ * as opposed to `null`, which means "nothing claims it, so INBOX should".
+ *
+ * Only DONE THIS WEEK produces it today. A NUL prefix so it can never collide
+ * with a real node id (uuids and the derived `<kind>-<uuid>-<uuid>` shapes).
+ */
+const OFF_CANVAS = "\u0000off-canvas";
+
 export function buildSectionMembership(
   canvasNodes: readonly CanvasNode[],
   tasks: readonly PlaceableTask[],
@@ -302,6 +387,17 @@ export function buildSectionMembership(
     if (!t) return null;
 
     const pin = pinnedSectionId(taskMap[id]);
+    // A DONE THIS WEEK pin means "off the canvas on purpose". It must short-
+    // circuit BEFORE the fall-through below, or the missing lane would read as
+    // "unplaced" and the INBOX reconciler would draw a lane to hold it —
+    // finished work coming back as untriaged. Checked on the id rather than on
+    // whether the node exists, so it holds both before and after the tray is
+    // swept from storage.
+    if (pin && placementOfDerivedId(pin) === "doneThisWeek") {
+      memo.set(id, OFF_CANVAS);
+      return OFF_CANVAS;
+    }
+
     let placed: string | null =
       pin && sectionsOnCanvas.has(pin) ? pin : null;
     if (placed === null && t.parentId) placed = placementOf(t.parentId, seen);
@@ -315,6 +411,9 @@ export function buildSectionMembership(
   const unplaced = new Set<string>();
   for (const t of tasks) {
     const sectionId = placementOf(t.id, new Set());
+    // Deliberately off-canvas: not a member of anything, and NOT unplaced —
+    // `unplaced` is what INBOX lanes get built from.
+    if (sectionId === OFF_CANVAS) continue;
     if (sectionId === null) {
       unplaced.add(t.id);
       continue;
@@ -324,6 +423,148 @@ export function buildSectionMembership(
     set.add(t.id);
   }
   return { bySection, unplaced };
+}
+
+/* ------------------- Placement OFF the canvas -------------------
+ * `buildSectionMembership` above answers "which Section shows this card?", which
+ * only a mounted canvas can ask — it needs every node. The board views need the
+ * coarser question, "which BUCKET is this card in?", and they have no canvas.
+ *
+ * So the canvas is flattened once, server-side, into a section id → placement
+ * map (`PlacementMap`, built by `listPlacementSections`) and the lookup below
+ * reads a task against it. Same answer as the canvas gives, three orders of
+ * magnitude less data than shipping the nodes. */
+
+/** Section node id → the bucket that section belongs to. Sections that aren't in
+ *  any bucket (a user's own group out on the canvas) are simply absent. */
+export type PlacementMap = Record<string, TaskPlacement>;
+
+/** Display order of the buckets in the board views — the triage ladder read top
+ *  to bottom: what's unsorted, what just finished, what's on today, this week,
+ *  and what's parked. */
+export const PLACEMENT_ORDER: readonly TaskPlacement[] = [
+  "inbox",
+  "doneThisWeek",
+  "today",
+  "thisWeek",
+  "backlog",
+  "later",
+];
+
+/** Header text for each bucket. The system groups already name themselves; THIS
+ *  WEEK is hand-made, so it isn't in that map.
+ *
+ *  These are the DEFAULTS — the names a freshly reconciled canvas gives its
+ *  groups. A group can be renamed on the canvas, so the board views prefer the
+ *  live name (`PlacementTitles`, below) and fall back to these. */
+export const PLACEMENT_TITLE: Record<TaskPlacement, string> = {
+  ...SYSTEM_GROUP_TITLE,
+  thisWeek: "THIS WEEK",
+};
+
+/**
+ * The name each bucket's group actually carries ON THE CANVAS, for the buckets
+ * that have a group drawn. Partial because a bucket can legitimately have none:
+ * the trays are materialised on demand, and THIS WEEK only exists once someone
+ * stars a group.
+ *
+ * Shipped alongside the placement map (`listPlacementGroups`) because a renamed
+ * group would otherwise make the two surfaces disagree about the SAME bucket —
+ * rename the tray to "Parked" on the canvas and the board view would still head
+ * that band "LATER", which reads as a different bucket rather than the one you
+ * just renamed.
+ */
+export type PlacementTitles = Partial<Record<TaskPlacement, string>>;
+
+/** What to head a bucket's band with: its canvas name, else the default. Blank
+ *  names fall through too — an unnamed group on the canvas shows its default
+ *  label there, so it must show the same one here. */
+export const placementTitle = (
+  titles: PlacementTitles | undefined,
+  placement: TaskPlacement,
+): string => titles?.[placement]?.trim() || PLACEMENT_TITLE[placement];
+
+/**
+ * The gradient behind a bucket's separator bar — a full-width band with white
+ * text, so the separators CUT the page rather than sitting in it.
+ *
+ * The ramp carries the ladder's meaning, warm → cool → grey: TODAY is a sunrise
+ * because it's the only bucket that means *now*, THIS WEEK cools through blue to
+ * indigo, DONE THIS WEEK settles into the same green the finished cards use, and
+ * everything unscheduled greys out, fading further the further out it is.
+ *
+ * Each runs left→right from its DARKEST stop, which is where the label sits — so
+ * the white text keeps its contrast even on the pale end of the grey ramp, and
+ * the bar lightens as it runs out toward the empty right edge.
+ *
+ * Deliberately NOT the status palette: a bar and a status pill sitting on the
+ * same screen must not look like they're saying the same thing.
+ */
+export const PLACEMENT_BAR: Record<TaskPlacement, string> = {
+  inbox: "bg-linear-to-r from-slate-700 via-slate-600 to-slate-400",
+  doneThisWeek: "bg-linear-to-r from-emerald-700 via-emerald-600 to-teal-400",
+  today: "bg-linear-to-r from-rose-600 via-orange-500 to-amber-400",
+  thisWeek: "bg-linear-to-r from-indigo-700 via-blue-600 to-sky-400",
+  backlog: "bg-linear-to-r from-slate-600 via-slate-500 to-slate-300",
+  later: "bg-linear-to-r from-slate-500 via-slate-400 to-slate-200",
+};
+
+/**
+ * The bucket a section id names, WITHOUT consulting the canvas.
+ *
+ * Covers the case the map can't: a pin the server wrote to a lane that doesn't
+ * exist yet. `resolvePlacementSection` deliberately returns a DERIVED id
+ * (`weekLaneId` / `systemLaneId`) for a board the group doesn't cover, leaving
+ * the canvas to materialise the node on its next reconcile — so between the
+ * write and that reconcile there is no node to look up. Reading the id itself
+ * is what stops a just-filed task from showing in INBOX for those few seconds.
+ *
+ * Prefix-matching is safe because both id shapes are `<kind>-<uuid>-<uuid>`: a
+ * real section id is a bare uuid, which starts with none of these.
+ */
+export function placementOfDerivedId(
+  sectionId: string,
+): TaskPlacement | null {
+  // Legacy: THIS WEEK lanes were `wk-<groupId>-<boardId>` while the group was
+  // hand-made (TD-137). Nothing writes the shape now, but old pins still carry
+  // it and must keep bucketing correctly until they're rewritten.
+  if (sectionId.startsWith(LEGACY_WEEK_LANE_PREFIX)) return "thisWeek";
+  for (const kind of SYSTEM_GROUPS)
+    if (sectionId.startsWith(`${kind}-`)) return kind;
+  return null;
+}
+
+/**
+ * Which bucket a task sits in: its own pin, else whatever its parent resolves to
+ * (an unpinned subtask inherits its parent's placement, exactly as it does on
+ * the canvas), else INBOX — which IS the absence of a pin.
+ *
+ * A pin we can't place — a section on someone's canvas that isn't in any bucket,
+ * or a node that's been deleted — reads as INBOX rather than vanishing, on the
+ * same principle as the canvas's own "a pin that can't be resolved falls back to
+ * INBOX": a card that's filed somewhere the view can't show must still be
+ * somewhere the view CAN show.
+ *
+ * `parentOf` is passed in rather than read off the task because `Task` has no
+ * parent link — nesting lives on the tree node (`TaskNode.parentId`), which is
+ * what every caller already has to hand.
+ */
+export function placementOfTask(
+  taskId: string,
+  taskMap: Record<string, Task>,
+  parentOf: (id: string) => string | null,
+  map: PlacementMap,
+): TaskPlacement {
+  const seen = new Set<string>();
+  let id: string | null = taskId;
+  // `seen` guards a corrupt parent cycle, same as buildSectionMembership.
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const pin = pinnedSectionId(taskMap[id]);
+    if (pin) return map[pin] ?? placementOfDerivedId(pin) ?? "inbox";
+    id = parentOf(id);
+  }
+  return "inbox";
 }
 
 /** An empty membership — used before a canvas's nodes have loaded, and by the
@@ -360,38 +601,15 @@ export function boardsNeedingInbox(
 }
 
 /**
- * Which boards need a lane materialised in the THIS WEEK group: those with a
- * task pinned to the lane's derived id (`weekLaneId`) where no such node exists.
- *
- * Only ever true for a pin the SERVER wrote, and only until the next reconcile:
- * when the group already covers a board, `resolveThisWeekSection` pins to that
- * existing section's real id instead, which never matches this pattern. A pin
- * whose board has since changed simply stops matching and the task falls back to
- * INBOX — the same rule as any pin that can't be resolved.
- */
-export function boardsNeedingWeekLane(
-  canvasNodes: readonly CanvasNode[],
-  tasks: readonly PlaceableTask[],
-  taskMap: Record<string, Task>,
-): Set<string | null> {
-  const groupId = thisWeekGroupId(canvasNodes);
-  if (!groupId) return new Set();
-  const nodeIds = new Set(canvasNodes.map((n) => n.id));
-  const filed = boardsFiledInLanes(tasks, taskMap, (b) => weekLaneId(groupId, b));
-  return new Set(
-    [...filed].filter((b) => !nodeIds.has(weekLaneId(groupId, b))),
-  );
-}
-
-/**
- * Which boards have work filed in a BACKLOG / LATER / DONE THIS WEEK group —
+ * Which boards have work filed in a system group (THIS WEEK / BACKLOG / LATER /
+ * DONE THIS WEEK) —
  * i.e. which lanes that group should have. The reconciler creates the ones that
  * are missing and drops the ones that aren't here, so a lane appears the moment
  * the first card lands in it and disappears once the last one leaves.
  *
- * Keyed on the canvas id rather than the group id (as `weekLaneId` is), because
- * a system group's id is itself derived from the canvas — which is what lets the
- * SERVER name a lane it can't see, knowing only which canvas it's on.
+ * Keyed on the CANVAS id: a system group's id is itself derived from the canvas,
+ * which is what lets the SERVER name a lane it can't see, knowing only which
+ * canvas it's on.
  *
  * INBOX is NOT resolved this way: nothing is ever pinned to an inbox lane, so
  * its demand comes from `boardsNeedingInbox` — the opposite question, "who is

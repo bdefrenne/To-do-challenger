@@ -2,9 +2,16 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { WorkspaceProvider, useWorkspace } from "./workspace/WorkspaceContext";
 import { TaskDetailModal } from "./workspace/TaskDetailModal";
+import { ShortcutsHelp, openShortcutsHelp } from "./workspace/ShortcutsHelp";
 import { BoardModal } from "./workspace/BoardModal";
 import { ProjectModal } from "./workspace/ProjectModal";
 import { PeopleProvider, usePeople } from "./PeopleContext";
@@ -26,11 +33,38 @@ export interface SessionUser {
 const NAV = [
   { href: "/", label: "All tasks", icon: "☰" },
   { href: "/today", label: "Today", icon: "◎" },
+  { href: "/day", label: "Finish work", icon: "◑" },
   { href: "/canvas", label: "Canvas", icon: "◳" },
   { href: "/notes", label: "Notes", icon: "✎" },
   { href: "/calendar", label: "Calendar", icon: "▦" },
   { href: "/archived", label: "Archived", icon: "🗄" },
 ];
+
+const SIDEBAR_KEY = "sidebar:open";
+
+/** The sidebar's open/closed flag, kept in localStorage so the choice survives
+ *  reloads (and stays in step across tabs). Read through
+ *  `useSyncExternalStore` so SSR always renders it closed — the default — and
+ *  the stored value is picked up right after hydration. */
+const sidebarListeners = new Set<() => void>();
+
+function subscribeSidebar(onChange: () => void) {
+  sidebarListeners.add(onChange);
+  window.addEventListener("storage", onChange);
+  return () => {
+    sidebarListeners.delete(onChange);
+    window.removeEventListener("storage", onChange);
+  };
+}
+
+function readSidebarOpen() {
+  return localStorage.getItem(SIDEBAR_KEY) === "1";
+}
+
+function writeSidebarOpen(open: boolean) {
+  localStorage.setItem(SIDEBAR_KEY, open ? "1" : "0");
+  for (const cb of sidebarListeners) cb();
+}
 
 export function AppShell({
   children,
@@ -39,18 +73,40 @@ export function AppShell({
   children: ReactNode;
   user: SessionUser;
 }) {
+  const sidebarOpen = useSyncExternalStore(
+    subscribeSidebar,
+    readSidebarOpen,
+    () => false,
+  );
+  const toggleSidebar = () => writeSidebarOpen(!sidebarOpen);
+
   return (
     <PeopleProvider me={user}>
       <WorkspaceProvider meName={user.name} meId={user.id}>
         <div className="flex min-h-screen">
-          <Sidebar user={user} />
-          <main className="flex-1 overflow-x-hidden">{children}</main>
+          {sidebarOpen ? (
+            <Sidebar user={user} onClose={toggleSidebar} />
+          ) : (
+            <SidebarRail onOpen={toggleSidebar} />
+          )}
+          {/* `overflow-x-clip`, NOT `-hidden`: `hidden` makes this a scroll
+              container (and per spec promotes overflow-y to `auto`). Nothing
+              here should ever scroll — the one wide surface, TaskTable, brings
+              its own `overflow-x-auto` — but a focusable element out in a
+              clipped subtree (the canvas is full of them) makes the browser
+              scroll THIS box to reveal it, and Chrome then restores that offset
+              across reloads, leaving the canvas translated off-screen with no
+              way to recover. `clip` clips identically and is unscrollable, so
+              the offset can't exist. See TD-133. */}
+          <main className="min-w-0 flex-1 overflow-x-clip">{children}</main>
         </div>
         <TaskDetailModal />
         <GlobalProjectSettings />
+        <ShortcutsHelp />
         <Notice />
         <DeleteUndoToast />
         <SendUndoToast />
+        <CompleteBranchPrompt />
       </WorkspaceProvider>
     </PeopleProvider>
   );
@@ -128,6 +184,7 @@ function DeleteUndoToast() {
 
 const SEND_LABEL: Record<TaskPlacement, string> = {
   inbox: "Inbox",
+  today: "Today",
   thisWeek: "This week",
   backlog: "Backlog",
   later: "Later",
@@ -167,7 +224,70 @@ function SendUndoToast() {
   );
 }
 
-function Sidebar({ user }: { user: SessionUser }) {
+/**
+ * The answer to a refused completion: this task still has unfinished subtasks.
+ *
+ * A question, not a notice — so unlike the toasts above it does NOT auto-dismiss,
+ * and it offers the only path that closes a branch in one action
+ * (`completeBranch` → `withSubtasks`). Without it the rule is a dead end: DELETE
+ * on a Review card means "complete", so a parent with open children could be
+ * refused with nothing to do about it but hunt down each child.
+ *
+ * "Not now" leaves everything exactly as it was — the refused write never landed.
+ */
+function CompleteBranchPrompt() {
+  const { pendingComplete, completeBranch, clearPendingComplete } = useWorkspace();
+  if (!pendingComplete) return null;
+  const { taskId, taskTitle, openCount } = pendingComplete;
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-32 z-[300] flex justify-center px-4">
+      <div
+        role="alertdialog"
+        aria-label="Unfinished subtasks"
+        className="pointer-events-auto flex max-w-xl items-center gap-3 rounded-lg border border-border bg-surface px-4 py-2.5 text-sm text-fg shadow-lg"
+      >
+        <span className="min-w-0">
+          <span className="max-w-[18rem] truncate font-medium">{taskTitle}</span>{" "}
+          <span className="text-muted">
+            still has {openCount} unfinished subtask{openCount === 1 ? "" : "s"}.
+          </span>
+        </span>
+        <button
+          onClick={() => completeBranch(taskId)}
+          className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-surface-2 px-2 py-0.5 text-xs font-medium text-accent transition-colors hover:border-accent"
+        >
+          Complete all {openCount}
+        </button>
+        <button
+          onClick={clearPendingComplete}
+          className="shrink-0 rounded px-2 py-0.5 text-xs font-medium text-faint transition-colors hover:text-fg"
+        >
+          Not now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Collapsed stand-in for the sidebar: a narrow gutter holding just the button
+ *  that brings it back, so page content never sits under the toggle. */
+function SidebarRail({ onOpen }: { onOpen: () => void }) {
+  return (
+    <div className="sticky top-0 flex h-screen w-11 shrink-0 flex-col items-center py-4">
+      <button
+        onClick={onOpen}
+        title="Show sidebar"
+        aria-label="Show sidebar"
+        aria-expanded={false}
+        className="grid h-8 w-8 place-items-center rounded-lg text-faint transition-colors hover:bg-surface-2 hover:text-fg"
+      >
+        »
+      </button>
+    </div>
+  );
+}
+
+function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) {
   const pathname = usePathname();
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -199,12 +319,21 @@ function Sidebar({ user }: { user: SessionUser }) {
         <div className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
           ✓
         </div>
-        <div className="leading-tight">
+        <div className="min-w-0 flex-1 leading-tight">
           <div className="text-sm font-semibold tracking-tight">
             To-do Challenger
           </div>
           <div className="text-[11px] text-faint">Personal workspace</div>
         </div>
+        <button
+          onClick={onClose}
+          title="Hide sidebar"
+          aria-label="Hide sidebar"
+          aria-expanded
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-faint transition-colors hover:bg-surface-2 hover:text-fg"
+        >
+          «
+        </button>
       </div>
 
       <nav className="flex flex-col gap-0.5 px-3 py-2">
@@ -259,6 +388,22 @@ function Sidebar({ user }: { user: SessionUser }) {
             role="menu"
             className="absolute bottom-full left-2 right-2 mb-1 z-40 overflow-hidden rounded-lg border border-border bg-surface py-1 shadow-lg"
           >
+            <button
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                openShortcutsHelp();
+              }}
+              className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-sm text-fg hover:bg-surface-2"
+            >
+              <span className="flex items-center gap-2">
+                <span className="text-faint">⌨</span>
+                Keyboard shortcuts
+              </span>
+              <kbd className="rounded bg-surface-3 px-1 text-[10px] font-semibold leading-none text-faint">
+                ?
+              </kbd>
+            </button>
             <Link
               href="/settings"
               role="menuitem"

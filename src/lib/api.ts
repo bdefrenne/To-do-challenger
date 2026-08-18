@@ -8,6 +8,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { AuthError, requireAuth } from "./auth";
 import { withLogContext } from "./db/log-context";
+import { APP_TIMEZONE } from "./workday";
 
 /* ---- Validation schemas (shared by REST + MCP) ---- */
 export const statusSchema = z.enum([
@@ -24,6 +25,7 @@ export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);
  *  `status`. See `TaskPlacement` in types.ts. */
 export const placementSchema = z.enum([
   "inbox",
+  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -118,7 +120,10 @@ export const taskFilterShape = {
     .string()
     .max(60)
     .optional()
-    .describe('IANA zone the bare-date window edges mean, e.g. "Europe/Brussels" (default UTC)'),
+    .describe(
+      `IANA zone the bare-date window edges mean, e.g. "America/New_York" ` +
+        `(default ${APP_TIMEZONE})`,
+    ),
   includeArchived: z
     .boolean()
     .optional()
@@ -140,6 +145,101 @@ export const taskFilterShape = {
 
 export const taskFilterSchema = z.object(taskFilterShape);
 export type TaskFilterInput = z.infer<typeof taskFilterSchema>;
+
+/* ---- Reading completions (the Done view) --------------------------------
+   Its own shape, deliberately NOT part of `taskFilterShape`: the unit here is a
+   done EVENT — one per credited person per day — not a task, so the two share
+   only their window edges. Parsed straight off `searchParams`, hence the coerce
+   on `limit`. */
+export const completionsQueryShape = {
+  /** Chunk start — the client walks this back four weeks at a time. */
+  from: windowEdge,
+  /** Chunk end. A bare day includes that whole day (`dateWindow` makes the
+   *  instant range half-open), so consecutive chunks tile exactly. */
+  to: windowEdge,
+  projectId: z.string().max(120).optional(),
+  boardId: z.string().max(120).optional(),
+  creditedTo: z
+    .string()
+    .max(120)
+    .optional()
+    .describe("narrow to one person's work — id, email, or display name"),
+  tz: z
+    .string()
+    .max(60)
+    .optional()
+    .describe(
+      `IANA zone the day/week buckets are read in, e.g. "America/New_York" ` +
+        `(default ${APP_TIMEZONE})`,
+    ),
+  limit: z.coerce.number().int().min(1).max(2000).optional(),
+};
+
+export const completionsQuerySchema = z.object(completionsQueryShape);
+export type CompletionsQuery = z.infer<typeof completionsQuerySchema>;
+
+/* ---- Work days ----------------------------------------------------------
+   A work day is addressed by (project, working day) — the acting user is always
+   the third part of the key and comes from the request, never the body: you
+   cannot draft someone else's day for them. */
+
+/** The working day itself. Bare `YYYY-MM-DD`, because a standup talks about days
+ *  rather than instants; `lib/workday.ts` decides which day an instant is in. */
+export const workDaySchema = {
+  projectId: z.string().max(120),
+  day: ymd.describe("the working day, YYYY-MM-DD (see lib/workday.ts)"),
+  tz: z
+    .string()
+    .max(60)
+    .optional()
+    .describe(
+      `IANA zone the day is read in, e.g. "America/New_York" (default ${APP_TIMEZONE})`,
+    ),
+};
+
+export const workDayQuerySchema = z.object(workDaySchema);
+export type WorkDayQuery = z.infer<typeof workDayQuerySchema>;
+
+/** Reading ONE person's write-up in full. The only place the standup prose
+ *  crosses the wire — ranged reads carry `previewOf` output instead (PLAT-403),
+ *  so this is what the Done view calls when someone opens a column. `userId` is
+ *  whose day to read, not who's asking: a team reads each other's standups the
+ *  same way it reads each other's completions. */
+export const writeUpQuerySchema = z.object({
+  ...workDaySchema,
+  userId: z.string().max(120).describe("whose day to read (an account id)"),
+});
+export type WriteUpQuery = z.infer<typeof writeUpQuerySchema>;
+
+/** "Finish work" — the two authored fields, and nothing else. Completions are
+ *  NOT in here on purpose: each task is confirmed on its own, so the close-out
+ *  batches the asking rather than the deciding. */
+export const finishWorkSchema = z.object({
+  ...workDaySchema,
+  bullets: z
+    .string()
+    .max(10_000)
+    .nullable()
+    .optional()
+    .describe("standup points that aren't about any one task"),
+  summary: z
+    .string()
+    .max(20_000)
+    .nullable()
+    .optional()
+    .describe("the standup write-up for the day"),
+});
+export type FinishWorkInput = z.infer<typeof finishWorkSchema>;
+
+/** Logging work that never reached the board — a call, a conversation. Becomes a
+ *  real task, already done, credited to `day`. */
+export const logPastWorkSchema = z.object({
+  title: z.string().min(1, "title is required").max(500),
+  day: ymd.describe("the working day the work actually happened on"),
+  boardId: z.string().max(120).nullable().optional(),
+  description: z.string().max(10_000).optional(),
+});
+export type LogPastWorkInput = z.infer<typeof logPastWorkSchema>;
 
 export const createTaskSchema = z.object({
   title: z.string().min(1, "title is required").max(500),
@@ -417,6 +517,9 @@ const canvasNodeData = z.record(z.string(), z.unknown());
 
 export const createCanvasSchema = z.object({
   name: z.string().min(1, "name is required").max(120),
+  /** The project this canvas lays out. Required — a canvas with no project has
+   *  no placements, because that's the axis the server resolves against. */
+  projectId: z.string().min(1, "projectId is required"),
 });
 
 export const updateCanvasSchema = z
@@ -470,8 +573,28 @@ export class ConflictError extends Error {
  * Thrown by the service layer when a write is well-formed but violates a
  * business rule (e.g. archiving a task that isn't done). `route()` turns it
  * into a 400.
+ *
+ * `details` rides along for rules a CLIENT can act on rather than just report.
+ * The message is for a person; details are for code — a refusal that says "3
+ * subtasks aren't done" can then offer to finish them, which needs the ids and a
+ * `code` to switch on. Same shape of thinking as `ConflictError`, which already
+ * ships the fresh task next to its message. Plain data only: it is merged into
+ * the JSON body verbatim, so keep the keys stable — they are API surface.
  */
-export class ValidationError extends Error {}
+export interface RuleDetails {
+  /** Stable machine name for the rule, e.g. `"open_subtasks"`. */
+  code: string;
+  [key: string]: unknown;
+}
+
+export class ValidationError extends Error {
+  constructor(
+    message: string,
+    public details?: RuleDetails,
+  ) {
+    super(message);
+  }
+}
 
 /* ---- Responses ---- */
 export const json = <T>(data: T, status = 200) =>
@@ -502,7 +625,10 @@ export function route(
       if (e instanceof AuthError) return error(e.message, e.status);
       if (e instanceof ConflictError)
         return json({ error: e.message, task: e.current }, 409);
-      if (e instanceof ValidationError) return error(e.message, 400);
+      if (e instanceof ValidationError)
+        // `details` (when the rule carries any) is spread beside the message, so
+        // a client can act on the rule instead of only showing its text.
+        return json({ error: e.message, ...(e.details ?? {}) }, 400);
       if (e instanceof z.ZodError)
         return error(e.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "), 422);
       console.error("[api] unhandled error", e);

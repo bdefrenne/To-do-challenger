@@ -11,6 +11,7 @@
 import { and, asc, desc, eq, getTableColumns, ilike, inArray, isNotNull, isNull, ne, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
+import { previewOf } from "@/lib/format";
 import { db } from "./client";
 import {
   tasks,
@@ -25,6 +26,9 @@ import {
   users,
   canvases,
   canvasNodes,
+  workDays,
+  type WorkDayRow,
+  type NewWorkDayRow,
   type TaskRow,
   type TaskStatusEventRow,
   type NewTaskStatusEventRow,
@@ -40,10 +44,23 @@ import { STATUS_LABEL } from "@/lib/statuses";
 import type { PublicUser } from "./users";
 import { ConflictError, ValidationError } from "@/lib/api";
 import { daysAgo } from "@/lib/format";
-import { currentLogContext, type LogSource } from "./log-context";
+import { currentLogContext, withWorkedOn, type LogSource } from "./log-context";
 import { deriveCode, sanitizeCode, formatCode } from "@/lib/refs";
 import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
-import { weekLaneId, systemLaneId } from "@/lib/sections";
+import {
+  dateWindow,
+  workingDayOf,
+  workingDayStart,
+  currentWorkingDay,
+  APP_TIMEZONE,
+} from "@/lib/workday";
+import {
+  systemLaneId,
+  systemGroupOf,
+  placementOfTask,
+  type PlacementMap,
+  type PlacementTitles,
+} from "@/lib/sections";
 import type {
   Task,
   TaskStatus,
@@ -80,80 +97,17 @@ const iso = (d: Date | string | null) =>
   d == null ? undefined : (d instanceof Date ? d.toISOString() : d);
 
 /* ---- Date windows ----
-   Every "what happened between X and Y" read goes through `dateWindow`. It
-   exists because each caller used to hand-roll `new Date(from)` / `new Date(to)`
-   and compare inclusively, which made the most natural window of all — a single
-   day, from = to — resolve to the empty range [00:00, 00:00]. */
+   Every "what happened between X and Y" read goes through `dateWindow`, and
+   every "which day is this row on" through `workingDayOf`. Both live in
+   `lib/workday.ts` — pure, so the UI and the check scripts resolve days the
+   same way the queries do — and both are re-exported here because this module
+   is where callers have always found them.
 
-const DAY_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+   `dateWindow` exists because each caller used to hand-roll `new Date(from)` /
+   `new Date(to)` and compare inclusively, which made the most natural window of
+   all — a single day, from = to — resolve to the empty range [00:00, 00:00]. */
 
-/** How far `tz` is ahead of UTC at a given instant, in ms (0 for UTC). */
-function tzOffsetMs(at: Date, tz: string): number {
-  if (tz === "UTC") return 0;
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).formatToParts(at);
-  const n = (type: string) => Number(parts.find((p) => p.type === type)?.value);
-  // hour12:false renders midnight as "24" on some ICU builds — fold it back.
-  const asIfUtc = Date.UTC(
-    n("year"),
-    n("month") - 1,
-    n("day"),
-    n("hour") % 24,
-    n("minute"),
-    n("second"),
-  );
-  return asIfUtc - at.getTime();
-}
-
-/** The instant at which `YYYY-MM-DD` (+ `plusDays`) begins in `tz`. */
-function dayStart(day: string, tz: string, plusDays = 0): Date {
-  const [y, m, d] = day.split("-").map(Number);
-  const naive = Date.UTC(y, m - 1, d + plusDays);
-  // The offset sampled at the naive instant is right except when the window
-  // edge sits across a DST change; one correction lands it (offsets shift by
-  // an hour, day boundaries are 24 apart).
-  const off = tzOffsetMs(new Date(naive), tz);
-  const first = naive - off;
-  return new Date(first - (tzOffsetMs(new Date(first), tz) - off));
-}
-
-/**
- * Parse a caller's date window into a HALF-OPEN instant range `[start, end)`.
- *
- * Both ends are optional and accept either a bare day (`YYYY-MM-DD`) or a full
- * ISO instant. A bare day means the WHOLE day in `tz`, so `from = to =
- * "2026-08-04"` covers 04T00:00 → 05T00:00 — "what happened on the 4th?".
- *
- * `end` is EXCLUSIVE: compare with `< end`, never `<=`. That way an event at
- * 23:59:59.999 counts and one at the next midnight does not, and consecutive
- * windows tile without double-counting.
- */
-export function dateWindow(
-  from?: string,
-  to?: string,
-  tz = "UTC",
-): { start?: Date; end?: Date } {
-  return {
-    start: from
-      ? DAY_ONLY.test(from)
-        ? dayStart(from, tz)
-        : new Date(from)
-      : undefined,
-    end: to
-      ? DAY_ONLY.test(to)
-        ? dayStart(to, tz, 1)
-        : new Date(to)
-      : undefined,
-  };
-}
+export { dateWindow, workingDayOf };
 
 /** Conditions placing a timestamp column inside a half-open window. */
 function inWindow(
@@ -164,6 +118,55 @@ function inWindow(
   if (start) conds.push(sql`${col} >= ${start}`);
   if (end) conds.push(sql`${col} < ${end}`);
   return conds;
+}
+
+/**
+ * The inclusive WORKING-DAY bounds a window covers, for the `date` columns that
+ * store a day rather than an instant (`worked_on`, `work_days.day`).
+ *
+ * One function so those columns can't disagree with the instant columns beside
+ * them: the last included day is the one containing `end - 1ms`, since `end` is
+ * exclusive.
+ */
+const dayBounds = (
+  w: { start?: Date; end?: Date },
+  tz: string,
+): { fromDay?: string; toDay?: string } => ({
+  ...(w.start ? { fromDay: workingDayOf(w.start, tz) } : {}),
+  ...(w.end
+    ? { toDay: workingDayOf(new Date(w.end.getTime() - 1), tz) }
+    : {}),
+});
+
+/**
+ * The same window, but over a status event's EFFECTIVE day — `worked_on` when
+ * it's set, otherwise the day `at` falls on.
+ *
+ * Two branches rather than one `coalesce`, because the two columns are different
+ * types: `at` is an instant compared against the window's half-open bounds,
+ * while `worked_on` is already a working day and compares as a date. Folding
+ * them together in SQL would mean converting instants to days per row in the
+ * reader's zone, which no index could serve.
+ *
+ * The date bounds come from `dayBounds`, derived from the window itself so they
+ * can't disagree with it.
+ */
+function effectiveWindow(
+  w: { start?: Date; end?: Date },
+  tz: string,
+): SQL[] {
+  if (!w.start && !w.end) return [];
+  const { fromDay, toDay } = dayBounds(w, tz);
+  const dayConds: SQL[] = [];
+  if (fromDay)
+    dayConds.push(sql`${taskStatusEvents.workedOn} >= ${fromDay}`);
+  if (toDay) dayConds.push(sql`${taskStatusEvents.workedOn} <= ${toDay}`);
+  const byInstant = and(
+    isNull(taskStatusEvents.workedOn),
+    ...inWindow(taskStatusEvents.at, w),
+  );
+  const byDay = and(isNotNull(taskStatusEvents.workedOn), ...dayConds);
+  return [sql`(${or(byInstant, byDay)})`];
 }
 
 /** Keep importance inside the -1…2 ladder — guards legacy rows and any stray
@@ -376,27 +379,27 @@ const THIS_WEEK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
 ]);
 
 /**
- * Where a "this week" task goes: the section for `boardId` inside the canvas's
- * THIS WEEK group (the group flagged `data.thisWeek`), or null if no group is
- * flagged — in which case the caller leaves the task unpinned and it shows up in
- * INBOX as usual.
+ * Where a "this week" task goes: the section for `boardId` inside that project's
+ * canvas's THIS WEEK group, or null only when the project has no canvas — then
+ * a placement genuinely has nowhere to go and the caller leaves the task
+ * unpinned, i.e. in INBOX.
+ *
+ * A thin wrapper now that THIS WEEK is an ordinary system group (TD-137); kept
+ * because "resolve this week" is what most callers actually mean, and the name
+ * documents the implicit status rule that uses it.
  *
  * An EXISTING member section for that board always wins, so the user's own lanes
  * ("Platform", "Racing", …) are what agents drop work into. Only when the group
- * doesn't cover the board yet do we return the DERIVED lane id (`weekLaneId`) —
- * a node the canvas will materialise inside the group on its next reconcile.
- * Writing the node here instead would be invisible to any open canvas, since
- * nodes live in Liveblocks storage, not in the row we'd insert.
- *
- * Reads `data` straight out of jsonb: the flag is a canvas-editor toggle whose
- * writes reach Postgres on the editor's debounced save, so it can lag a few
- * seconds behind the star being clicked. Nothing else depends on it being
- * instant.
+ * doesn't cover the board yet do we return the DERIVED lane id — a node the
+ * canvas will materialise on its next reconcile. Writing the node here instead
+ * would be invisible to any open canvas, since nodes live in Liveblocks storage,
+ * not in the row we'd insert.
  */
 export async function resolveThisWeekSection(
   boardId: string | null,
+  projectId: string | null = null,
 ): Promise<string | null> {
-  return resolvePlacementSection("thisWeek", boardId);
+  return resolvePlacementSection("thisWeek", boardId, projectId);
 }
 
 /**
@@ -410,27 +413,99 @@ export async function resolveThisWeekSection(
  * on the group id (the group is hand-made, so its id is random), the system
  * groups' on the canvas id (their ids are themselves derived from it).
  */
+/**
+ * Which canvas a project's machine-managed trays belong on — the canvas to
+ * derive a not-yet-drawn lane id against (see `resolvePlacementSection`).
+ *
+ * One lookup, because `canvases.project_id` is unique: a project has exactly one
+ * canvas. This replaces ~50 lines that GUESSED — scan for the starred THIS WEEK
+ * group, else count placement groups per canvas, else take the first by
+ * position. Every one of those heuristics was reaching for the fact the column
+ * now states, and each was stable only by accident: the id they produce is a
+ * promise that a particular canvas will materialise that lane, so answering with
+ * a different canvas next call strands the first pin. Ordering tricks made the
+ * guess repeatable; they could never make it right, because nothing in the data
+ * said which canvas a task's placement belonged on (TD-136).
+ *
+ * Null only if the project has no canvas — then a placement genuinely has
+ * nowhere to go, and the caller leaves the task in INBOX.
+ */
+async function canvasIdForProject(projectId: string): Promise<string | null> {
+  const [row] = await db
+    .select({ id: canvases.id })
+    .from(canvases)
+    .where(eq(canvases.projectId, projectId))
+    .limit(1);
+  return row?.id ?? null;
+}
+
+/** The project a task's placement should resolve against: its board's project,
+ *  or — for a board-less task — the project it was filed under directly. Both
+ *  columns exist on `tasks`; the board is preferred because a task can be moved
+ *  between boards without its stale `projectId` being rewritten. */
+async function projectForPlacement(
+  boardId: string | null,
+  projectId: string | null,
+): Promise<string | null> {
+  if (boardId) {
+    const [row] = await db
+      .select({ projectId: boards.projectId })
+      .from(boards)
+      .where(eq(boards.id, boardId))
+      .limit(1);
+    if (row?.projectId) return row.projectId;
+  }
+  return projectId;
+}
+
 export async function resolvePlacementSection(
   placement: TaskPlacement,
   boardId: string | null,
+  projectId: string | null = null,
 ): Promise<string | null> {
   if (placement === "inbox") return null;
+
+  // WHICH CANVAS is decided by the task, not by a scan. Before TD-136 this
+  // query had no canvas filter and took `groups[0]` ordered by node id, so with
+  // two canvases a task's placement landed on whichever canvas id sorted first —
+  // deterministic, and unrelated to the project the task belongs to.
+  const project = await projectForPlacement(boardId, projectId);
+  if (!project) return null;
+  const canvasId = await canvasIdForProject(project);
+  if (!canvasId) return null;
+
   // Each placement's name IS the `data` flag that marks its group, so the query
   // is the same for all of them.
   const flag = placement;
 
-  const groups = await db
+  const [group] = await db
     .select({ id: canvasNodes.id, canvasId: canvasNodes.canvasId })
     .from(canvasNodes)
     .where(
       and(
+        eq(canvasNodes.canvasId, canvasId),
         eq(canvasNodes.kind, "section_group"),
         sql`${canvasNodes.data}->>${flag} = 'true'`,
       ),
     )
-    .orderBy(asc(canvasNodes.id));
-  const group = groups[0];
-  if (!group) return null;
+    .orderBy(asc(canvasNodes.id))
+    .limit(1);
+
+  if (!group) {
+    // No group flagged for this placement on this project's canvas yet. Every
+    // group and lane id here is derivable from the canvas id, so we can name the
+    // lane the canvas will materialise on its next reconcile — the same
+    // name-a-node-that-doesn't-exist-yet trick the THIS WEEK path uses once its
+    // group exists, one level up: for THIS WEEK the GROUP is named too
+    // (`WEEK_GROUP_FALLBACK`), because a hand-made group has no id to find.
+    //
+    // Without this, filing into a group the canvas hasn't drawn yet silently did
+    // nothing and the card stayed in INBOX — invisible for a brand-new tray
+    // (TODAY on every existing canvas), for any canvas whose trays haven't been
+    // materialised, and for THIS WEEK on every canvas with no starred group,
+    // which made the board view's THIS WEEK band unfillable (TD2-2).
+    return systemLaneId(placement, canvasId, boardId);
+  }
 
   const [existing] = await db
     .select({ id: canvasNodes.id })
@@ -449,9 +524,7 @@ export async function resolvePlacementSection(
     .limit(1);
   if (existing) return existing.id;
 
-  return placement === "thisWeek"
-    ? weekLaneId(group.id, boardId)
-    : systemLaneId(placement, group.canvasId, boardId);
+  return systemLaneId(placement, group.canvasId, boardId);
 }
 
 /** How a placement change reads on the activity timeline. Every move is
@@ -459,6 +532,7 @@ export async function resolvePlacementSection(
  *  these lines exist to prevent. */
 const PLACEMENT_LOG: Record<TaskPlacement, string> = {
   inbox: "📥 Moved back to INBOX",
+  today: "☀️ Moved to TODAY",
   thisWeek: "📅 Moved to THIS WEEK",
   backlog: "🗂️ Moved to BACKLOG",
   later: "🕓 Moved to LATER",
@@ -567,6 +641,10 @@ function statusEventRows(input: {
       source: ctx?.source,
       actorId: ctx?.actorId,
       creditedTo,
+      // Null unless the close-out is reconciling a day that already ended, in
+      // which case `at` still records when we learned and this records which
+      // day the work belongs to.
+      workedOn: ctx?.workedOn ?? null,
     }),
   );
 }
@@ -1031,7 +1109,7 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
 
   if (filter?.includeDone === false) conds.push(ne(tasks.status, "done"));
 
-  const tz = filter?.tz ?? "UTC";
+  const tz = filter?.tz ?? APP_TIMEZONE;
   conds.push(
     ...inWindow(
       tasks.statusSince,
@@ -1469,7 +1547,7 @@ export async function createTask(
   const canvasSectionId =
     input.canvasSectionId !== undefined && input.canvasSectionId !== null
       ? input.canvasSectionId
-      : await resolvePlacementSection(placement, boardId);
+      : await resolvePlacementSection(placement, boardId, projectId);
   const explicitAssignees = await resolveAssignees(input.assigneeIds ?? []);
   // Born straight into work = you own it. `userId` is already a canonical id.
   const assigneeIds = claimsWork(status)
@@ -1522,6 +1600,10 @@ export async function createTask(
     assigneeIds: row.assigneeIds,
     at: row.createdAt,
   });
+  // "Add a subtask…" on a finished task means it isn't finished — see
+  // `reopenForNewChild`. After the insert, so the trail reads in the order it
+  // happened: the child appears, then the parent reopens because of it.
+  await reopenForNewChild(parentId, status, author);
   return rowToTask(row, 0, [], ctx);
 }
 
@@ -1615,6 +1697,9 @@ export async function updateTask(
 
   const statusChanged =
     patch.status !== undefined && patch.status !== current.status;
+  // A parent closes AFTER its children — see `assertSubtreeDone`.
+  if (statusChanged && patch.status === "done")
+    await assertSubtreeDone(id, current.title);
   let autoLocked: string | null = null;
   if (statusChanged) {
     values.status = patch.status;
@@ -1651,6 +1736,17 @@ export async function updateTask(
   let placed: TaskPlacement | null = null;
   if (patch.canvasSectionId === undefined) {
     placed = askedPlacement(patch) ?? null;
+    // Leaving done UN-PARKS the card (see `unparkTarget`): a Review card must not
+    // be left sitting in DONE THIS WEEK. Checked before the implied rule below —
+    // they can't both apply (that one only fires for an unpinned task, and a
+    // parked card is pinned), but this reads in the order the rules are meant.
+    if (
+      placed === null &&
+      statusChanged &&
+      patch.status !== "done" &&
+      current.status === "done"
+    )
+      placed = await unparkPlacement(current.canvasSectionId, current.boardId);
     if (
       placed === null &&
       statusChanged &&
@@ -1660,7 +1756,11 @@ export async function updateTask(
       placed = "thisWeek";
   }
   if (placed !== null) {
-    const target = await resolvePlacementSection(placed, current.boardId);
+    const target = await resolvePlacementSection(
+      placed,
+      current.boardId,
+      current.projectId,
+    );
     // Already there — or asked for a group this canvas hasn't flagged, in which
     // case `resolvePlacementSection` gives us null and there's nowhere to move
     // it. Either way there's nothing to do or announce. (`inbox` legitimately
@@ -1779,6 +1879,9 @@ export async function moveTask(
   const boardId =
     target.boardId === undefined ? current.boardId : target.boardId;
   const statusChanged = status !== current.status;
+  // Same rule as `updateTask`: a drag across the done boundary is still a
+  // completion, so it can't close over unfinished children either.
+  if (statusChanged && status === "done") await assertSubtreeDone(id, current.title);
   const boardChanged = boardId !== current.boardId;
   const position =
     target.position ?? (await nextPosition(userId, status, parentId ?? null));
@@ -1840,10 +1943,26 @@ export async function moveTask(
   if (target.canvasSectionId !== undefined) {
     canvasSectionId = target.canvasSectionId;
   } else if (asked !== undefined) {
-    canvasSectionId = await resolvePlacementSection(asked, boardId);
+    canvasSectionId = await resolvePlacementSection(asked, boardId, current.projectId);
     placed = canvasSectionId !== current.canvasSectionId ? asked : null;
   } else {
     canvasSectionId = boardChanged ? null : current.canvasSectionId;
+  }
+  // A drag OUT of done un-parks the card, exactly as `updateTask` does — nothing
+  // that isn't done belongs in DONE THIS WEEK. Only when the caller didn't name a
+  // destination itself.
+  if (
+    target.canvasSectionId === undefined &&
+    asked === undefined &&
+    statusChanged &&
+    status !== "done" &&
+    current.status === "done"
+  ) {
+    const unpark = await unparkPlacement(current.canvasSectionId, boardId);
+    if (unpark !== null) {
+      canvasSectionId = await resolvePlacementSection(unpark, boardId, current.projectId);
+      placed = unpark;
+    }
   }
   // …and an agent moving the task into work files it on THIS WEEK's board, the
   // same rule `updateTask` applies — but only if nothing else claimed it, so a
@@ -1853,7 +1972,7 @@ export async function moveTask(
     statusChanged &&
     statusImpliesThisWeek(status)
   ) {
-    canvasSectionId = await resolvePlacementSection("thisWeek", boardId);
+    canvasSectionId = await resolvePlacementSection("thisWeek", boardId, current.projectId);
     if (canvasSectionId !== null) placed = "thisWeek";
   }
 
@@ -1919,6 +2038,10 @@ export async function moveTask(
       parentTitle ? `Nested under “${parentTitle}”` : "Un-nested to top level",
       author,
     );
+    // Dropping open work onto a finished parent reopens it — the same mirror rule
+    // `createTask` applies (see `reopenForNewChild`). Uses the task's NEW status,
+    // since this same call may have changed it.
+    await reopenForNewChild(parentId, status, author);
   } else if (boardChanged) {
     const boardName = boardId
       ? (
@@ -1942,15 +2065,278 @@ export async function moveTask(
   return rowToTask(row, counts.get(id) ?? 0, undefined, ctx);
 }
 
-/** Complete or reopen (reopen sends it back to To Do, like the UI). */
+/** How many unfinished subtasks a refusal names before it says "+N more". */
+const OPEN_SUBTASKS_LISTED = 3;
+
+/** Depth ceiling on the subtree walk below. Not a real limit — nesting runs two
+ *  or three deep — but a corrupt `parent_id` cycle would otherwise make the
+ *  recursion spin forever, and a CTE has no `seen` set to fall back on. */
+const MAX_SUBTREE_DEPTH = 20;
+
+/** One unfinished task under some root, with the root it blocks. */
+interface OpenDescendant {
+  rootId: string;
+  id: string;
+  title: string;
+  status: TaskStatus;
+  depth: number;
+}
+
+/**
+ * The unfinished (and unarchived) descendants of each of `rootIds`, DEEPEST
+ * FIRST — one query for the whole set, however many roots and however deep.
+ *
+ * One statement rather than a walk per level per root: a 50-task bulk completion
+ * would otherwise be 50 × depth round trips to Neon, on a board that just spent a
+ * commit cutting egress. Deepest-first is what `completeTask({ withSubtasks })`
+ * needs to close a branch from the leaves up, and costs the refusal path nothing.
+ *
+ * Archived descendants are excluded: archiving cascades over a subtree regardless
+ * of status (see `archiveTask`), so they're off the board and can't be what's
+ * holding a parent open.
+ */
+async function openDescendants(
+  rootIds: string[],
+): Promise<Map<string, OpenDescendant[]>> {
+  const out = new Map<string, OpenDescendant[]>();
+  if (!rootIds.length) return out;
+  // Raw CTE (the same shape `archiveTask` uses to cascade): `rootIds` and the
+  // depth cap still ride as bound parameters via the embedded `inArray`.
+  const res = await db.execute(sql`
+    WITH RECURSIVE sub AS (
+      SELECT id, parent_id, title, status, archived_at, position, created_at,
+             parent_id AS root_id, 1 AS depth
+        FROM ${tasks}
+       WHERE ${inArray(tasks.parentId, rootIds)}
+      UNION ALL
+      SELECT c.id, c.parent_id, c.title, c.status, c.archived_at, c.position,
+             c.created_at, sub.root_id, sub.depth + 1
+        FROM ${tasks} c JOIN sub ON c.parent_id = sub.id
+       WHERE sub.depth < ${MAX_SUBTREE_DEPTH}
+    )
+    SELECT root_id, id, title, status, depth FROM sub
+     WHERE status <> 'done' AND archived_at IS NULL
+     ORDER BY depth DESC, position, created_at, id
+  `);
+  const rows = (res as unknown as { rows: Record<string, unknown>[] }).rows ?? [];
+  for (const row of rows) {
+    const item: OpenDescendant = {
+      rootId: String(row.root_id),
+      id: String(row.id),
+      title: String(row.title),
+      status: row.status as TaskStatus,
+      depth: Number(row.depth),
+    };
+    const list = out.get(item.rootId);
+    if (list) list.push(item);
+    else out.set(item.rootId, [item]);
+  }
+  return out;
+}
+
+/**
+ * The refusal itself: a sentence for the person, plus the ids for the client.
+ *
+ * `details` is what lets the UI offer to finish the branch instead of just
+ * reporting the wall — see `RuleDetails` in api.ts and the `open_subtasks` toast.
+ */
+function openSubtasksError(
+  id: string,
+  title: string,
+  open: OpenDescendant[],
+): ValidationError {
+  const listed = open
+    .slice(0, OPEN_SUBTASKS_LISTED)
+    .map((t) => `“${t.title}” (${STATUS_LABEL[t.status]})`);
+  const rest = open.length - listed.length;
+  return new ValidationError(
+    `Can’t complete “${title}”: ${open.length} subtask${open.length === 1 ? " isn’t" : "s aren’t"} done — ${listed.join(", ")}${rest > 0 ? `, +${rest} more` : ""}`,
+    {
+      code: "open_subtasks",
+      // The task the refusal is ABOUT, so a client can offer to finish the
+      // branch without having to remember what it just tried to complete —
+      // the write may have come from a drag or a keypress three layers down.
+      taskId: id,
+      taskTitle: title,
+      openIds: open.map((t) => t.id),
+      openCount: open.length,
+    },
+  );
+}
+
+/**
+ * Refuse to complete a task while anything beneath it is unfinished.
+ *
+ * Done on a parent is a claim about its whole subtree, not about the parent row:
+ * subtasks are how a piece of work is broken down, so they finish FIRST and the
+ * parent closes after them. A parent marked done over open children makes the
+ * board lie twice — the branch reads as finished, and the children, which have
+ * no pin of their own, inherit the parent's placement and follow it into DONE
+ * THIS WEEK while sitting in Review.
+ *
+ * Enforced here rather than in `completeTask` because completing isn't one code
+ * path: `completeTask`, a status patch through `updateTask`, a drag across the
+ * done boundary in `moveTask`, DELETE on a Review card (`deletionOf`), and
+ * `bulkUpdate` all write the same status. This is the one place they meet.
+ *
+ * The MIRROR of this rule lives in `reopenForNewChild`: this side stops a parent
+ * closing over open work, that side stops open work being attached to a closed
+ * parent. Both are needed, or the same bad state just arrives from the other end.
+ *
+ * Only ENTERING done is checked. Reopening a parent, editing a done task, and
+ * archiving (which cascades by design) are all untouched.
+ */
+async function assertSubtreeDone(id: string, title: string): Promise<void> {
+  const open = (await openDescendants([id])).get(id) ?? [];
+  if (open.length) throw openSubtasksError(id, title, open);
+}
+
+/**
+ * Is this task PARKED — pinned to the DONE THIS WEEK lane for its board?
+ *
+ * Asked by the un-parking rule below. Resolved through
+ * `resolvePlacementSection` (a read; it never writes canvas nodes) rather than
+ * by parsing the id, so it recognises both a real lane node and the derived id
+ * the server pins to before the canvas has drawn one.
+ */
+async function isParkedInDone(
+  pin: string | null,
+  boardId: string | null,
+  projectId: string | null = null,
+): Promise<boolean> {
+  if (!pin) return false;
+  return pin === (await resolvePlacementSection("doneThisWeek", boardId, projectId));
+}
+
+/**
+ * Which bucket a task belongs in once it LEAVES done — `null` for "leave it".
+ *
+ * Only ever moves a card OUT of DONE THIS WEEK: a card that isn't done has no
+ * business in a tray called DONE THIS WEEK, which is the exact complaint that
+ * started this rule (a Review card under the done band). The implied "entering
+ * work files it on THIS WEEK" rule can't do this job — it deliberately spares any
+ * task pinned by hand, and a parked card IS pinned. A pin anywhere else is left
+ * alone: that's a filing decision someone made, and reopening is no reason to
+ * overrule it.
+ *
+ * THIS WEEK is the destination when it exists, but it's HAND-MADE — a canvas may
+ * have no starred group at all, and then `resolvePlacementSection` rightly gives
+ * back nothing. Falling back to INBOX matters more than it looks: without it the
+ * card simply stayed parked, so on exactly the canvases that have no THIS WEEK
+ * group, the rule quietly did nothing. Untriaged is always available (it IS the
+ * absence of a pin), and it's honest — the card needs re-filing anyway.
+ */
+async function unparkPlacement(
+  pin: string | null,
+  boardId: string | null,
+  projectId: string | null = null,
+): Promise<TaskPlacement | null> {
+  if (!(await isParkedInDone(pin, boardId, projectId))) return null;
+  return (await resolvePlacementSection("thisWeek", boardId, projectId)) !== null
+    ? "thisWeek"
+    : "inbox";
+}
+
+/**
+ * The mirror of `assertSubtreeDone`: attaching unfinished work to a FINISHED
+ * parent reopens the parent.
+ *
+ * `assertSubtreeDone` stops a parent closing over open children, but on its own
+ * it only guards one direction — nothing stopped the same state arriving from
+ * the other end, and that end is the everyday one: "Add a subtask…" on a done
+ * task (`createTask`), or dragging an open card onto a done parent
+ * (`moveTask`). Neither looked at the parent's status.
+ *
+ * Reopening rather than refusing is the honest reading of the rule: if there's
+ * unfinished work under it, the parent is not finished. So it goes back to
+ * Review (the status it must have passed through to be completed), leaves the
+ * DONE THIS WEEK tray with `unparkTarget`, and says so on its timeline. A DONE
+ * child attaches without disturbing anything — that's just recording work that
+ * was already finished.
+ */
+async function reopenForNewChild(
+  parentId: string | null,
+  childStatus: TaskStatus,
+  author: string,
+): Promise<void> {
+  if (!parentId || childStatus === "done") return;
+  const [parent] = await db.select().from(tasks).where(eq(tasks.id, parentId));
+  if (!parent || parent.status !== "done") return;
+
+  const now = new Date();
+  const unpark = await unparkPlacement(
+    parent.canvasSectionId,
+    parent.boardId,
+    parent.projectId,
+  );
+  const unparked =
+    unpark !== null
+      ? await resolvePlacementSection(unpark, parent.boardId, parent.projectId)
+      : null;
+  await db
+    .update(tasks)
+    .set({
+      status: "review",
+      statusSince: now,
+      completedAt: null,
+      // An archived task is always done, so leaving done un-archives it — the
+      // same rule `updateTask` applies on that transition.
+      archivedAt: null,
+      // `unpark` of "inbox" resolves to a null pin, which IS the move.
+      ...(unpark !== null ? { canvasSectionId: unparked } : {}),
+      updatedAt: now,
+    })
+    .where(eq(tasks.id, parentId));
+  await recordStatusEvent({
+    taskId: parentId,
+    from: "done",
+    to: "review",
+    assigneeIds: parent.assigneeIds,
+    at: now,
+  });
+  await log(
+    parentId,
+    "reopened",
+    [
+      `Reopened (${STATUS_LABEL.review}) — unfinished work was nested under it`,
+      ...(unpark !== null ? [PLACEMENT_LOG[unpark]] : []),
+    ].join(" · "),
+    author,
+  );
+}
+
+/**
+ * Complete or reopen (reopen sends it back to To Do, like the UI).
+ *
+ * `withSubtasks` closes the whole BRANCH: every unfinished descendant first, then
+ * the task. It exists because `assertSubtreeDone` is otherwise a wall with no
+ * door — DELETE on a Review card means "complete", so a parent with open children
+ * could be refused with no way forward — and because closing thirteen subtasks
+ * one at a time to finish one branch is not a workflow.
+ *
+ * Deliberately opt-in, never implied: completing a parent must not quietly mark
+ * work done that nobody finished, so the caller (a human confirming a prompt, or
+ * an agent that was told to) has to ask for it by name.
+ *
+ * The descendants go through this same function, DEEPEST FIRST (the order
+ * `openDescendants` returns), so each one gets its own status event, log line and
+ * placement move, and each passes `assertSubtreeDone` on its own merits — no
+ * bypass flag, no second write path, and a mid-branch failure leaves the leaves
+ * done rather than a parent lying about them.
+ */
 export async function completeTask(
   handle: string,
   done = true,
   userId: string,
   author = "You",
+  opts: { withSubtasks?: boolean } = {},
 ): Promise<TaskDTO | null> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return null;
+  if (done && opts.withSubtasks) {
+    const open = (await openDescendants([id])).get(id) ?? [];
+    for (const child of open) await completeTask(child.id, true, userId, author);
+  }
   return updateTask(
     id,
     { status: done ? "done" : "todo" },
@@ -2114,6 +2500,11 @@ export type MoveTarget = {
    *  change means "clear it" (see `moveTask`) — which is exactly why a
    *  cross-board drop has to say what it wants. */
   canvasSectionId?: string | null;
+  /** File it in a canvas group BY NAME instead of by section id — `moveTask`
+   *  resolves it against the (possibly new) board. Already accepted end to end
+   *  (`moveTaskSchema` → `moveTask`); stated here so a bulk `move` op can carry a
+   *  bucket, which is how the Boards view files and positions a card in one op. */
+  placement?: TaskPlacement;
 };
 
 /** One step in a `bulkApply` batch. Executed in array order. */
@@ -2176,7 +2567,9 @@ function describeBulkPatch(patch: UpdateTaskInput): string {
  * Genuinely bulk: one SELECT to resolve ownership, one UPDATE, one batched
  * INSERT for the activity trail (kind "updated"). Tasks the user doesn't own
  * are silently skipped (returned in `skipped`), matching the single-task
- * "invisible if not yours" convention.
+ * "invisible if not yours" convention. A `status: "done"` patch also skips any
+ * task with unfinished subtasks, for the reason `assertSubtreeDone` gives —
+ * skipped rather than fatal, so one bad parent doesn't sink the batch.
  *
  * Note: because the whole set is updated in a single statement, `statusSince`
  * (and `completedAt` when status changes) is re-stamped for every matched row,
@@ -2189,7 +2582,15 @@ export async function bulkUpdate(
   ids: string[],
   patch: UpdateTaskInput,
   author = "You",
-): Promise<{ updated: number; skipped: string[]; tasks: TaskDTO[] }> {
+): Promise<{
+  updated: number;
+  /** Ids the caller can't see (not theirs) — nothing to report to a person. */
+  skipped: string[];
+  /** Ids a RULE stopped, with enough to explain it. Currently only a completion
+   *  held up by unfinished subtasks (`assertSubtreeDone`). */
+  blocked: { id: string; title: string; openCount: number }[];
+  tasks: TaskDTO[];
+}> {
   // 1. Resolve each handle (UUID or ref) to a canonical UUID the user owns;
   //    anything that doesn't resolve is reported as skipped, not silently lost.
   const resolved = await Promise.all(ids.map((h) => resolveTaskId(h, userId)));
@@ -2197,22 +2598,59 @@ export async function bulkUpdate(
   const resolvedIds = resolved.filter((x): x is string => x !== null);
   // Grab prior status + assignees for the activity log (resolution already
   // scoped to user); the assignees tell us which rows the claim below touched.
-  const owned = resolvedIds.length
+  let owned = resolvedIds.length
     ? await db
         .select({
           id: tasks.id,
           status: tasks.status,
+          // Named in the `blocked` report below, so a caller can say WHICH task
+          // still has unfinished subtasks without a second read.
+          title: tasks.title,
           assigneeIds: tasks.assigneeIds,
           // For THIS WEEK placement below: the target depends on each task's own
           // board, and the status-implied move only applies to unpinned tasks.
           boardId: tasks.boardId,
+          // Needed to pick a board-less task's canvas — see the grouping below.
+          projectId: tasks.projectId,
           canvasSectionId: tasks.canvasSectionId,
         })
         .from(tasks)
         .where(inArray(tasks.id, resolvedIds))
     : [];
+  // A bulk completion obeys the same rule as a single one — a parent closes
+  // after its children (`assertSubtreeDone`). This path writes status in one
+  // UPDATE rather than through `updateTask`, so the check has to happen here too,
+  // or "select all → Done" would be the one way round it.
+  //
+  // A blocked parent is REPORTED, not fatal: the rest of the selection is
+  // legitimate and shouldn't be lost to one bad id. It gets its own `blocked`
+  // list rather than being lumped into `skipped`, which means "not yours" — a
+  // caller has to be able to tell "you can't see it" from "finish its subtasks
+  // first", and only the second one is worth showing a person. Dropped from
+  // `owned`, not just from the UPDATE, so the locking and placement passes below
+  // leave a blocked task completely alone.
+  const blocked: { id: string; title: string; openCount: number }[] = [];
+  if (patch.status === "done" && owned.length) {
+    // Rows already done aren't entering done, so nothing to check.
+    const entering = owned.filter((r) => r.status !== "done");
+    const open = await openDescendants(entering.map((r) => r.id));
+    for (const row of entering) {
+      const openUnder = open.get(row.id);
+      if (openUnder?.length)
+        blocked.push({
+          id: row.id,
+          title: row.title,
+          openCount: openUnder.length,
+        });
+    }
+    if (blocked.length) {
+      const ids = new Set(blocked.map((b) => b.id));
+      owned = owned.filter((r) => !ids.has(r.id));
+    }
+  }
+
   const ownedIds = owned.map((r) => r.id);
-  if (!ownedIds.length) return { updated: 0, skipped, tasks: [] };
+  if (!ownedIds.length) return { updated: 0, skipped, blocked, tasks: [] };
 
   // 2. Build the column patch — same field set + null-clearing as updateTask.
   const now = new Date();
@@ -2303,14 +2741,28 @@ export async function bulkUpdate(
       // explicit one moves every task named.
       const movable =
         asked !== undefined ? owned : owned.filter((r) => r.canvasSectionId === null);
-      const byBoard = new Map<string | null, (typeof owned)[number][]>();
+      // Keyed by board — but a BOARD-LESS task has only its project to say which
+      // canvas it belongs on, so those group by project instead. Keying them all
+      // under one `null` bucket would resolve the whole lot against whichever
+      // project happened to come first.
+      type Movable = (typeof owned)[number];
+      const byBoard = new Map<
+        string,
+        { boardId: string | null; projectId: string | null; rows: Movable[] }
+      >();
       for (const r of movable) {
-        const list = byBoard.get(r.boardId);
-        if (list) list.push(r);
-        else byBoard.set(r.boardId, [r]);
+        const key = r.boardId ?? `project:${r.projectId ?? ""}`;
+        const bucket = byBoard.get(key);
+        if (bucket) bucket.rows.push(r);
+        else
+          byBoard.set(key, {
+            boardId: r.boardId,
+            projectId: r.projectId,
+            rows: [r],
+          });
       }
-      for (const [boardId, group] of byBoard) {
-        const section = await resolvePlacementSection(target, boardId);
+      for (const [, { boardId, projectId, rows: group }] of byBoard) {
+        const section = await resolvePlacementSection(target, boardId, projectId);
         // No group flagged for this placement — leave them where they are.
         // (`inbox` resolves to null legitimately, and unpinning IS the move.)
         if (section === null && target !== "inbox") continue;
@@ -2390,6 +2842,7 @@ export async function bulkUpdate(
   return {
     updated: rows.length,
     skipped,
+    blocked,
     tasks: rows.map((r) => {
       const row = relocked.get(r.id) ?? r;
       // 3c ran after both UPDATEs read their rows, so fold its pin back in.
@@ -2913,7 +3366,9 @@ export async function activityDigest(
   opts: { from: string; to: string; credited: string | null; tz?: string },
 ): Promise<ActivityDigest> {
   const w = dateWindow(opts.from, opts.to, opts.tz);
-  const conds: (SQL | undefined)[] = [...inWindow(taskStatusEvents.at, w)];
+  const conds: (SQL | undefined)[] = [
+    ...effectiveWindow(w, opts.tz ?? APP_TIMEZONE),
+  ];
   // One person's digest = their credited work, PLUS anything they closed that
   // nobody can be credited for. You should see the stale tasks you cleared —
   // they're just listed as cleared rather than counted as work.
@@ -3065,6 +3520,745 @@ async function attributionCaveat(w: {
   return {
     attribution: `unavailable-before-${iso(first.at)} — attribution wasn't recorded before then, so anything earlier is missing rather than empty`,
   };
+}
+
+/* ---- Completions (the Done view) ---------------------------------------
+   The Done view's unit is a done EVENT, not a task: the same task appears once
+   per credited person, and again on any later day it was re-done. That's why
+   this doesn't go through `taskWhere` / `TaskFilter`, whose unit is a task. */
+
+/** One task reaching `done`, credited to one person, on one day — the Done
+ *  view's row. */
+export interface Completion {
+  task: TaskDTO;
+  /** When it reached done — the LATEST such event within `day`. */
+  at: string;
+  /** The day `at` falls on in the requested tz. Computed here so the client's
+   *  week/day buckets tile exactly the way the window edges do. */
+  day: string;
+  /** Whose WORK it was (`credited_to`). Null = nobody creditable, which for a
+   *  `done` transition means the task had no assignees (WORK_STATUSES excludes
+   *  done, so `creditFor` can't fall back to the actor). The view's "no
+   *  assignee" column — honest, not a gap. */
+  creditedTo: string | null;
+  /** Who pressed the button. On the record for the unattributed column only;
+   *  never treat it as credit — that conflation is what TD-54 removed. */
+  closedBy: string | null;
+}
+
+/** One chunk of the Done log. The client asks for four weeks at a time and walks
+ *  `from` backwards; `dateWindow` is half-open, so chunks tile with no
+ *  double-counted or skipped day at the seam. */
+export interface CompletionsPage {
+  from: string;
+  to: string;
+  tz: string;
+  /** Newest first. */
+  entries: Completion[];
+  /** Set when the cap truncated the window, so a partial chunk says so rather
+   *  than passing for a complete one. */
+  truncated?: boolean;
+  /** Set when the window predates the event log — same caveat the digest gives. */
+  attribution?: string;
+  /**
+   * The standup each person wrote for each day in the window — the header of the
+   * very column these entries fill.
+   *
+   * Rides along rather than getting its own route: same project, same window,
+   * same reader, and two text columns don't earn a second round trip. Only
+   * populated for a project-scoped read, since a work day is keyed by project.
+   */
+  writeUps?: DayWriteUp[];
+}
+
+/** Cap on one chunk — a guardrail, not a page size (four weeks of one project's
+ *  completions is tens of rows). Fetched as `limit + 1` so `truncated` is
+ *  observed rather than guessed. */
+const COMPLETIONS_LIMIT = 2000;
+
+/** One done event, reduced to what the crediting rule needs. */
+export interface DoneEvent {
+  taskId: string;
+  creditedTo: string | null;
+  at: Date;
+  /**
+   * The working day this transition is credited to, overriding the one derived
+   * from `at`. Null/absent for almost every row — set only where the recording
+   * time and the working day genuinely differ: work logged after the fact (a
+   * phone call written up the next morning) and the Done view's re-dating.
+   *
+   * `at` stays the immutable record of when we learned; this is which day the
+   * work belongs to. Keeping them as two facts is what lets a late correction
+   * fix a standup without rewriting history.
+   */
+  workedOn?: string | null;
+}
+
+/** Which working day an event counts for: its explicit override, else the day
+ *  its recording instant falls on. The one rule, so no reader re-derives it. */
+export const effectiveDay = (e: DoneEvent, tz: string): string =>
+  e.workedOn ?? workingDayOf(e.at, tz);
+
+/**
+ * WHICH done events become rows in the Done view — the whole rule, in one pure
+ * function so it can be checked without a database (`npm run check:done`).
+ *
+ * Input must be sorted newest-first (the query's own order). Output keeps that
+ * order and is one row per (task, credited person, day):
+ *
+ *  • **Per day, not per task.** Two completions of the same task 20 minutes
+ *    apart are one row; three weeks apart, two rows — which is the truth, and
+ *    the day is the view's finest bucket so nothing visible is lost either way.
+ *    Keeping only a task's LATEST completion instead would rewrite history and
+ *    break paging: re-doning an old task would silently delete it from a chunk
+ *    the client already holds.
+ *  • **Latest within the day**, so a day's column reads most-recently-finished
+ *    first and the timestamp shown is the last time it was confirmed done.
+ *  • **Per credited person.** `creditFor` emits one event per assignee, so a
+ *    two-assignee task yields two rows and its card lands in both columns.
+ *  • **Credited beats uncredited on the same day.** Closed twice in a day, once
+ *    with an assignee and once without, the card belongs in that person's column
+ *    — not in theirs AND in "no assignee".
+ */
+export function pickCompletions<T extends DoneEvent>(
+  newestFirst: T[],
+  tz: string,
+): (T & { day: string })[] {
+  const byKey = new Map<string, T & { day: string }>();
+  for (const e of newestFirst) {
+    const day = effectiveDay(e, tz);
+    const key = `${e.taskId} ${e.creditedTo ?? ""} ${day}`;
+    // Newest-first input ⇒ the first row seen for a key is the latest one.
+    if (!byKey.has(key)) byKey.set(key, { ...e, day });
+  }
+  const credited = new Set(
+    [...byKey.values()]
+      .filter((c) => c.creditedTo)
+      .map((c) => `${c.taskId} ${c.day}`),
+  );
+  return [...byKey.values()].filter(
+    (c) => c.creditedTo || !credited.has(`${c.taskId} ${c.day}`),
+  );
+}
+
+/**
+ * Everything that reached `done` in a window, one entry per (task, credited
+ * person, day) — the Done view's read.
+ *
+ * Reads `task_status_events`, NOT `tasks.completedAt`: that column holds only
+ * the latest completion, is overwritten on re-done and CLEARED on reopen, and
+ * carries no crediting, so it cannot answer "who finished what, when".
+ *
+ * Two predicates are deliberately ABSENT:
+ *   • no archived filter — a task swept off the board still shipped;
+ *   • no `tasks.status = 'done'` — a reopened task was still finished that day,
+ *     and without this, past weeks would silently rewrite themselves whenever
+ *     someone reopens something.
+ */
+export async function listCompletions(
+  userId: string,
+  opts: {
+    from: string;
+    to: string;
+    projectId?: string;
+    boardId?: string;
+    creditedTo?: string;
+    tz?: string;
+    limit?: number;
+  },
+): Promise<CompletionsPage> {
+  const tz = opts.tz ?? APP_TIMEZONE;
+  const limit = opts.limit ?? COMPLETIONS_LIMIT;
+  const w = dateWindow(opts.from, opts.to, tz);
+
+  const rows = await db
+    .select({
+      at: taskStatusEvents.at,
+      workedOn: taskStatusEvents.workedOn,
+      creditedTo: taskStatusEvents.creditedTo,
+      actorId: taskStatusEvents.actorId,
+      // List columns only (PLAT-403); nested so nothing collides with the event
+      // columns above, and so `rowToTask` gets a ListTaskRow as-is.
+      task: LIST_TASK_COLUMNS,
+    })
+    .from(taskStatusEvents)
+    .innerJoin(tasks, eq(tasks.id, taskStatusEvents.taskId))
+    .where(
+      and(
+        eq(taskStatusEvents.toStatus, "done"),
+        ...effectiveWindow(w, tz),
+        // A board-less task in a project still carries `projectId`, so this is
+        // the right column rather than a join through boards.
+        opts.projectId ? eq(tasks.projectId, opts.projectId) : undefined,
+        opts.boardId ? eq(tasks.boardId, opts.boardId) : undefined,
+        opts.creditedTo
+          ? eq(taskStatusEvents.creditedTo, opts.creditedTo)
+          : undefined,
+      ),
+    )
+    // Newest first; `tasks.id` breaks ties so the cap keeps a stable slice.
+    .orderBy(desc(taskStatusEvents.at), asc(tasks.id))
+    .limit(limit + 1);
+
+  const truncated = rows.length > limit;
+  const kept = truncated ? rows.slice(0, limit) : rows;
+
+  const { fromDay, toDay } = dayBounds(w, tz);
+  const [counts, ctx, writeUps] = await Promise.all([
+    commentCounts(userId),
+    codeCtx(userId),
+    // A work day is keyed by (person, project, day), so this answers only for a
+    // project-scoped read. A `boardId` read gets none: the prose covers a whole
+    // day across the project, and hanging it off one board's slice of that day
+    // would overstate what it says.
+    opts.projectId && !opts.boardId && fromDay && toDay
+      ? listDayWriteUps({
+          projectId: opts.projectId,
+          fromDay,
+          toDay,
+          ...(opts.creditedTo ? { userId: opts.creditedTo } : {}),
+        })
+      : Promise.resolve<DayWriteUp[]>([]),
+  ]);
+
+  // The rule itself is pure and lives in `pickCompletions`; all this does is
+  // hand it the events and hydrate whatever survives.
+  const rowById = new Map(kept.map((r) => [r.task.id, r.task]));
+  const picked = pickCompletions(
+    kept.map((r) => ({
+      taskId: r.task.id,
+      creditedTo: r.creditedTo,
+      at: r.at,
+      workedOn: r.workedOn,
+      closedBy: r.actorId,
+    })),
+    tz,
+  );
+
+  return {
+    from: opts.from,
+    to: opts.to,
+    tz,
+    entries: picked.map((p) => {
+      const row = rowById.get(p.taskId)!;
+      return {
+        task: rowToTask(row, counts.get(p.taskId) ?? 0, undefined, ctx),
+        at: iso(p.at)!,
+        day: p.day,
+        creditedTo: p.creditedTo,
+        closedBy: p.closedBy,
+      };
+    }),
+    ...(truncated ? { truncated } : {}),
+    ...(writeUps.length ? { writeUps } : {}),
+    ...(await attributionCaveat(w)),
+  };
+}
+
+/* ---- Work days -----------------------------------------------------------
+   One person's working day on one project. See the `workDays` table comment for
+   why this holds two artifacts and no task list.
+
+   Nothing here opens a day: `getWorkDay` answers for any date whether or not a
+   row exists, because a day exists by virtue of work happening in it. A missing
+   row means "neither artifact was produced", never "no such day". */
+
+/** One line of the morning snapshot — enough to show the list back without
+ *  joining to `tasks`, so it still reads correctly after a task is renamed or
+ *  deleted. That's the point of a snapshot. */
+export interface WorkDaySnapshotEntry {
+  taskId: string;
+  /** The display code as it stood (`TD-65`), when it had one. */
+  ref?: string;
+  title: string;
+  status: TaskStatus;
+}
+
+/** A work day, with `sealed` derived. */
+export interface WorkDay {
+  userId: string;
+  projectId: string;
+  day: string;
+  readyAt: string | null;
+  snapshot: WorkDaySnapshotEntry[] | null;
+  draftedAt: string | null;
+  bullets: string | null;
+  summary: string | null;
+  /**
+   * Frozen: a LATER day for this person and project has been drafted.
+   *
+   * Derived rather than stored, which is what gives the standup the window it
+   * needs — yesterday stays correctable while you're presenting it, and shuts by
+   * itself the moment you draft today. Nothing to press, nothing to fall out of
+   * sync.
+   */
+  sealed: boolean;
+}
+
+/** What the close-out needs to show, in one read. */
+export interface WorkDayReview {
+  day: WorkDay;
+  /** Everything credited to this person on this day. */
+  digest: ActivityDigest;
+  /** Notes written on the day — the standup's Progress/Blockers material. */
+  notes: Note[];
+  /**
+   * Probably-finished work: tasks sitting in a late work status that the person
+   * actually touched that day. The close-out's "which of these finished?" list.
+   * Proposals only — each still goes through its own confirmation.
+   */
+  candidates: TaskDTO[];
+  /**
+   * Earlier working days with this person's work on them that were never
+   * drafted, newest first — the debt the close-out collects. Empty is the normal,
+   * happy case.
+   */
+  openDays: string[];
+  /** Snapshot vs reality. Absent when no snapshot was taken. */
+  drift?: {
+    /** On the morning list, never completed. */
+    plannedNotDone: WorkDaySnapshotEntry[];
+    /** Completed but not on the morning list — the day's real interruptions. */
+    doneNotPlanned: TaskDTO[];
+  };
+}
+
+/** Statuses that mean "in flight, plausibly finished today". */
+const CANDIDATE_STATUSES: TaskStatus[] = ["building", "review", "analyzed"];
+
+/**
+ * A stored snapshot, or null if the column holds anything else.
+ *
+ * `jsonb` is untyped at the boundary, so a cast would let a malformed row through
+ * to the view and crash the render. Same defensive posture as `clampImportance`:
+ * coerce at the read, so a bad row degrades to "no snapshot taken" — which is a
+ * state the close-out already handles — rather than taking the screen down.
+ */
+function parseSnapshot(value: unknown): WorkDaySnapshotEntry[] | null {
+  if (!Array.isArray(value)) return null;
+  const ok = value.every(
+    (e): e is WorkDaySnapshotEntry =>
+      typeof e === "object" &&
+      e !== null &&
+      typeof (e as WorkDaySnapshotEntry).taskId === "string" &&
+      typeof (e as WorkDaySnapshotEntry).title === "string" &&
+      typeof (e as WorkDaySnapshotEntry).status === "string",
+  );
+  return ok ? (value as WorkDaySnapshotEntry[]) : null;
+}
+
+const rowToWorkDay = (r: WorkDayRow, sealed: boolean): WorkDay => ({
+  userId: r.userId,
+  projectId: r.projectId,
+  day: r.day,
+  readyAt: iso(r.readyAt) ?? null,
+  snapshot: parseSnapshot(r.snapshot),
+  draftedAt: iso(r.draftedAt) ?? null,
+  bullets: r.bullets,
+  summary: r.summary,
+  sealed,
+});
+
+/**
+ * That a person wrote a standup for a day, and roughly what it said.
+ *
+ * Deliberately not a `WorkDay`, and deliberately carries no prose. `snapshot` is
+ * a jsonb per person per day that no header shows; `summary` and `bullets` are
+ * unbounded authored text, and a Done-view read spans four weeks × the whole team
+ * and grows from there — exactly the shape `LIST_TASK_COLUMNS` exists to refuse
+ * (PLAT-403). What a column head actually needs is one line, so one line is what
+ * crosses the wire; `GET /api/work-days/write-up` fetches the full text for the
+ * one column someone opens. `sealed` is dropped too — a per-row extra query, and
+ * the same route answers it when it matters.
+ */
+export interface DayWriteUp {
+  userId: string;
+  /** The working day, `YYYY-MM-DD`. */
+  day: string;
+  /** When Finish work ran. Never null here — an undrafted day has no prose. */
+  draftedAt: string;
+  /** One plain-text line of it — see `previewOf`. Never empty: a row with nothing
+   *  written in it isn't returned at all. */
+  preview: string;
+  /** There is more than the preview shows, so opening it is worth a fetch. */
+  hasMore: boolean;
+}
+
+/**
+ * Every write-up a team produced on one project over a range of working days.
+ *
+ * The team's, not one person's: this feeds the Done view, where a day is read as
+ * a column per person, so the whole day arrives in one query rather than one per
+ * column. Rows with neither artifact are dropped — an empty header is worse than
+ * no header, because it reads as a standup that said nothing.
+ */
+export async function listDayWriteUps(opts: {
+  projectId: string;
+  /** Inclusive working-day bounds — see `dayBounds`. */
+  fromDay: string;
+  toDay: string;
+  /** Narrow to one person, for a read that was already narrowed to them. */
+  userId?: string;
+}): Promise<DayWriteUp[]> {
+  const rows = await db
+    .select({
+      userId: workDays.userId,
+      day: workDays.day,
+      draftedAt: workDays.draftedAt,
+      bullets: workDays.bullets,
+      summary: workDays.summary,
+    })
+    .from(workDays)
+    .where(
+      and(
+        eq(workDays.projectId, opts.projectId),
+        // Drafted only: a row that exists for its morning snapshot alone has
+        // nothing to say yet.
+        isNotNull(workDays.draftedAt),
+        sql`${workDays.day} >= ${opts.fromDay}`,
+        sql`${workDays.day} <= ${opts.toDay}`,
+        opts.userId ? eq(workDays.userId, opts.userId) : undefined,
+      ),
+    );
+  return rows
+    .filter((r) => r.summary?.trim() || r.bullets?.trim())
+    .map((r) => {
+      /* The prose is SELECTed — a preview has to be derived from something — but
+         it stops here and never reaches a caller. Preview the summary when there
+         is one, else the bullets, which is the same order the header falls back
+         in. */
+      const { preview, truncated } = previewOf(r.summary ?? r.bullets);
+      return {
+        userId: r.userId,
+        day: r.day,
+        draftedAt: iso(r.draftedAt)!,
+        preview,
+        // Either the teaser was cut, or there's a second field it didn't cover.
+        hasMore:
+          truncated || Boolean(r.summary?.trim() && r.bullets?.trim()),
+      };
+    });
+}
+
+/** Has a later day for this person+project been drafted? The whole of the
+ *  sealing rule. */
+async function isSealed(
+  userId: string,
+  projectId: string,
+  day: string,
+): Promise<boolean> {
+  const [later] = await db
+    .select({ day: workDays.day })
+    .from(workDays)
+    .where(
+      and(
+        eq(workDays.userId, userId),
+        eq(workDays.projectId, projectId),
+        isNotNull(workDays.draftedAt),
+        sql`${workDays.day} > ${day}`,
+      ),
+    )
+    .limit(1);
+  return Boolean(later);
+}
+
+/** A day's row, or an empty day — never null, because the day exists either way. */
+export async function getWorkDay(
+  userId: string,
+  projectId: string,
+  day: string,
+): Promise<WorkDay> {
+  const [row, sealed] = await Promise.all([
+    db
+      .select()
+      .from(workDays)
+      .where(
+        and(
+          eq(workDays.userId, userId),
+          eq(workDays.projectId, projectId),
+          eq(workDays.day, day),
+        ),
+      )
+      .limit(1)
+      .then((rs) => rs[0]),
+    isSealed(userId, projectId, day),
+  ]);
+  return row
+    ? rowToWorkDay(row, sealed)
+    : {
+        userId,
+        projectId,
+        day,
+        readyAt: null,
+        snapshot: null,
+        draftedAt: null,
+        bullets: null,
+        summary: null,
+        sealed,
+      };
+}
+
+/** Upsert one day's row, touching only the columns given. */
+async function upsertWorkDay(
+  userId: string,
+  projectId: string,
+  day: string,
+  patch: Partial<Pick<NewWorkDayRow, "readyAt" | "snapshot" | "draftedAt" | "bullets" | "summary">>,
+): Promise<WorkDay> {
+  await db
+    .insert(workDays)
+    .values({ userId, projectId, day, ...patch })
+    .onConflictDoUpdate({
+      target: [workDays.userId, workDays.projectId, workDays.day],
+      set: { ...patch, updatedAt: new Date() },
+    });
+  return getWorkDay(userId, projectId, day);
+}
+
+/** The tasks currently filed in a placement bucket for one project, resolved the
+ *  same way the canvas resolves them (own pin, else inherited from the parent,
+ *  else INBOX). */
+async function tasksInPlacement(
+  userId: string,
+  projectId: string,
+  bucket: TaskPlacement,
+): Promise<TaskDTO[]> {
+  const [all, map] = await Promise.all([
+    listTasksFlat(userId, { projectId, includeDone: false }),
+    listPlacementSections(projectId),
+  ]);
+  const byId = new Map(all.map((t) => [t.id, t]));
+  const taskMap: Record<string, Task> = Object.fromEntries(
+    all.map((t) => [t.id, t as Task]),
+  );
+  const parentOf = (id: string) => byId.get(id)?.parentId ?? null;
+  return all.filter(
+    (t) => placementOfTask(t.id, taskMap, parentOf, map) === bucket,
+  );
+}
+
+/**
+ * "Ready for the day" — freeze the todo as it stands.
+ *
+ * Re-pressing overwrites, deliberately: this records the list you committed to,
+ * and if you rearrange and press again, the later arrangement is the real
+ * commitment. Nothing about crediting changes — a snapshot is a record, not a
+ * boundary, which is why pressing it (or not) can't affect where work lands.
+ */
+export async function markDayReady(
+  userId: string,
+  projectId: string,
+  day: string,
+): Promise<WorkDay> {
+  // A snapshot is of the list AS IT STANDS, so it can only honestly be taken for
+  // the day you're in. Allowing a past day would record today's TODAY as that
+  // morning's plan — a fiction, stored as a fact, and the drift figures computed
+  // from it would be nonsense.
+  const current = currentWorkingDay();
+  if (day !== current)
+    throw new ValidationError(
+      `A snapshot records the list as it stands now, so it can only be taken for the current working day (${current}), not ${day}.`,
+    );
+  const today = await tasksInPlacement(userId, projectId, "today");
+  const snapshot: WorkDaySnapshotEntry[] = today.map((t) => ({
+    taskId: t.id,
+    ...(t.code ? { ref: t.code } : {}),
+    title: t.title,
+    status: t.status,
+  }));
+  return upsertWorkDay(userId, projectId, day, {
+    readyAt: new Date(),
+    snapshot,
+  });
+}
+
+/**
+ * "Finish work" — the day is drafted and ready to present.
+ *
+ * Records only the two authored fields. It does NOT complete anything: each task
+ * goes through its own confirmation (`completeTask`), so the close-out batches
+ * the asking, never the deciding.
+ */
+export async function finishWork(
+  userId: string,
+  projectId: string,
+  day: string,
+  input: { bullets?: string | null; summary?: string | null },
+): Promise<WorkDay> {
+  // A future day would seal every real day behind it (sealing is "a later day is
+  // drafted") and there is no unseal, so this would be unrecoverable. Checked
+  // before `sealed` so the message names the actual mistake.
+  const today = currentWorkingDay();
+  if (day > today)
+    throw new ValidationError(
+      `${day} hasn't happened yet — the current working day is ${today}. Drafting a future day would seal every day before it.`,
+    );
+  const current = await getWorkDay(userId, projectId, day);
+  if (current.sealed)
+    throw new ValidationError(
+      `Working day ${day} is sealed — a later day has already been drafted. Late work is credited to the current day instead.`,
+    );
+  return upsertWorkDay(userId, projectId, day, {
+    draftedAt: new Date(),
+    ...(input.bullets !== undefined ? { bullets: input.bullets } : {}),
+    ...(input.summary !== undefined ? { summary: input.summary } : {}),
+  });
+}
+
+/** How far back `listOpenDays` looks. Two weeks covers a holiday; beyond that an
+ *  unclosed day is history rather than a debt worth chasing. */
+const OPEN_DAYS_LOOKBACK = 14;
+
+/**
+ * Working days that have this person's work on them but were never drafted —
+ * newest first.
+ *
+ * This is what makes the close-out find YOU. Without it, a day you forgot is
+ * invisible unless you happen to navigate to its date, which is exactly the
+ * failure the work-day design set out to prevent: the record quietly diverges and
+ * nothing ever says so.
+ *
+ * The current working day is excluded — it's in progress, not neglected.
+ *
+ * Grouped in JS through `effectiveDay` rather than with SQL date arithmetic. The
+ * range scan is indexed (`task_status_events_credited_at_idx`) and a fortnight of
+ * one person's events is a small set, so the win of expressing it in SQL is
+ * nothing next to having the working-day rule live in exactly one place. A
+ * `coalesce(worked_on, …)` here would be a second implementation of it, free to
+ * disagree with the first.
+ */
+export async function listOpenDays(
+  userId: string,
+  projectId: string,
+  opts?: { lookbackDays?: number; tz?: string },
+): Promise<string[]> {
+  const tz = opts?.tz ?? APP_TIMEZONE;
+  const today = currentWorkingDay(tz);
+  const from = workingDayStart(today, tz, -(opts?.lookbackDays ?? OPEN_DAYS_LOOKBACK));
+
+  const [events, drafted] = await Promise.all([
+    db
+      .select({ at: taskStatusEvents.at, workedOn: taskStatusEvents.workedOn })
+      .from(taskStatusEvents)
+      .innerJoin(tasks, eq(tasks.id, taskStatusEvents.taskId))
+      .where(
+        and(
+          eq(taskStatusEvents.creditedTo, userId),
+          eq(tasks.projectId, projectId),
+          sql`${taskStatusEvents.at} >= ${from}`,
+        ),
+      ),
+    db
+      .select({ day: workDays.day })
+      .from(workDays)
+      .where(
+        and(
+          eq(workDays.userId, userId),
+          eq(workDays.projectId, projectId),
+          isNotNull(workDays.draftedAt),
+        ),
+      ),
+  ]);
+
+  const closed = new Set(drafted.map((r) => r.day));
+  const open = new Set<string>();
+  for (const e of events) {
+    // `effectiveDay` takes the same shape a completion does; only the two date
+    // fields matter here.
+    const day = effectiveDay({ taskId: "", creditedTo: userId, ...e }, tz);
+    if (day !== today && day >= workingDayOf(from, tz) && !closed.has(day))
+      open.add(day);
+  }
+  return [...open].sort().reverse();
+}
+
+/** Everything the close-out shows, in one read. */
+export async function workDayReview(
+  userId: string,
+  projectId: string,
+  day: string,
+  tz = APP_TIMEZONE,
+): Promise<WorkDayReview> {
+  const [dayRow, digest, notes, inFlight, openDays] = await Promise.all([
+    getWorkDay(userId, projectId, day),
+    activityDigest(userId, { from: day, to: day, credited: userId, tz }),
+    listNotes(userId, { from: day, to: day }),
+    listTasksFlat(userId, {
+      projectId,
+      status: CANDIDATE_STATUSES,
+      includeDone: false,
+    }),
+    listOpenDays(userId, projectId, { tz }),
+  ]);
+
+  // "Touched that day" comes from the digest rather than a second query: it
+  // already resolved who the work belongs to, which a status filter cannot.
+  const touched = new Set(
+    [...digest.worked, ...digest.shipped, ...digest.handled].map(
+      (e) => e.task.id,
+    ),
+  );
+  const candidates = inFlight.filter((t) => touched.has(t.id));
+
+  const closed = [...digest.shipped, ...digest.handled].map((e) => e.task);
+  const drift = dayRow.snapshot
+    ? {
+        plannedNotDone: dayRow.snapshot.filter(
+          (s) => !closed.some((t) => t.id === s.taskId),
+        ),
+        doneNotPlanned: closed.filter(
+          (t) => !dayRow.snapshot!.some((s) => s.taskId === t.id),
+        ),
+      }
+    : undefined;
+
+  return {
+    day: dayRow,
+    digest,
+    notes,
+    candidates,
+    // A day being reviewed isn't its own debt, however it was reached.
+    openDays: openDays.filter((d) => d !== day),
+    ...(drift ? { drift } : {}),
+  };
+}
+
+/**
+ * Log work that never reached the board — a phone call, a conversation, an
+ * errand. Creates a real task, already done, credited to the day it happened.
+ *
+ * A real task rather than a separate day-log entry, so there is ONE record of
+ * what you did: searchable a year later, and consistent with the board being the
+ * record rather than a partial view of it. Filed straight into DONE THIS WEEK so
+ * it never sits in a triage lane asking to be worked.
+ *
+ * `withWorkedOn` is what puts it on the right day: the create-and-complete
+ * happens now, but every status event it writes is credited to `day`.
+ */
+export async function logPastWork(
+  userId: string,
+  input: {
+    title: string;
+    day: string;
+    boardId?: string | null;
+    description?: string;
+    author?: string;
+  },
+): Promise<TaskDTO> {
+  return withWorkedOn(input.day, () =>
+    createTask(
+      {
+        title: input.title,
+        ...(input.description ? { description: input.description } : {}),
+        ...(input.boardId ? { boardId: input.boardId } : {}),
+        status: "done",
+        placement: "doneThisWeek",
+        assigneeIds: [userId],
+      },
+      userId,
+      input.author ?? "You",
+    ),
+  );
 }
 
 /* `standup()` is gone: it wrapped `activityDigest` in a flat `finished` list,
@@ -3236,6 +4430,11 @@ export async function createProject(
     await db
       .insert(projectMembers)
       .values(validIds.map((uid) => ({ projectId: row.id, userId: uid })));
+  // Every project gets its canvas here, not lazily on first use: `placement` is
+  // resolved against the project's canvas, so a project without one silently
+  // files everything into INBOX. Creating it up-front also keeps the 1:1
+  // invariant true by construction rather than by convention.
+  await createCanvas(userId, name, row.id);
   return { ...rowToProject(row), boards: [], members: validIds };
 }
 
@@ -3541,6 +4740,7 @@ const rowToCanvasNode = (r: CanvasNodeRow): CanvasNode => ({
 
 const rowToCanvas = (r: CanvasRow, nodes?: CanvasNode[]): Canvas => ({
   id: r.id,
+  projectId: r.projectId,
   name: r.name,
   viewport: (r.viewport as Partial<CanvasViewport>) ?? {},
   createdAt: iso(r.createdAt),
@@ -3562,10 +4762,130 @@ async function canvasExists(id: string): Promise<boolean> {
   return !!row;
 }
 
-/** Every canvas on the instance (no nodes — the index only needs names). */
-export async function listCanvases(): Promise<Canvas[]> {
-  const rows = await db.select().from(canvases).orderBy(asc(canvases.position));
+/** Every canvas on the instance, or just one project's (no nodes — the index
+ *  only needs names). A project has exactly one canvas, so passing `projectId`
+ *  returns at most a single row. */
+export async function listCanvases(projectId?: string): Promise<Canvas[]> {
+  const rows = await db
+    .select()
+    .from(canvases)
+    .where(projectId ? eq(canvases.projectId, projectId) : undefined)
+    .orderBy(asc(canvases.position));
   return rows.map((r) => rowToCanvas(r));
+}
+
+/**
+ * The canvas flattened down to the two things the board views need: which bucket
+ * every Section belongs to, and what each bucket's group is CALLED.
+ *
+ * The board views group cards by bucket, but a bucket is a canvas concept: it
+ * lives in the node's `data` flags, and a task only points at a Section id. They
+ * can't mount a canvas to find out (and shouldn't pull its nodes just to read a
+ * handful of flags — drawings and images ride in the same `data` column). So the
+ * lookup is resolved here, over a narrow select, and shipped as two small maps.
+ *
+ * **A section's bucket is its GROUP's bucket.** The group is what the eye reads
+ * on the canvas — a lane sits inside a band and takes that band's meaning — so
+ * membership is resolved by walking `data.groupId` to the group and reading the
+ * flag there. The lane's own flag is only a fallback, for a lane whose group id
+ * is missing or stale.
+ *
+ * That order matters, and getting it wrong is what sent cards to the wrong band:
+ * the machine-managed lanes carry their kind as a flag on themselves
+ * (`data.later === true`), but a lane the USER drew into a tray carries no flag
+ * at all — just `groupId`. Classifying by the flag alone left those sections in
+ * no bucket, so their tasks fell through to INBOX while sitting plainly inside
+ * LATER on the canvas. Only the THIS WEEK group, whose flag was never on its
+ * lanes, was resolved this way before.
+ *
+ * Team-wide — a task can be pinned to any canvas's section, so scoping this to
+ * one USER would make other people's placements read as INBOX. Scoping it to one
+ * PROJECT is different and safe: pass `projectId` and it reads only that
+ * project's canvas, which is what a board view wants (it renders one project).
+ * Omit it and every canvas is considered, for callers bucketing across projects.
+ */
+export async function listPlacementGroups(projectId?: string): Promise<{
+  placements: PlacementMap;
+  titles: PlacementTitles;
+}> {
+  const only = projectId ? await canvasIdForProject(projectId) : null;
+  // Asked for a project that has no canvas: no sections, hence no buckets. Not
+  // the same as "no filter" — falling through would bucket every OTHER project's
+  // sections into this project's board view.
+  if (projectId && !only) return { placements: {}, titles: {} };
+  const rows = await db
+    .select({
+      id: canvasNodes.id,
+      canvasId: canvasNodes.canvasId,
+      kind: canvasNodes.kind,
+      content: canvasNodes.content,
+      data: canvasNodes.data,
+    })
+    .from(canvasNodes)
+    .where(
+      and(
+        inArray(canvasNodes.kind, ["section", "section_group"]),
+        ...(only ? [eq(canvasNodes.canvasId, only)] : []),
+      ),
+    )
+    // Deterministic, so the title pass below can't name a bucket differently
+    // from one call to the next when two groups compete for it.
+    .orderBy(asc(canvasNodes.canvasId), asc(canvasNodes.id));
+
+  /** Every group that IS a bucket: the trays by their own flag, plus the one
+   *  hand-starred THIS WEEK group. */
+  const groupPlacement = new Map<string, TaskPlacement>();
+  for (const row of rows) {
+    if (row.kind !== "section_group") continue;
+    const data = (row.data ?? {}) as Record<string, unknown>;
+    const placement =
+      systemGroupOf({ data }) ?? (data.thisWeek === true ? "thisWeek" : null);
+    if (placement) groupPlacement.set(row.id, placement);
+  }
+
+  /* Names come from ONE canvas wherever possible — the one holding the starred
+   * THIS WEEK group. Mixing names across canvases would head one band with your
+   * name and the next with someone else's. A bucket the preferred canvas doesn't
+   * draw is then named by whoever does draw it, and one nobody draws keeps its
+   * default (`placementTitle`). Moot when `projectId` scoped us to a single
+   * canvas, which is the common case now that canvases are per-project. */
+  const preferred =
+    rows.find(
+      (r) =>
+        r.kind === "section_group" &&
+        ((r.data ?? {}) as Record<string, unknown>).thisWeek === true,
+    )?.canvasId ?? null;
+
+  const titles: PlacementTitles = {};
+  for (const pass of [true, false]) {
+    for (const row of rows) {
+      const placement = groupPlacement.get(row.id);
+      if (!placement) continue;
+      if ((row.canvasId === preferred) !== pass) continue;
+      const name = (row.content ?? "").trim();
+      if (name && titles[placement] === undefined) titles[placement] = name;
+    }
+  }
+
+  const placements: PlacementMap = {};
+  for (const row of rows) {
+    if (row.kind !== "section") continue;
+    const data = (row.data ?? {}) as Record<string, unknown>;
+    const viaGroup =
+      typeof data.groupId === "string"
+        ? groupPlacement.get(data.groupId)
+        : undefined;
+    const placement = viaGroup ?? systemGroupOf({ data });
+    if (placement) placements[row.id] = placement;
+  }
+  return { placements, titles };
+}
+
+/** Just the `sectionId → placement` half, for callers that only bucket cards. */
+export async function listPlacementSections(
+  projectId?: string,
+): Promise<PlacementMap> {
+  return (await listPlacementGroups(projectId)).placements;
 }
 
 /** One canvas with all its nodes (team-wide; null if it doesn't exist). */
@@ -3585,13 +4905,20 @@ export async function getCanvas(id: string): Promise<Canvas | null> {
 export async function createCanvas(
   userId: string,
   name: string,
+  projectId: string,
 ): Promise<Canvas> {
+  // One canvas per project (`canvases_project_idx`). Surfacing it as a
+  // ValidationError rather than letting the unique violation escape as a 500:
+  // "this project already has a canvas" is a normal answer, not a fault.
+  const existing = await canvasIdForProject(projectId);
+  if (existing)
+    throw new ValidationError("That project already has a canvas.");
   const [{ max }] = await db
     .select({ max: sql<number>`coalesce(max(${canvases.position}), 0)` })
     .from(canvases);
   const [row] = await db
     .insert(canvases)
-    .values({ userId, name, position: Number(max) + 1 })
+    .values({ userId, name, projectId, position: Number(max) + 1 })
     .returning();
   return rowToCanvas(row, []);
 }

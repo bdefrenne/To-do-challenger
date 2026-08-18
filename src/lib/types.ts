@@ -25,6 +25,7 @@ export type TaskStatus =
  * word itself.
  *
  *   inbox         untriaged — no pin, so it surfaces in its board's INBOX lane
+ *   today         on today's shortlist — the daily counterpart to `thisWeek`
  *   thisWeek      scheduled for this week — the starred group's lane for its board
  *   backlog       triaged, not scheduled
  *   later         deliberately deferred
@@ -36,6 +37,7 @@ export type TaskStatus =
  */
 export type TaskPlacement =
   | "inbox"
+  | "today"
   | "thisWeek"
   | "backlog"
   | "later"
@@ -206,8 +208,10 @@ export interface Task {
   difficulty?: FibPoints;
   /** Importance/priority (−2…3, default 0 Normal). See Importance. */
   importance?: Importance;
-  /** Free-text notes shown in the detail modal. */
-  description?: string;
+  /** Free-text notes shown in the detail modal. Nullable like the column it
+   *  mirrors (and like Project/Board above): `null` is how a caller CLEARS it,
+   *  which is distinct from omitting the key to leave it alone. */
+  description?: string | null;
   /** Comment count, shown as "💬 N" on the row. */
   commentCount?: number;
   /** ISO timestamp of last update — drives the "Updated" column. */
@@ -243,9 +247,12 @@ export interface CanvasViewport {
   scale: number;
 }
 
-/** A standalone whiteboard document. `nodes` is attached when fetching one. */
+/** A project's whiteboard. Exactly one per project — that 1:1 is what lets the
+ *  server resolve "which canvas does this task's placement go on?" as a lookup
+ *  rather than a guess (TD-136). `nodes` is attached when fetching one. */
 export interface Canvas {
   id: string;
+  projectId: string;
   name: string;
   viewport?: Partial<CanvasViewport>;
   createdAt?: string; // ISO

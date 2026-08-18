@@ -8,7 +8,7 @@ import { BoardPill, type BoardGroup } from "./BoardPill";
 import { QuickStatus } from "./QuickStatus";
 import { QuickImportance } from "./QuickImportance";
 import { QuickAssign } from "./QuickAssign";
-import { useCardShortcut } from "./useCardShortcut";
+import { useTaskCardShortcuts } from "./useTaskCardShortcuts";
 import { formatRelative, formatDue } from "@/lib/format";
 import { STATUS_LABEL, STATUS_TONE } from "@/lib/statuses";
 import { IMPORTANCE_CARD, IMPORTANCE_LABEL, IMPORTANCE_TONE } from "@/lib/importance";
@@ -40,8 +40,6 @@ export function TaskTableRow({
   onSetStatus,
   onImportance,
   onAssign,
-  onAssignSelf,
-  onDelete,
   memberIds,
   onEditMembers,
   onDragStartRow,
@@ -70,10 +68,6 @@ export function TaskTableRow({
   onImportance: (v: Importance) => void;
   /** Assignee change from QuickAssign (`(id, { assigneeIds })`). */
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
-  /** SPACE — toggle the viewer as an assignee. */
-  onAssignSelf: () => void;
-  /** DELETE / Backspace — delete the task. */
-  onDelete: () => void;
   /** Project members to scope the assign picker to (see QuickAssign). */
   memberIds?: string[];
   /** Opens the task's project members editor from the assign picker footer. */
@@ -89,19 +83,11 @@ export function TaskTableRow({
   const ic = IMPORTANCE_CARD[importance];
   const due = task.dueDate ? formatDue(task.dueDate) : null;
 
-  // Hover-scoped per-task shortcuts, matching the canvas Section / kanban cards
-  // (see SectionNode's TaskCard). S / I / A are self-registered by the Quick*
-  // pickers below; these are the direct-action keys.
-  //  "D" — not-done → done (via the checkbox's complete path), done → building.
-  useCardShortcut(cardRef, "d", () => (done ? onSetStatus("building") : onToggleDone()));
-  //  "1" / "2" — set importance directly (Elevated / High).
-  useCardShortcut(cardRef, "1", () => onImportance(1));
-  useCardShortcut(cardRef, "2", () => onImportance(2));
-  //  SPACE — toggle the viewer as an assignee.
-  useCardShortcut(cardRef, " ", onAssignSelf);
-  //  DELETE / Backspace — delete the task (with the workspace's undo window).
-  useCardShortcut(cardRef, "delete", onDelete);
-  useCardShortcut(cardRef, "backspace", onDelete);
+  // The same hover set as the canvas Section card and the kanban card, from the
+  // one shared definition — including the ↑/→/↓ triage arrows, which a row has no
+  // band to show but the global send-undo toast makes recoverable. S / I / A are
+  // self-registered by the Quick* pickers below.
+  useTaskCardShortcuts(cardRef, node.id);
 
   function zoneFromEvent(e: DragEvent<HTMLDivElement>): DropPos {
     const r = e.currentTarget.getBoundingClientRect();

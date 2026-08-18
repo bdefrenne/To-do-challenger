@@ -120,7 +120,7 @@ export function QuickImportance({
       ) : (
         <button
           type="button"
-          title="Importance (press I while hovering the card)"
+          title="Importance (press I while hovering the card — 1 / 2 set it directly)"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={toggle}
           className={[
