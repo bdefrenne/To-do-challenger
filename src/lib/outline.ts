@@ -8,6 +8,11 @@
  *
  * Keyboard mapping lives in SectionNode; here we only convert rows ⇄ a task
  * tree. This file is UI-free and side-effect-free so it's easy to test.
+ *
+ * **Changing anything here? Run `npm run check:outline`.** These rules decide
+ * whether a task is created, deleted, or has someone's caret ripped out of it, and
+ * the merge below has been rewritten five times — the suite is what stops each fix
+ * reintroducing an earlier bug.
  */
 
 import type { Task } from "./types";
@@ -388,17 +393,13 @@ export function mergeOutlineRows(
   if (!pending.length) return merged.length ? merged : blankFallback();
 
   const out = [...merged];
-  const mergedKeys = rowFieldKeys(out);
-  const indexOfField = (field: string | null, fromEnd = false) => {
-    if (!field) return -1;
-    if (fromEnd) {
-      for (let i = mergedKeys.length - 1; i >= 0; i--) if (mergedKeys[i] === field) return i;
-      return -1;
-    }
-    return mergedKeys.indexOf(field);
-  };
-
   for (const { above, below, row } of pending) {
+    // Recomputed EVERY iteration: each splice shifts every later index, so a map
+    // taken once before the loop sends the second pending row to the wrong slot —
+    // two rows sharing a follower came out reversed, and rows at different anchors
+    // bunched together.
+    const outFields = rowFieldKeys(out);
+    const indexOfField = (field: string | null) => (field ? outFields.indexOf(field) : -1);
     // BEFORE whatever followed it locally. This is the rule that keeps a trailing
     // composer at the bottom when a peer's new task arrives (nothing followed it,
     // so it goes last) while a line opened mid-list stays where it was opened.

@@ -24,7 +24,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { type TaskUnit } from "@/lib/outline";
-import type { TaskStatus, Importance } from "@/lib/types";
+import type { TaskStatus, Importance, TaskPlacement } from "@/lib/types";
 import { useWorkspace, type DropPos, type TaskNode } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
 import { refId } from "@/lib/ref-id";
@@ -35,9 +35,11 @@ import { resolveRowLock, type RowClaim, type RowLock } from "./useRowLock";
  *  worse outcome than one taken a beat early. */
 const TAKEOVER_WAIT_MS = 1500;
 import { useEventCallback } from "./useEventCallback";
+import { HEIGHT_COMMIT_MS } from "./canvasWrites";
 import {
   isInboxNode,
   systemGroupOf,
+  PLACEMENT_TITLE,
   type SystemGroup,
 } from "@/lib/sections";
 import { compareTaskOrder } from "@/lib/task-order";
@@ -659,13 +661,24 @@ export function SectionNode({
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
+    // Debounced for the same reason as the text card's (TD2-185): a section
+    // growing by a row fires this several times, and every intermediate height
+    // is a billed storage update from every client in the room.
+    let t: ReturnType<typeof setTimeout> | null = null;
     const ro = new ResizeObserver(() => {
-      if (filterActiveRef.current) return;
-      const h = el.offsetHeight;
-      if (Math.round(h) !== Math.round(heightRef.current)) onResizeRef.current?.(h);
+      if (t) clearTimeout(t);
+      t = setTimeout(() => {
+        t = null;
+        if (filterActiveRef.current) return;
+        const h = el.offsetHeight;
+        if (Math.round(h) !== Math.round(heightRef.current)) onResizeRef.current?.(h);
+      }, HEIGHT_COMMIT_MS);
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (t) clearTimeout(t);
+      ro.disconnect();
+    };
   }, []);
 
   // Publish a soft outline-lock while authoring this section, so peers see it's
@@ -804,6 +817,69 @@ export function SectionNode({
       setBusy(false);
     }
   }, [sectionNodes, siblingIds, bulk, ws]);
+
+  /** Re-file every card in this section into another canvas group — the header's
+   *  "Move to…". Only the ROOTS are written: a subtask carries no pin of its own
+   *  and follows its parent's placement, exactly as it does on a drag.
+   *
+   *  `ws.fileTasks` rather than a loop of `sendToPlacement`: one bulk batch and
+   *  one refetch, and it states no board, so this only re-pins — the cards stay
+   *  on the board this section is bound to. */
+  const bulkMoveTo = useCallback(
+    async (to: TaskPlacement) => {
+      const roots = sectionNodes
+        .filter((nd) => nd.parentId === null || !siblingIds.has(nd.parentId))
+        .map((nd) => nd.id);
+      if (!roots.length) return;
+      setBusy(true);
+      try {
+        await ws.fileTasks(roots, to);
+      } catch (err) {
+        console.error("[section] bulk move failed", err);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [sectionNodes, siblingIds, ws],
+  );
+
+  /** Archive the cards in this section that are ALREADY done, leaving the rest
+   *  where they are — the sweep a part-finished tray wants, as opposed to
+   *  "Done and archive", which completes everything first.
+   *
+   *  Only done cards that aren't already inside another done card being archived
+   *  get an op: `archive` cascades to the whole subtree. */
+  const bulkArchiveDone = useCallback(async () => {
+    const done = sectionNodes.filter((nd) => nd.status === "done");
+    if (!done.length) return;
+    if (
+      !confirm(
+        `Archive ${done.length} done card${done.length === 1 ? "" : "s"} from this section? ` +
+          `They move to the Archived view (with their subtasks) and can be restored later.`,
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const byId = new Map(sectionNodes.map((nd) => [nd.id, nd]));
+      const doneIds = new Set(done.map((nd) => nd.id));
+      const coveredByAncestor = (nd: (typeof sectionNodes)[number]) => {
+        let p = nd.parentId;
+        while (p && byId.has(p)) {
+          if (doneIds.has(p)) return true;
+          p = byId.get(p)!.parentId;
+        }
+        return false;
+      };
+      const roots = done.filter((nd) => !coveredByAncestor(nd));
+      await bulk(roots.map((nd) => ({ op: "archive", id: nd.id })));
+      await ws.refresh();
+    } catch (err) {
+      console.error("[section] bulk archive-done failed", err);
+    } finally {
+      setBusy(false);
+    }
+  }, [sectionNodes, bulk, ws]);
 
   /** Delete every card in this section, for good. Deepest-first, so a parent is
    *  gone only once its children are — otherwise `deleteTask` would promote them
@@ -1006,6 +1082,10 @@ export function SectionNode({
         {(boardId || systemKind) && sectionNodes.length ? (
           <BulkMenu
             count={sectionNodes.length}
+            doneCount={sectionNodes.filter((nd) => nd.status === "done").length}
+            currentPlacement={systemKind}
+            onMoveTo={bulkMoveTo}
+            onArchiveDone={bulkArchiveDone}
             onDoneAndArchive={bulkDoneAndArchive}
             onDelete={bulkDelete}
           />
@@ -1102,38 +1182,82 @@ export function SectionNode({
   );
 }
 
+/** Destinations the "Move to…" list offers, in the order it offers them: THIS
+ *  WEEK first because it's where a sweep almost always goes (and the one the
+ *  canvas already draws in orange), then the rest of the ladder. */
+const MOVE_TO_ORDER: readonly TaskPlacement[] = [
+  "thisWeek",
+  "today",
+  "backlog",
+  "later",
+  "inbox",
+  "doneThisWeek",
+];
+
 /**
  * "Bulk" header menu — actions that sweep EVERY card in the section at once.
  * Portaled (via AnchoredPopover) because the section card and the canvas root are
  * both `overflow-hidden`, which would clip an in-flow dropdown.
+ *
+ * Two views in the one popover: the action list, and the "Move to…" destination
+ * list it swaps to (with a back row). A submenu that flew out sideways would need
+ * its own flipping logic against the canvas edge; swapping in place doesn't.
  */
 function BulkMenu({
   count,
+  doneCount,
+  currentPlacement,
+  onMoveTo,
+  onArchiveDone,
   onDoneAndArchive,
   onDelete,
 }: {
   count: number;
+  doneCount: number;
+  /** The group this section IS, when it's a machine-managed tray — dropped from
+   *  the destination list, since moving cards to where they already are is a
+   *  no-op write. Null on an ordinary section. */
+  currentPlacement: SystemGroup | null;
+  onMoveTo: (to: TaskPlacement) => void | Promise<void>;
+  onArchiveDone: () => void | Promise<void>;
   onDoneAndArchive: () => void | Promise<void>;
   onDelete: () => void | Promise<void>;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const [view, setView] = useState<"actions" | "move">("actions");
 
-  const item = (label: string, danger: boolean, run: () => void | Promise<void>) => (
+  const close = () => {
+    setOpen(false);
+    setView("actions"); // always reopen on the action list
+  };
+
+  const item = (
+    label: string,
+    danger: boolean,
+    run: () => void | Promise<void>,
+    opts: { disabled?: boolean; trailing?: string } = {},
+  ) => (
     <button
       type="button"
+      disabled={opts.disabled}
       onClick={() => {
-        setOpen(false); // close first — both actions confirm() synchronously
+        close(); // close first — the actions confirm() synchronously
         void run();
       }}
       className={[
-        "flex w-full items-center rounded px-2 py-1.5 text-left text-xs hover:bg-surface-2",
-        danger ? "text-red-600" : "text-fg",
+        "flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs",
+        opts.disabled
+          ? "cursor-not-allowed text-faint opacity-60"
+          : ["hover:bg-surface-2", danger ? "text-red-600" : "text-fg"].join(" "),
       ].join(" ")}
     >
-      {label}
+      <span>{label}</span>
+      {opts.trailing ? <span className="text-[10px] text-faint">{opts.trailing}</span> : null}
     </button>
   );
+
+  const destinations = MOVE_TO_ORDER.filter((to) => to !== currentPlacement);
 
   return (
     <div ref={rootRef} className="shrink-0" onPointerDown={(e) => e.stopPropagation()}>
@@ -1141,7 +1265,8 @@ function BulkMenu({
         type="button"
         onClick={(e) => {
           e.stopPropagation();
-          setOpen((v) => !v);
+          if (open) close();
+          else setOpen(true);
         }}
         title={`Bulk actions on all ${count} card${count === 1 ? "" : "s"} in this section`}
         className={[
@@ -1154,15 +1279,69 @@ function BulkMenu({
       <AnchoredPopover
         open={open}
         anchorRef={rootRef}
-        onClose={() => setOpen(false)}
+        onClose={close}
         align="right"
-        className="w-44 rounded-lg border border-border bg-surface p-1 shadow-lg"
+        className="w-52 rounded-lg border border-border bg-surface p-1 shadow-lg"
       >
         <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-faint">
-          {count} card{count === 1 ? "" : "s"}
+          {view === "move" ? "Move to" : `${count} card${count === 1 ? "" : "s"}`}
         </p>
-        {item("Done and archive", false, onDoneAndArchive)}
-        {item("Delete", true, onDelete)}
+        {view === "actions" ? (
+          <>
+            {/* Opens the destination list in place — no confirm, so it doesn't go
+                through `item`'s close-then-run. */}
+            <button
+              type="button"
+              onClick={() => setView("move")}
+              className="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-fg hover:bg-surface-2"
+            >
+              <span>Move to…</span>
+              <span aria-hidden className="text-faint">›</span>
+            </button>
+            {item("Archive done tasks", false, onArchiveDone, {
+              disabled: doneCount === 0,
+              trailing: doneCount ? String(doneCount) : "none done",
+            })}
+            {item("Done and archive", false, onDoneAndArchive)}
+            {item("Delete", true, onDelete)}
+          </>
+        ) : (
+          <>
+            {destinations.map((to) => {
+              const week = to === "thisWeek";
+              return (
+                <button
+                  key={to}
+                  type="button"
+                  onClick={() => {
+                    close();
+                    void onMoveTo(to);
+                  }}
+                  // THIS WEEK carries the same orange the canvas draws its tray
+                  // hull in — it's the row you work out of, so it reads first.
+                  style={week ? { color: "var(--color-orange)" } : undefined}
+                  className={[
+                    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-surface-2",
+                    week ? "font-semibold" : "text-fg",
+                  ].join(" ")}
+                >
+                  <span aria-hidden className={week ? undefined : "text-faint"}>
+                    {TRAY_GLYPH[to].icon}
+                  </span>
+                  <span>{PLACEMENT_TITLE[to]}</span>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => setView("actions")}
+              className="mt-0.5 flex w-full items-center gap-2 rounded border-t border-border px-2 py-1.5 pt-2 text-left text-xs text-faint hover:bg-surface-2"
+            >
+              <span aria-hidden>‹</span>
+              <span>Back</span>
+            </button>
+          </>
+        )}
       </AnchoredPopover>
     </div>
   );

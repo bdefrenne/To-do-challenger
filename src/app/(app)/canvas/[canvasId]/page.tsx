@@ -151,7 +151,14 @@ export default function CanvasPage() {
           >
             <RoomProvider
               id={`canvas:${canvasId}`}
-              initialPresence={{ cursor: null, selection: [], editing: null, view: null }}
+              initialPresence={{
+                cursor: null,
+                selection: [],
+                editing: null,
+                view: null,
+                dragIds: null,
+                dragDelta: null,
+              }}
               initialStorage={initialStorage}
             >
               <CanvasEditor

@@ -16,6 +16,14 @@
   results stay index-aligned with the ops even when one fails, and that going over
   the cap really does drop ops silently — which is why the client chunks.
 
+  TD2-188 — a create says WHERE the new task goes, and that has to survive the
+  trip. The outline computes a fractional key between the row's neighbours (see
+  `siblingPositionAt`, checked pure in check:outline) and sends it on the create
+  op; it was stripped by the request schema and then overwritten by `nextPosition`,
+  so every line opened mid-list was appended and the row — with the caret in it —
+  jumped to the end of the group on the next refetch. Guarded here at both layers,
+  along with the append default nothing else may lose.
+
   Runs against DATABASE_URL, creates its own scratch tasks, cleans up after
   itself. The over-cap case issues MAX_BULK_OPS+ failing ops, so it takes a while.
 
@@ -36,6 +44,8 @@ import {
   listProjects,
 } from "../src/lib/db/service";
 import { MAX_BULK_OPS } from "../src/lib/bulk";
+import { createTaskSchema } from "../src/lib/api";
+import { compareTaskOrder } from "../src/lib/task-order";
 
 const AUTHOR = "check:bulk";
 const TITLE = "[check:bulk] scratch — safe to delete";
@@ -65,6 +75,33 @@ async function newTask(boardId: string, canvasSectionId: string | null) {
   const t = await createTask({ title: TITLE, boardId, canvasSectionId }, ME, AUTHOR);
   scratch.push(t.id);
   return t.id;
+}
+
+/** A task's stored position — the column the create is supposed to set. */
+async function positionOf(id: string): Promise<number | undefined> {
+  const [row] = await db
+    .select({ position: tasks.position })
+    .from(tasks)
+    .where(eq(tasks.id, id));
+  return row?.position;
+}
+
+/** A parent's children in the order every surface renders them (position, then
+ *  createdAt, then id — see `compareTaskOrder`). Titles, so a failure reads. */
+async function childOrder(parentId: string): Promise<string[]> {
+  const rows = await db
+    .select({
+      id: tasks.id,
+      title: tasks.title,
+      position: tasks.position,
+      createdAt: tasks.createdAt,
+    })
+    .from(tasks)
+    .where(eq(tasks.parentId, parentId));
+  return rows
+    .map((r) => ({ ...r, createdAt: r.createdAt.toISOString() }))
+    .sort(compareTaskOrder)
+    .map((r) => r.title);
 }
 
 async function pinOf(id: string): Promise<string | null> {
@@ -169,6 +206,123 @@ async function main() {
       AUTHOR,
     );
     check("dropping into an INBOX lane leaves it unpinned", (await pinOf(id)) === null);
+  }
+
+  /* ---- TD2-188: a create carries WHERE the line was opened ------------ */
+  console.log("\nTD2-188 — createTask honours the position it was given");
+  {
+    // The layer that dropped it first: zod strips unknown keys, so a schema
+    // without `position` loses it before anyone can honour it.
+    const parsed = createTaskSchema.safeParse({ title: TITLE, position: 10.5 });
+    check(
+      "the request schema lets `position` through (it was silently stripped)",
+      parsed.success && parsed.data.position === 10.5,
+      JSON.stringify(parsed.success ? parsed.data : parsed.error.issues),
+    );
+  }
+  {
+    const t = await createTask({ title: TITLE, boardId: boardA.id, position: 10.5 }, ME, AUTHOR);
+    scratch.push(t.id);
+    const p = await positionOf(t.id);
+    check(
+      "an explicit fractional key is stored verbatim (not rounded, not replaced)",
+      p === 10.5,
+      `position=${p}`,
+    );
+  }
+  {
+    // The default nothing else may lose: no position asked for → end of the
+    // (status, parent) group. Scoped to a scratch parent so the group is ours.
+    const parent = await newTask(boardA.id, null);
+    const first = await createTask(
+      { title: `${TITLE} first`, boardId: boardA.id, parentId: parent, position: 5 },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(first.id);
+    const appended = await createTask(
+      { title: `${TITLE} appended`, boardId: boardA.id, parentId: parent },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(appended.id);
+    const p = await positionOf(appended.id);
+    check("an omitted position still appends (max + 1)", p === 6, `position=${p}`);
+  }
+  {
+    // The reported bug, end to end: a task with three subtasks, then a fourth
+    // created FIRST — which is what Shift+Tab out of a description asks for.
+    const parent = await newTask(boardA.id, null);
+    for (const [i, name] of ["sous task", "subtask", "sub"].entries()) {
+      const kid = await createTask(
+        { title: name, boardId: boardA.id, parentId: parent, position: i + 1 },
+        ME,
+        AUTHOR,
+      );
+      scratch.push(kid.id);
+    }
+    const popped = await createTask(
+      { title: "desc", boardId: boardA.id, parentId: parent, position: 0 },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(popped.id);
+    check(
+      "a line popped out of a description lands FIRST, not last (the bug)",
+      JSON.stringify(await childOrder(parent)) ===
+        JSON.stringify(["desc", "sous task", "subtask", "sub"]),
+      JSON.stringify(await childOrder(parent)),
+    );
+    // …and the mid-list case: an Enter split between two siblings.
+    const split = await createTask(
+      { title: "split", boardId: boardA.id, parentId: parent, position: 1.5 },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(split.id);
+    check(
+      "a midpoint key lands between its neighbours",
+      JSON.stringify(await childOrder(parent)) ===
+        JSON.stringify(["desc", "sous task", "split", "subtask", "sub"]),
+      JSON.stringify(await childOrder(parent)),
+    );
+  }
+  {
+    // The guard: a key computed among someone's children means nothing in the
+    // root group, so a parent that doesn't resolve falls back to appending
+    // rather than dropping the task into the middle of the roots.
+    const t = await createTask(
+      { title: TITLE, boardId: boardA.id, parentId: "no-such-parent", position: 0 },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(t.id);
+    const p = await positionOf(t.id);
+    check(
+      "a position for a parent that didn't resolve is ignored, not applied at root",
+      t.parentId === null && p !== 0,
+      `parentId=${t.parentId} position=${p}`,
+    );
+  }
+  {
+    // The shape the outline actually sends: one bulk create per row, carrying the
+    // parent and the key together.
+    const parent = await newTask(boardA.id, null);
+    const res = await bulkApply(
+      ME,
+      [
+        { op: "create", input: { title: "first line", boardId: boardA.id, parentId: parent, position: 1 } },
+        { op: "create", input: { title: "opened above it", boardId: boardA.id, parentId: parent, position: 0 } },
+      ],
+      AUTHOR,
+    );
+    for (const r of res.results) if (r.ok && r.id) scratch.push(r.id);
+    check(
+      "the outline's own batch shape keeps the order it asked for",
+      JSON.stringify(await childOrder(parent)) ===
+        JSON.stringify(["opened above it", "first line"]),
+      JSON.stringify(await childOrder(parent)),
+    );
   }
 
   /* ---- TD-46: results alignment and the silent cap -------------------- */

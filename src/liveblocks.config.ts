@@ -46,6 +46,30 @@ declare global {
        *  window size — a laptop and a large monitor sharing offsets would land
        *  on different content. null until their first broadcast. */
       view: { cx: number; cy: number; scale: number } | null;
+      /** Nodes this user is dragging RIGHT NOW, and how far they've moved them.
+       *
+       *  In-flight drag positions live here rather than in Storage (TD2-185).
+       *  Storage updates are metered — one row update per node per event — and
+       *  the drag handler fires on every raw pointermove over a set that can be
+       *  a whole tray column (~35 nodes), which is thousands of billed updates
+       *  per second of dragging. Presence isn't metered, already coalesces to
+       *  ~100ms, and CanvasNode's 90ms left/top glide was tuned to exactly that
+       *  cadence — so peers see what they always did. Storage gets ONE commit
+       *  per node, on release.
+       *
+       *  Two keys, not one object: `dragIds` is ~35 UUIDs and never changes
+       *  during a drag, so it's published once when the drag starts, while
+       *  `dragDelta` is rewritten per frame. Presence patches send the whole
+       *  value of each key they touch, so folding the ids in would resend them
+       *  60×/s for nothing.
+       *
+       *  Ephemeral by design: a tab that dies mid-drag has its presence dropped
+       *  by Liveblocks, so the nodes simply return to their last committed
+       *  position and every peer's skip set clears itself. */
+      dragIds: string[] | null;
+      /** How far `dragIds` have moved from their stored position, in canvas
+       *  coords. Peers add this to what Storage says to draw the drag live. */
+      dragDelta: { dx: number; dy: number } | null;
       /** What this user is editing, or null. Ephemeral — auto-released on
        *  disconnect.
        *

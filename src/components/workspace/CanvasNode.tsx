@@ -16,6 +16,7 @@ import { SectionNode } from "./SectionNode";
 import { DrawNode } from "./DrawNode";
 import { ImageNode } from "./ImageNode";
 import { SectionGroupNode } from "./SectionGroupNode";
+import { HEIGHT_COMMIT_MS } from "./canvasWrites";
 export { NEW_SECTION_SIZE } from "./SectionNode";
 export { NEW_GROUP_SIZE } from "./SectionGroupNode";
 
@@ -211,12 +212,24 @@ export function CanvasNode({
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
+    // Debounced: a card that grows while you type fires this on every
+    // intermediate frame, and each one is a billed Liveblocks storage update
+    // (TD2-185) from EVERY client watching. Only the height it settles at is
+    // worth writing. Short enough that a peer sees the card resize as one step.
+    let t: ReturnType<typeof setTimeout> | null = null;
     const ro = new ResizeObserver(() => {
-      const h = el.offsetHeight;
-      if (Math.round(h) !== Math.round(heightRef.current)) onResizeRef.current?.(h);
+      if (t) clearTimeout(t);
+      t = setTimeout(() => {
+        t = null;
+        const h = el.offsetHeight;
+        if (Math.round(h) !== Math.round(heightRef.current)) onResizeRef.current?.(h);
+      }, HEIGHT_COMMIT_MS);
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (t) clearTimeout(t);
+      ro.disconnect();
+    };
   }, []);
 
   const base: React.CSSProperties = {

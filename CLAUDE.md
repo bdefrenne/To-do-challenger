@@ -44,6 +44,21 @@ of the RYDR board set.)
 - `npm run dev` — dev server
 - `npm run db:generate` / `npm run db:migrate` — Drizzle migrations
 - `npx tsc --noEmit` · `npm run lint` · `npm run build` — checks before committing
+- `npm run check:outline` — the outline/text-view logic checks (167 pure assertions:
+  the row⇄field merge, per-row locks, fractional positions, delete subtrees).
+  **Run it after touching anything in `src/lib/outline.ts`,
+  `useOutlineDraft.ts`, `OutlineEditor.tsx` or `useRowLock.ts`** — that code is
+  co-editing, task creation and deletion at once, so a wrong answer there loses a
+  task, duplicates one, or yanks the caret out of someone's hands rather than
+  merely rendering oddly. Six real bugs came out of writing these, three of them
+  from cases nobody had hit yet.
+- `npm run check:bulk` — the write-path checks, against DATABASE_URL (it makes its
+  own scratch tasks and cleans up). This is where a rule the pure suite can only
+  *state* gets proven to reach the database: canvas pins across a board change,
+  `bulkApply`'s results contract, and the create `position` the outline computes
+  for a line opened mid-list. **Run it after touching `createTask` / `moveTask` /
+  `bulkApply` or the request schemas in `src/lib/api.ts`** — a field that a zod
+  schema silently strips fails nowhere else.
 
 ## Conventions
 

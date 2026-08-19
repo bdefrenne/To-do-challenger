@@ -380,7 +380,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_task",
-      "Get one task by its id OR its code (the short ref people share, e.g. PLAT-77 — locked, or PLAT-77* — soft) — its full detail plus its notes (decisions + standup callouts), linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context — including when someone hands you a code like PLAT-77.",
+      "Get one task by its id OR its code (the short ref people share, e.g. PLAT-77 — locked, or PLAT-77* — soft) — its full detail plus its notes (decisions + standup callouts), linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context — including when someone hands you a code like PLAT-77. If it comes back with a non-empty `attachments` array, those are images someone attached as part of the brief: call `get_attachment` on each id to actually see them before you analyze.",
       { id: taskHandle },
       async ({ id }) => {
         const result = await getTask(id, currentUser());
@@ -1524,9 +1524,21 @@ const handler = createMcpHandler(
             `Task ${taskId} was not found on my board. Please ask me to pick a valid task id or code.`,
           );
         const code = result.task.code ?? taskId;
+        // Attachments are images someone added BECAUSE the words weren't enough.
+        // The JSON only carries their metadata, so say out loud that they must be
+        // fetched — an `attachments` key buried in a large dump gets skimmed past.
+        const atts = result.task.attachments ?? [];
+        const seeImages = atts.length
+          ? `This task has ${atts.length} image${atts.length > 1 ? "s" : ""} attached — ` +
+            `part of the brief, not decoration. Call \`get_attachment\` on each of these ` +
+            `ids and actually look at them BEFORE you analyze or plan:\n` +
+            atts.map((a) => `- \`${a.id}\` — ${a.filename}`).join("\n") +
+            `\n\n`
+          : "";
         return await promptMsg(
           `I want you to work on task **${code} — ${result.task.title}** (id: ${taskId}).\n\n` +
             `Here it is:\n\n${JSON.stringify(result.task, null, 2)}\n\n` +
+            seeImages +
             `Follow the todo workflow contract (in your server instructions / the ` +
             `\`todo://workflow\` resource) using the todo MCP tools — read it if you ` +
             `haven't. Start by understanding the task and the relevant code, and ask ` +

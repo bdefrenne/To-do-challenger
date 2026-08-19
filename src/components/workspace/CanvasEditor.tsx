@@ -69,6 +69,7 @@ import {
   masterSectionsByBoard,
   LEGACY_WEEK_LANE_PREFIX,
   systemGroupId,
+  placementOfDerivedId,
   systemGroupOf,
   systemLaneId,
   SYSTEM_GROUPS,
@@ -131,33 +132,52 @@ const isLegacyWeekLane = (n: CanvasNode, weekGroupId: string): boolean =>
   n.id.startsWith(LEGACY_WEEK_LANE_PREFIX) &&
   n.data?.groupId === weekGroupId;
 
+/** Does this node LIVE IN a tray? True for the machine-made lanes (which carry
+ *  the tray's flag) and for a lane you made by hand inside one, which carries no
+ *  flag at all — only `data.groupId` pointing at the tray. Both sit at the
+ *  column's own coordinates, so neither may anchor the column. */
+const isTrayResident = (n: Pick<CanvasNode, "data">): boolean => {
+  if (systemGroupOf(n) !== null) return true;
+  const g = n.data?.groupId;
+  return typeof g === "string" && placementOfDerivedId(g) !== null;
+};
+
 /**
  * Top-left of the tray column: clear of user content, to the LEFT of everything.
  *
- * Measured against USER nodes only. Include the trays themselves and each new
- * one lands left of the last, so the column marches off to infinity as the set
- * grows — and, worse, any drift in one tray becomes the base for the next.
+ * Measured against USER nodes only, and "user" means OUTSIDE the trays — not
+ * merely "unflagged". Include anything standing on the column's own ground and
+ * the base is derived from where the column already is, so each recompute lands
+ * it one tray-width further left and it marches off to infinity. That is not
+ * hypothetical: a hand-made lane inside THIS WEEK carries `groupId` but no
+ * system flag, read as user content, and took the RYDR column to x ≈ -2.7M
+ * (TD2-186). `isTrayResident` is the whole fix — the exclusion has to be
+ * "is it in a tray", never "is it machine-made".
+ *
+ * `clearWidth` is how wide the thing being sited actually is. It defaults to a
+ * FRESH tray, which is right when creating one, but a tray that has grown to
+ * hold ten boards is ~10× that — so the rescue passes the head's real width and
+ * the column lands clear of your content instead of on top of it.
  */
 function trayColumnBase(
   nodes: readonly CanvasNode[],
   excludeId?: string,
+  clearWidth: number = NEW_GROUP_SIZE.width,
 ): { x: number; y: number } {
   const anchors = nodes.filter(
-    (n) =>
-      n.kind !== "draw" && systemGroupOf(n) === null && n.id !== excludeId,
+    (n) => n.kind !== "draw" && !isTrayResident(n) && n.id !== excludeId,
   );
   const minX = anchors.length ? Math.min(...anchors.map((n) => n.x)) : 0;
   const minY = anchors.length ? Math.min(...anchors.map((n) => n.y)) : 0;
   return {
-    x: Math.round(minX - NEW_GROUP_SIZE.width - 120),
+    x: Math.round(minX - clearWidth - 120),
     y: Math.round(minY),
   };
 }
 
-/** How far below the tray base an UNPINNED group has to sit before it counts as
+/** How far from the tray base the column’s head has to sit before it counts as
  *  drift rather than an arrangement. Deliberately generous: nobody parks a tray
- *  four screens down on purpose, and anything they DID place by hand carries
- *  `pinned` and is exempt regardless. */
+ *  four screens away on purpose. */
 const TRAY_DRIFT_LIMIT = 4000;
 const uid = () => crypto.randomUUID();
 
@@ -365,6 +385,11 @@ const slotCaretRect = (
     h: thickness,
   };
 };
+
+/** The "nothing is being dragged" set. A module constant so `draggingIds` has a
+ *  stable identity while idle — a fresh `new Set()` per render would invalidate
+ *  every memo keyed on it, on every render. */
+const NO_IDS: Set<string> = new Set();
 
 /** Compute the derived layout for every group: each member section's x/y slot
  *  (packed down a column in portrait, across a row in landscape) and the group's
@@ -574,12 +599,107 @@ export function CanvasEditor({
     deleteCanvasNote,
   } = useWorkspace();
 
-  // useStorage's root is ToJson<Storage>, so `nodes` is a plain readonly
-  // record (id → node), not a Map — hence Object.values, not .values().
-  const nodes: CanvasNode[] = useMemo(
+  /** What Liveblocks Storage says, verbatim — the committed truth.
+   *
+   *  useStorage's root is ToJson<Storage>, so `nodesMap` is a plain readonly
+   *  record (id → node), not a Map — hence Object.values, not .values().
+   *
+   *  Everything geometric reads `nodes` below (stored + the live drag overlay)
+   *  because that's what's on screen. The exceptions are deliberate and few:
+   *  the Postgres snapshot, which must never persist a position that hasn't
+   *  been committed yet. */
+  const storedNodes: CanvasNode[] = useMemo(
     () => (nodesMap ? Object.values(nodesMap).map((n) => ({ ...n })) : []),
     [nodesMap],
   );
+
+  /** YOUR in-flight drag, or null. `ids` and `base` are captured once at
+   *  pointerdown and keep the SAME identity for the whole gesture (only dx/dy
+   *  are rewritten per frame), so `draggingIds` below is referentially stable
+   *  and every memo keyed on it bails out as it did before.
+   *
+   *  This is where a drag lives now instead of in Liveblocks Storage — see the
+   *  `dragIds` doc in liveblocks.config.ts for why. `base` is the pointerdown
+   *  snapshot rather than the live stored position, which keeps the old
+   *  semantics exactly: your drag owns where these nodes are for its duration,
+   *  and a concurrent write to the same x/y can't shift them under you. */
+  const [drag, setDrag] = useState<{
+    ids: Set<string>;
+    base: Map<string, { x: number; y: number }>;
+    dx: number;
+    dy: number;
+  } | null>(null);
+  // Nodes YOU are actively dragging — excluded from smoothing so they track
+  // the cursor 1:1 (everyone else sees them glide via the node transition).
+  const draggingIds = drag?.ids ?? NO_IDS;
+
+  /** Peers' in-flight drags, as a compact string.
+   *
+   *  Selected as a STRING so this only changes when a drag actually changes:
+   *  `others` gets a fresh identity on every peer cursor move, and keying
+   *  `nodes` on that would re-run the whole derived-geometry cascade at their
+   *  pointer frequency — the TD-132 problem from the other direction. Same
+   *  string-key idiom as `linksKey` below. */
+  const peerDragKey = useOthers((them) =>
+    them
+      .map((o) =>
+        o.presence.dragIds?.length && o.presence.dragDelta
+          ? `${o.presence.dragDelta.dx},${o.presence.dragDelta.dy}:${o.presence.dragIds.join(",")}`
+          : "",
+      )
+      .filter(Boolean)
+      .join("|"),
+  );
+
+  const peerDrags = useMemo(() => {
+    const m = new Map<string, { dx: number; dy: number }>();
+    if (!peerDragKey) return m;
+    for (const entry of peerDragKey.split("|")) {
+      const [delta, ids] = entry.split(":");
+      const [dx, dy] = delta.split(",").map(Number);
+      for (const id of ids.split(",")) m.set(id, { dx, dy });
+    }
+    return m;
+  }, [peerDragKey]);
+
+  /**
+   * What's actually ON SCREEN: Storage, plus whatever is mid-drag anywhere in
+   * the room. THE array — every derived thing in this file reads this one (or
+   * `nodesRef`), which is why moving drags out of Storage didn't touch link
+   * paths, hit-testing, drop slots, selection rings, marquee or auto-fit.
+   *
+   * With nothing being dragged this IS `storedNodes`, same identity — so the
+   * common case allocates nothing and every downstream memo behaves exactly as
+   * it did before. Rounded, because the committed values are rounded too: hit
+   * tests and the layout passes must see the same integers during the drag that
+   * they'll see after it lands.
+   */
+  const nodes: CanvasNode[] = useMemo(() => {
+    if (!drag && peerDrags.size === 0) return storedNodes;
+    return storedNodes.map((n) => {
+      // Yours wins over a peer's on the same node: you're the one holding it.
+      const mine = drag && drag.ids.has(n.id) ? drag : null;
+      if (mine) {
+        const b = mine.base.get(n.id);
+        if (b)
+          return { ...n, x: Math.round(b.x + mine.dx), y: Math.round(b.y + mine.dy) };
+      }
+      const d = peerDrags.get(n.id);
+      return d ? { ...n, x: Math.round(n.x + d.dx), y: Math.round(n.y + d.dy) } : n;
+    });
+  }, [storedNodes, drag, peerDrags]);
+
+  /** Every node anyone in the room is dragging — the set no layout pass may
+   *  touch. Yours alone isn't enough: `draggingIds` is local, so before peers
+   *  published their drags each client went on repacking a section someone else
+   *  was holding, patching it back into its slot every frame while the dragger's
+   *  next frame pulled it out again (TD2-185). */
+  const anyDraggingIds = useMemo(() => {
+    if (peerDrags.size === 0) return draggingIds;
+    const s = new Set(draggingIds);
+    for (const id of peerDrags.keys()) s.add(id);
+    return s;
+  }, [draggingIds, peerDrags]);
 
   /**
    * The tasks THIS canvas is responsible for.
@@ -637,9 +757,6 @@ export function CanvasEditor({
     y1: number;
   } | null>(null);
   const [spaceDown, setSpaceDown] = useState(false);
-  // Nodes YOU are actively dragging — excluded from smoothing so they track
-  // the cursor 1:1 (everyone else sees them glide via the node transition).
-  const [draggingIds, setDraggingIds] = useState<Set<string>>(new Set());
   // The section_group a section is currently being dragged over (drop target
   // highlight). null when no section is over any group.
   const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
@@ -853,10 +970,13 @@ export function CanvasEditor({
   // results into storage. The rounded guard in computeGroupLayout prevents a
   // write loop, and nodes being dragged are skipped so a live drag owns its own
   // position (a released/captured section then snaps in on the next pass).
+  //
+  // The skip set is `anyDraggingIds`, not just yours: repacking a node a PEER is
+  // holding is a write war neither side wins (TD2-185).
   useEffect(() => {
-    const patches = computeGroupLayout(nodes, draggingIds);
+    const patches = computeGroupLayout(nodes, anyDraggingIds);
     if (patches.length) patchMany(patches);
-  }, [nodes, draggingIds, patchMany]);
+  }, [nodes, anyDraggingIds, patchMany]);
 
   /* -------- System groups: INBOX / BACKLOG / LATER / DONE THIS WEEK -------- */
 
@@ -1129,9 +1249,9 @@ export function CanvasEditor({
   ]);
 
   /**
-   * Arrange the tray column: TODAY, THIS WEEK, BACKLOG, LATER stacked downward
-   * with INBOX beside THIS WEEK — every one of them DERIVED from a single stored
-   * origin (TD2-171).
+   * Arrange the tray column: THIS WEEK, BACKLOG, LATER stacked downward, with
+   * INBOX beside THIS WEEK and TODAY hanging under INBOX — every one of them
+   * DERIVED from a single stored origin (TD2-171).
    *
    * The origin is the head tray's own x/y. There is exactly one stored position
    * for the whole column, so no tray's box can ever claim the ground another
@@ -1160,14 +1280,23 @@ export function CanvasEditor({
    */
   useEffect(() => {
     if (!nodesMap) return;
-    // TODAY is the head — the nearest horizon, and the top of the timescale the
-    // column reads as (today → this week → backlog → later, pushing DOWN).
-    const head = nodes.find((n) => n.id === systemGroupId("today", canvasId));
+    // Never re-derive mid-drag, anyone's. The trays travel as a rigid unit so
+    // the stack usually stays self-consistent anyway, but the RESCUE branch
+    // below reads a live position and would fire in the middle of a long drag
+    // downward, yanking the column out of your hand. It all re-derives on
+    // release, off the position you actually dropped.
+    if (anyDraggingIds.size) return;
+    // THIS WEEK is the head — the row you actually work out of, and the top of
+    // the timescale the column reads as (this week → backlog → later, pushing
+    // DOWN). TODAY isn't in this column at all any more (TD2-186): it belongs
+    // with triage, not with the horizons, so it hangs under INBOX below.
+    const head = nodes.find((n) => n.id === systemGroupId("thisWeek", canvasId));
     if (!head) return;
-    const below = (["thisWeek", "backlog", "later"] as const)
+    const below = (["backlog", "later"] as const)
       .map((kind) => nodes.find((n) => n.id === systemGroupId(kind, canvasId)))
       .filter((n): n is CanvasNode => n !== undefined);
     const inbox = nodes.find((n) => n.id === systemGroupId("inbox", canvasId));
+    const today = nodes.find((n) => n.id === systemGroupId("today", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
     /** Put a derived tray at (x,y). Returns where it ended up so the next one
      *  down stacks off the truth rather than off a patch that hasn't landed. */
@@ -1179,32 +1308,48 @@ export function CanvasEditor({
     };
     // RESCUE. The head's position is stored and nothing but a drag moves it — so
     // a canvas left over from the old ratcheting code can have the column
-    // thousands of px below everything, looking deleted, with no path back. Pull
-    // it home if it has drifted absurdly far from the user's content.
-    const home = trayColumnBase(nodes, head.id);
-    if (head.y - home.y > TRAY_DRIFT_LIMIT) {
+    // thousands of px away from everything, looking deleted, with no path back.
+    // Pull it home if it has drifted absurdly far from the user's content.
+    //
+    // BOTH axes. It used to check only y, which is why a column that had marched
+    // 2.7M px LEFT had no way back — the whole canvas read as empty, on every
+    // client, because tray positions are shared storage (TD2-186). Only the
+    // left-drift direction is checked on x: the column is SUPPOSED to sit to the
+    // left of content, so being right of home is the normal state.
+    const home = trayColumnBase(nodes, head.id, head.width);
+    if (head.y - home.y > TRAY_DRIFT_LIMIT || home.x - head.x > TRAY_DRIFT_LIMIT) {
       patchMany([{ id: head.id, patch: { x: home.x, y: home.y } }]);
       return; // the rest follow on the next pass, off the corrected head
     }
 
     // Walk down the column, each tray measured from the one above it.
     let above = head;
-    const placed = new Map<string, CanvasNode>();
     for (const g of below) {
       above = place(g, head.x, above.y + above.height + TRAY_GAP);
-      placed.set(g.id, above);
     }
     // INBOX sits beside the column because triage is a sideways move — what's
-    // arrived, not yet a when. It rides THIS WEEK's row, not TODAY's: THIS WEEK
-    // is where triage actually lands most of the time, so the two you compare
-    // while sorting sit side by side. Falls back to the head while THIS WEEK
-    // hasn't been materialised yet, so INBOX is never left unplaced.
-    // Measured from INBOX's OWN width so a tray that has grown still sits flush
-    // against the column instead of overlapping it.
-    const inboxRow = placed.get(systemGroupId("thisWeek", canvasId) ?? "") ?? head;
-    if (inbox) place(inbox, head.x - inbox.width - TRAY_GAP, inboxRow.y);
+    // arrived, not yet a when. It rides THIS WEEK's row, so the two you compare
+    // while sorting sit side by side. Measured from INBOX's OWN width so a tray
+    // that has grown still sits flush against the column instead of overlapping
+    // it.
+    const sideX = (w: number) => head.x - w - TRAY_GAP;
+    const placedInbox = inbox ? place(inbox, sideX(inbox.width), head.y) : null;
+    // TODAY hangs off the BOTTOM of INBOX, in that same side column: it's the
+    // last step of triage — what came in, and what of it is for today — rather
+    // than a horizon above the week. Stacked downward like every other derived
+    // tray, so INBOX growing pushes it down instead of the two overlapping.
+    // With no INBOX materialised yet it simply takes INBOX's row, so it's never
+    // left unplaced.
+    if (today)
+      place(
+        today,
+        sideX(today.width),
+        placedInbox
+          ? placedInbox.y + placedInbox.height + TRAY_GAP
+          : head.y,
+      );
     if (patches.length) patchMany(patches);
-  }, [nodesMap, nodes, canvasId, patchMany]);
+  }, [nodesMap, nodes, canvasId, patchMany, anyDraggingIds]);
 
   /** Identity of the section set as far as membership and placement are
    *  concerned: which sections exist and which board each system lane serves.
@@ -1348,6 +1493,14 @@ export function CanvasEditor({
   }, [sectionNodes, membership, registerPlacement, laneFor]);
 
   /* -------- snapshot storage → Postgres (debounced diff) -------- */
+  /** The COMMITTED nodes, for the snapshot only. It must not see the drag
+   *  overlay: canvas node data is Liveblocks-owned, and a peer watching your
+   *  drag would otherwise PUT positions derived from a gesture that hasn't
+   *  landed (and that a dropped connection would undo). Storage is what gets
+   *  mirrored; the overlay is a local view of it. */
+  const storedRef = useRef(storedNodes);
+  useEffect(() => void (storedRef.current = storedNodes), [storedNodes]);
+
   const savedRef = useRef<Map<string, string>>(new Map());
   const seededRef = useRef(false);
   const savingRef = useRef(false);
@@ -1363,7 +1516,7 @@ export function CanvasEditor({
     try {
       do {
         againRef.current = false;
-        const sent = nodesRef.current;
+        const sent = storedRef.current;
         const upserts = sent.filter((n) => savedRef.current.get(n.id) !== sig(n));
         const ids = new Set(sent.map((n) => n.id));
         const deletes = [...savedRef.current.keys()].filter((id) => !ids.has(id));
@@ -2244,6 +2397,11 @@ export function CanvasEditor({
       // drawn if the viewport moves mid-drag.
       const grab = toCanvas(e.clientX, e.clientY);
 
+      // Captured once: the drag's identity for as long as it lasts. Same
+      // references every frame, so `draggingIds` stays referentially stable and
+      // only dx/dy move (see the `drag` state).
+      const dragIds = new Set(origin.keys());
+
       const onMove = (ev: PointerEvent) => {
         const dx = (ev.clientX - startX) / scale;
         const dy = (ev.clientY - startY) / scale;
@@ -2252,15 +2410,17 @@ export function CanvasEditor({
         if (!moved && Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 3) {
           moved = true;
           history.pause(); // group the whole drag into one undo step
-          setDraggingIds(new Set(origin.keys())); // skip smoothing on these
+          // Tell peers WHICH nodes are in play, once — the list can be a whole
+          // tray column, and it doesn't change for the rest of the gesture.
+          updateMyPresence({ dragIds: [...dragIds] });
         }
         if (!moved) return;
-        patchMany(
-          [...origin.entries()].map(([id, o]) => ({
-            id,
-            patch: { x: Math.round(o.x + dx), y: Math.round(o.y + dy) },
-          })),
-        );
+        // The move itself: local overlay for you, presence for everyone else.
+        // Storage is deliberately untouched until release — this used to be a
+        // patchMany per event per node, which is what blew the storage-update
+        // quota (TD2-185).
+        setDrag({ ids: dragIds, base: origin, dx, dy });
+        updateMyPresence({ dragDelta: { dx, dy } });
         // Highlight the group the cursor is over, and mark the slot it'd land in.
         if (capturable) {
           const px = grab.x + dx;
@@ -2283,11 +2443,27 @@ export function CanvasEditor({
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
         setGroupDropTarget(null);
         setDropSlotIndex(null);
         if (moved) {
           history.resume();
-          setDraggingIds(new Set());
+          // COMMIT: one storage update per node for the whole gesture, from the
+          // same base + delta the overlay has been drawing all along, so nothing
+          // moves on landing. `patchMany` is a single room.batch, so it's one
+          // undo step whether or not history is paused — hence resuming first,
+          // which also means a throw here can't strand the paused window.
+          patchMany(
+            [...origin.entries()].map(([id, o]) => ({
+              id,
+              patch: { x: Math.round(o.x + lastDx), y: Math.round(o.y + lastDy) },
+            })),
+          );
+          // Drop the overlay and stop telling peers we're dragging. Same handler
+          // as the commit above, so React lands both in ONE render — clearing it
+          // in a later tick would flash the nodes back to their old position.
+          setDrag(null);
+          updateMyPresence({ dragIds: null, dragDelta: null });
           // The group you GRABBED is the one you meant to place, so only that
           // one stops being auto-arranged (see `isPinnedGroup`). The others
           // travelled with it and go on being arranged around it — flagging
@@ -2363,8 +2539,12 @@ export function CanvasEditor({
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+      // A cancelled pointer (touch interrupted, gesture stolen) must land the
+      // drag too. It used to be harmless — every frame was already in storage —
+      // but now the overlay and the presence claim would be stranded.
+      window.addEventListener("pointercancel", onUp);
     },
-    [patchMany, history, toCanvas, canvasId],
+    [patchMany, history, toCanvas, canvasId, updateMyPresence],
   );
 
   /* -------- pointer: background (pan / create / marquee) -------- */

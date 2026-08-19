@@ -59,6 +59,13 @@ always has somewhere to land.
 commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)
 
+**Look at the images.** If the task came back with a non-empty
+\`attachments\` array, someone attached those screenshots *because the words
+weren't enough* — a mockup, a bug they couldn't describe, an error on screen.
+Call \`get_attachment\` on **every** id, before you analyze or plan. They are
+part of the brief, not decoration, and you cannot see them from the metadata
+alone.
+
 **Read the code, don't infer it from other tasks.** A task's
 \`analysisSummary\`/\`plan\`/\`summary\` describe how *that* task was worked — they
 are context, never a map of the current codebase. Never use another task's

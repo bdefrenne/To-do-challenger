@@ -159,6 +159,71 @@ group("siblingPositionAt — fractional keys, never a renumber");
   eq("out of range → 0", at([], 0), 0);
 }
 
+group("siblingPositionAt — a line opened MID-LIST is not a new last item (TD2-188)");
+{
+  // The reported shape: a task with a description and three subtasks. Shift+Tab
+  // on the description line pops it out as the FIRST subtask — so the key it asks
+  // for must sort BEFORE the existing children. It did; the create threw the key
+  // away server-side and appended, and the row (with the caret in it) jumped to
+  // the bottom of the list on the next refetch. These pin the row-side contract
+  // the server now has to honour.
+  const pos: Record<string, number> = { t: 1, a: 2, b: 3, c: 4 };
+  const at = (rows: OutlineRow[], i: number) => siblingPositionAt(rows, i, (id) => pos[id]);
+  const popped = [
+    r("kt", "t", "New task here"),
+    r("kn", null, "desc", 1), // ← the bullet Shift+Tab just made
+    r("ka", "a", "sous task", 1),
+    r("kd", null, "sous task desc", 2, true),
+    r("kb", "b", "subtask", 1),
+    r("kc", "c", "sub", 1),
+  ];
+  eq("the popped line nests under the task it described", parentRowAt(popped, 1)?.taskId, "t");
+  eq("…and asks for a key BEFORE the first existing subtask", at(popped, 1), 1);
+  eq("…so the owner's description is now empty, not the popped line",
+     foldedDescriptionFor(popped, 0), "");
+
+  // Same key, wherever in the block the caret was: popping the second line of a
+  // description leaves the first line behind as a desc row and the bullet still
+  // sorts first.
+  const mid = [
+    r("kt", "t", "New task here"),
+    r("kdesc", null, "kept line", 1, true),
+    r("kn", null, "popped line", 1),
+    r("ka", "a", "sous task", 1),
+    r("kb", "b", "subtask", 1),
+  ];
+  eq("a line popped from the MIDDLE of a description still sorts first", at(mid, 2), 1);
+  eq("…and the lines above it stay the owner's description",
+     foldedDescriptionFor(mid, 0), "kept line");
+
+  // A subtask's own description pops out as ITS child, in a group of its own.
+  const nested = [
+    r("kt", "t", "New task here"),
+    r("ka", "a", "sous task", 1),
+    r("kn", null, "sous task desc", 2),
+    r("kb", "b", "subtask", 1),
+  ];
+  eq("a subtask's description pops out under the SUBTASK", parentRowAt(nested, 2)?.taskId, "a");
+  eq("…into an empty group, where any key will do", at(nested, 2), 0);
+
+  // The first task in a list with no description: nothing above, so it is a root
+  // line and must land before the roots that exist.
+  const top = [r("kn", null, "typed at the top", 0), r("kt", "t", "New task here")];
+  eq("a line opened at the very top asks for a key before the first root", at(top, 0), 0);
+
+  // Enter mid-list — the same class of bug, same fix.
+  const split = [
+    r("kt", "t", "New task here"),
+    r("ka", "a", "sous task", 1),
+    r("kn", null, "split off b", 1),
+    r("kb", "b", "subtask", 1),
+    r("kc", "c", "sub", 1),
+  ];
+  eq("an Enter split mid-list asks for the midpoint of its neighbours", at(split, 2), 2.5);
+  eq("appending really is the LAST line's answer — the default must stay",
+     at([...popped, r("kend", null, "appended", 1)], 6), 5);
+}
+
 /* ------------------------ rows ⇄ units round trip ----------------------- */
 
 group("rowsToUnits / unitsToRows — the tree the outline saves");
@@ -311,6 +376,62 @@ group("mergeOutlineRows — pending rows land where they were");
        [r("k1", "t1", "first"), r("n1", null, "one"), r("n2", null, "two")],
        new Set())),
      ["first", "one", "two"]);
+  // Each insert shifts every later index. These three caught a real reversal.
+  eq("two pending rows sharing ONE follower stay in order",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "A"), r("s2", "t2", "B")],
+       [r("k1", "t1", "A"), r("n1", null, "one"), r("n2", null, "two"), r("k2", "t2", "B")],
+       new Set())),
+     ["A", "one", "two", "B"]);
+  eq("pending rows at different anchors each land at their own",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "A"), r("s2", "t2", "B"), r("s3", "t3", "C")],
+       [r("k1", "t1", "A"), r("n1", null, "after A"), r("k2", "t2", "B"), r("n2", null, "after B"), r("k3", "t3", "C")],
+       new Set())),
+     ["A", "after A", "B", "after B", "C"]);
+  eq("a pending row before the very first row",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "A"), r("s2", "t2", "B")],
+       [r("n1", null, "first"), r("k1", "t1", "A"), r("k2", "t2", "B")],
+       new Set())),
+     ["first", "A", "B"]);
+  eq("five pending rows interleaved with four server rows",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "1"), r("s2", "t2", "2"), r("s3", "t3", "3"), r("s4", "t4", "4")],
+       [r("p0", null, "p0"), r("k1", "t1", "1"), r("p1", null, "p1"), r("k2", "t2", "2"),
+        r("p2", null, "p2"), r("p3", null, "p3"), r("k3", "t3", "3"), r("k4", "t4", "4"), r("p4", null, "p4")],
+       new Set())),
+     ["p0", "1", "p1", "2", "p2", "p3", "3", "4", "p4"]);
+  eq("a blank FOCUSED desc row is kept by the invariant (caret is in it)",
+     keys(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "", 1, true)],
+       new Set(), "d1")),
+     ["k1", "d1"]);
+  eq("…and dropped once the caret leaves it",
+     keys(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "", 1, true)],
+       new Set(), null)),
+     ["k1"]);
+  eq("the FIRST of two desc rows focused keeps its key too",
+     keys(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "l1\nl2", 1, true)],
+       [r("k1", "t1", "task"), r("d1", null, "l1", 1, true), r("d2", null, "l2", 1, true)],
+       new Set(), "d1")),
+     ["k1", "d1"]);
+  eq("a field both protected AND unconfirmed keeps my text and the row",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "parent")],
+       [r("k1", "t1", "parent"), r("k2", "t2", "mine", 1)],
+       new Set(["t2"]), null, new Set(["t2"]))),
+     ["parent", "  mine"]);
+  eq("a pending row keeps its own indent, not the server's neighbours'",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "parent")],
+       [r("k1", "t1", "parent"), r("n1", null, "deep", 3)],
+       new Set())),
+     ["parent", "      deep"]);
   eq("blank rows nobody is in are not preserved",
      view(mergeOutlineRows(
        [r("s1", "t1", "first")],
@@ -450,6 +571,60 @@ group("mergeOutlineRows — scale sanity");
   eq("300 rows merge to 301 (all rows + my composer)", merged.length, 301);
   eq("…keeping local keys", merged[0].key, "k0");
   eq("…in under 50ms", ms < 50, true);
+}
+
+/* ------------------------- the op log's own rules ------------------------ */
+
+group("delete ops must carry their subtree (or the server promotes it to root)");
+{
+  /** Mirrors `noteDeleted`: which descendants need re-parenting after a line dies. */
+  const subtree = (rows: OutlineRow[], deletedIndent: number, from: number) => {
+    const out: string[] = [];
+    for (let i = from; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row.desc && row.indent <= deletedIndent) break;
+      if (!row.desc && row.taskId) out.push(row.taskId);
+    }
+    return out;
+  };
+  // Backspace-merge on a row at indent 1 whose children were c and d: the row is
+  // spliced out, so its subtree starts where it was.
+  const merged = [r("a", "a", "A"), r("c", "c", "C", 2), r("d", "d", "D", 2), r("e", "e", "E", 1), r("f", "f", "F")];
+  eq("children of the deleted row are collected", subtree(merged, 1, 1), ["c", "d"]);
+  eq("collection stops at the next sibling", subtree(merged, 1, 1).includes("e"), false);
+  eq("each child re-parents to the enclosing task", parentRowAt(merged, 1)?.taskId, "a");
+  eq("a leaf delete collects nothing", subtree([r("a", "a", "A"), r("b", "b", "B")], 0, 1), []);
+  eq("grandchildren come too", subtree([r("a", "a", "A"), r("c", "c", "C", 2), r("g", "g", "G", 3), r("z", "z", "Z")], 1, 1), ["c", "g"]);
+  // Tab→description: the row survives as a desc row, so the subtree starts after it.
+  const asDesc = [r("a", "a", "A"), r("d", null, "was a task", 1, true), r("c", "c", "C", 2), r("z", "z", "Z")];
+  eq("desc conversion collects the children", subtree(asDesc, 1, 2), ["c"]);
+  eq("…and they re-parent past the desc row", parentRowAt(asDesc, 2)?.taskId, "a");
+  eq("desc rows are never collected as tasks", subtree([r("a", "a", "A"), r("d", null, "x", 1, true)], 0, 1), []);
+}
+
+group("the move pass needs the positions it just wrote");
+{
+  const rows = [r("ka", "a", "A"), r("kc", "c", "C", 2), r("kd", "d", "D", 2), r("kf", "f", "F")];
+  const dbPos: Record<string, number> = { a: 0, f: 5 };
+  // WITH the local cache (what `localPosRef` does): sequential, distinct.
+  const local = new Map<string, number>();
+  const got: number[] = [];
+  for (const id of ["c", "d"]) {
+    const i = rows.findIndex((x) => x.taskId === id);
+    const p = siblingPositionAt(rows, i, (q) => local.get(q) ?? dbPos[q]);
+    local.set(id, p);
+    got.push(p);
+  }
+  eq("re-parented children get distinct, ordered positions", got, [0, 1]);
+  eq("WITHOUT the cache they collide — why it exists",
+     ["c", "d"].map((id) => siblingPositionAt(rows, rows.findIndex((x) => x.taskId === id), (q) => dbPos[q])),
+     [0, 0]);
+  eq("a new row after a just-created one sits after it",
+     siblingPositionAt(
+       [r("k1", "a", "A"), r("k2", "new1", "N1"), r("k3", null, "N2")],
+       2,
+       (id) => (id === "new1" ? 1 : dbPos[id]),
+     ), 2);
 }
 
 /* -------------------------------- locking ------------------------------- */

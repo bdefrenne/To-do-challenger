@@ -261,6 +261,10 @@ export const createTaskSchema = z.object({
   description: z.string().max(10_000).optional(),
   parentId: taskHandle.nullable().optional(),
   boardId: z.string().nullable().optional(),
+  /** Fractional sort key within the (status, parent) group. Omit to append at
+   *  the end; the outline sends the midpoint of the row's neighbours so a line
+   *  typed mid-list stays mid-list. */
+  position: z.number().optional(),
 });
 
 export const updateTaskSchema = z

@@ -1428,6 +1428,13 @@ export interface CreateTaskInput {
   description?: string;
   parentId?: string | null;
   boardId?: string | null;
+  /** Where in its (status, parent) group the task goes — the fractional sort key
+   *  the outline and the canvas already compute for a row's neighbours. Omit it
+   *  and the task is appended at the end of the group, which is what every
+   *  "add a task" surface wants. Honoured only when the parent asked for is the
+   *  parent it actually gets: a position computed among someone's children means
+   *  nothing at root. */
+  position?: number;
 }
 
 /** Next position at the end of the team's (status, parent) group. Team-wide,
@@ -1517,7 +1524,17 @@ export async function createTask(
   // A task scoped to a board inherits its project (so a code prefix falls back
   // board → project → user). Board-less tasks are user-scoped for now.
   const projectId = board?.projectId ?? null;
-  const position = await nextPosition(userId, status, parentId);
+  // An explicit position places the task BETWEEN its neighbours — a line opened
+  // mid-list in the outline (Shift+Tab out of a description, Enter mid-list) is
+  // not a new last item, and appending it moved the row — and the caret with it —
+  // to the bottom of the group on the next refetch (TD2-188). Ignored if the
+  // requested parent didn't survive resolution above: the key was computed among
+  // that parent's children and means nothing in the root group.
+  const parentHonoured = (input.parentId ?? null) === parentId;
+  const position =
+    input.position !== undefined && parentHonoured
+      ? input.position
+      : await nextPosition(userId, status, parentId);
   // Draw a soft number from the current owner (board → project → creator). The
   // code stays unlocked (soft, shows a trailing "*") until handoff / mint.
   const owner = ownerOf({ boardId, projectId, userId }, userId);

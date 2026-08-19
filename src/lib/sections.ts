@@ -249,9 +249,9 @@ export const masterSectionsByBoard = (
 export const LEGACY_WEEK_LANE_PREFIX = "wk-";
 
 /**
- * The ids of the trays arranged around THIS WEEK — TODAY above, INBOX to THIS
- * WEEK's left, BACKLOG and LATER below — which travel together as one rigid unit
- * on the canvas.
+ * The ids of the trays arranged around THIS WEEK — INBOX to THIS WEEK's left
+ * with TODAY under it, BACKLOG and LATER below — which travel together as one
+ * rigid unit on the canvas.
  * Grabbing any one of them drags the others along, preserving whatever relative
  * offset they currently sit at (see `onNodePointerDown` in CanvasEditor).
  *
