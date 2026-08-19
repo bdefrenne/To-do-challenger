@@ -19,7 +19,7 @@
  * (`node.content`) trails it inline, dimmed and regular weight.
  */
 
-import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
@@ -1167,6 +1167,17 @@ export function SectionNode({
             onAddTask={(title) =>
               ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
             }
+            // Same create, but landing above the card whose gap was clicked.
+            onAddTaskAbove={(beforeId, title) =>
+              ws.addSectionTask({
+                title,
+                canvasSectionId: pin,
+                boardId,
+                parentId: null,
+                siblingIds,
+                insertBefore: beforeId,
+              })
+            }
             // Subtasks are never pinned — they inherit their parent's placement,
             // so they follow it if the parent is dragged elsewhere.
             onAddSubtask={(parentId, title) =>
@@ -1760,6 +1771,49 @@ function InlineTaskComposer({
   );
 }
 
+/**
+ * The clickable gap BETWEEN two cards — how a task gets added mid-list instead of
+ * only at the end.
+ *
+ * Zero-height with an absolutely-positioned hit strip over the gap, so it costs
+ * no layout and can't push the cards apart. Idle it's invisible; hovered it draws
+ * the line and a "+ Add task here" pill where the new card will land — the pill
+ * has its own hover state, so the thing under the cursor is clearly the button
+ * (the whole strip is clickable, not just the pill). Click or double-click both
+ * open the composer — the gesture people reach for first is the double-click, but
+ * a single click in a 6px band is no less deliberate.
+ *
+ * Drags are deliberately NOT handled here: a card dropped on the strip falls
+ * through to the section's own blank-area zone, which is what a drop outside a
+ * card already means.
+ */
+function InsertGap({ onOpen }: { onOpen: () => void }) {
+  return (
+    <div className="relative h-0">
+      <button
+        type="button"
+        title="Add a task here"
+        aria-label="Add a task here"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen();
+        }}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          onOpen();
+        }}
+        className="group/gap absolute inset-x-0 -top-2 z-10 h-4 cursor-pointer"
+      >
+        <span className="absolute inset-x-1 top-1/2 hidden h-px -translate-y-1/2 bg-accent/50 group-hover/gap:block" />
+        <span className="absolute left-1/2 top-1/2 hidden -translate-x-1/2 -translate-y-1/2 items-center gap-0.5 whitespace-nowrap rounded border border-accent/40 bg-surface px-1.5 py-0.5 text-[10px] font-semibold leading-none text-accent shadow-sm transition-colors group-hover/gap:flex hover:border-accent hover:bg-accent hover:text-white">
+          + Add task here
+        </span>
+      </button>
+    </div>
+  );
+}
+
 function CommittedList({
   units,
   filterAssigneeId,
@@ -1770,6 +1824,7 @@ function CommittedList({
   onImportance,
   onMove,
   onAddTask,
+  onAddTaskAbove,
   onAddSubtask,
   onDropIntoSection,
 }: {
@@ -1783,6 +1838,8 @@ function CommittedList({
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   onAddTask: (title: string) => void;
+  /** Create a card immediately ABOVE this one (the between-cards composer). */
+  onAddTaskAbove: (beforeTaskId: string, title: string) => void;
   onAddSubtask: (parentId: string, title: string) => void;
   /** Drop a card into THIS section's blank area (or an empty section) — lands it
    *  at the end as a top-level card, moving it (and its subtree) here. */
@@ -1791,6 +1848,8 @@ function CommittedList({
   // True while a section-task drag hovers the list's blank area (not a card) —
   // draws a dashed ring so it reads as "drop here to move into this section".
   const [overSection, setOverSection] = useState(false);
+  // Which card the between-cards composer is currently open ABOVE (one at a time).
+  const [insertAbove, setInsertAbove] = useState<string | null>(null);
 
   /* ONE handler bag with ONE identity for the life of the list — the memo
    * boundary on `TaskCard` rests on it. Each entry is wrapped so its identity
@@ -1842,13 +1901,23 @@ function CommittedList({
       ].join(" ")}
     >
       {units.map((u) => (
-        <TaskCard
-          key={u.taskId ?? u.title}
-          unit={u}
-          depth={0}
-          filterAssigneeId={filterAssigneeId}
-          h={h}
-        />
+        <Fragment key={u.taskId ?? u.title}>
+          {/* One insertion point above each card — so the top of the list and
+              every gap between two cards can take a new task. Below the last one
+              is what the bottom composer already is. */}
+          {u.taskId ? (
+            insertAbove === u.taskId ? (
+              <InlineTaskComposer
+                label="Task"
+                onSubmit={(title) => onAddTaskAbove(u.taskId!, title)}
+                onClose={() => setInsertAbove(null)}
+              />
+            ) : (
+              <InsertGap onOpen={() => setInsertAbove(u.taskId)} />
+            )
+          ) : null}
+          <TaskCard unit={u} depth={0} filterAssigneeId={filterAssigneeId} h={h} />
+        </Fragment>
       ))}
       {/* Always-present "+ Add task" composer at the bottom of the list. */}
       <InlineTaskComposer label="Add task" onSubmit={onAddTask} />

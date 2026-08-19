@@ -197,7 +197,8 @@ interface WorkspaceContextValue {
    *  so parking and the archiving second press work there too.
    *  See `undoDelete` (cancel) and `pendingDeletes` (the toast). */
   deleteTask: (id: string) => void;
-  /** Cancel a pending delete and restore the task; no id ⇒ most recent (LIFO).
+  /** Cancel pending deletes and restore the tasks; no id ⇒ ALL still inside their
+   *  window, since one run of DELETE presses is one action to undo.
    *  Returns whether anything was undone (canvas Ctrl+Z tries this first). */
   undoDelete: (id?: string) => boolean;
   /** Tasks inside their delete undo window (oldest → newest), for the toast.
@@ -267,6 +268,9 @@ interface WorkspaceContextValue {
     boardId: string | null;
     parentId?: string | null;
     siblingIds?: Set<string>;
+    /** Land the new card immediately ABOVE this sibling instead of at the end —
+     *  what a composer opened in the gap between two cards passes. */
+    insertBefore?: string | null;
   }) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
@@ -1402,21 +1406,34 @@ export function WorkspaceProvider({
     setPendingDeletes((s) => [...s.filter((d) => d.id !== id), { id, title: task.title, mode }]);
   }
 
-  /** Cancel a pending delete and restore the task. With no id, undoes the most
-   *  recent (LIFO) — the canvas Ctrl+Z path. Returns whether it undid anything. */
+  /** Cancel pending deletes and restore the tasks. With no id, undoes EVERY task
+   *  still inside its window — the toast's Undo and the canvas Ctrl+Z both mean
+   *  "put back what I just deleted", and a run of DELETE presses is one action to
+   *  the person who made it, not N to be reversed one at a time (and the windows
+   *  are lapsing while they press). Pass an id to undo just that one. Returns
+   *  whether it undid anything. */
   const undoDelete = useCallback((id?: string): boolean => {
     const pend = pendingDeleteRef.current;
-    const target = id ?? [...pend.keys()].pop();
-    if (!target) return false;
-    const entry = pend.get(target);
-    if (!entry) return false;
-    clearTimeout(entry.timer);
-    pend.delete(target);
-    setPendingDeletes((s) => s.filter((d) => d.id !== target));
-    setTaskMap((prev) => ({ ...prev, [target]: entry.task }));
-    if (entry.node) {
-      const restored = entry.node;
-      setNodes((prev) => (prev.some((x) => x.id === target) ? prev : [...prev, restored]));
+    const targets = id ? (pend.has(id) ? [id] : []) : [...pend.keys()];
+    if (!targets.length) return false;
+    const entries = targets.map((t) => [t, pend.get(t)!] as const);
+    for (const [t, entry] of entries) {
+      clearTimeout(entry.timer);
+      pend.delete(t);
+    }
+    const undone = new Set(targets);
+    setPendingDeletes((s) => s.filter((d) => !undone.has(d.id)));
+    setTaskMap((prev) => {
+      const next = { ...prev };
+      for (const [t, entry] of entries) next[t] = entry.task;
+      return next;
+    });
+    const restored = entries.map(([, entry]) => entry.node).filter((n): n is TaskNode => !!n);
+    if (restored.length) {
+      setNodes((prev) => [
+        ...prev,
+        ...restored.filter((n) => !prev.some((x) => x.id === n.id)),
+      ]);
     }
     return true;
   }, []);
@@ -2449,26 +2466,43 @@ export function WorkspaceProvider({
     boardId: string | null;
     parentId?: string | null;
     siblingIds?: Set<string>;
+    insertBefore?: string | null;
   }) {
     const { title, canvasSectionId, boardId, siblingIds } = input;
     const parentId = input.parentId ?? null;
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
-    // End of this section's sibling group (same parent), not the global status
-    // group — the section list sorts by position within a parent regardless of
-    // status.
-    const maxPos = Math.max(
-      0,
-      ...nodes
-        .filter(
-          (n) =>
-            n.parentId === parentId &&
-            (siblingIds
-              ? siblingIds.has(n.id)
-              : (taskMap[n.id]?.canvasSectionId ?? null) === canvasSectionId),
-        )
-        .map((n) => n.position),
-    );
+    // This card's sibling group as RENDERED: same parent, same section, in the
+    // canonical order — the run both the append and the insert are measured
+    // against.
+    const run = nodes
+      .filter(
+        (n) =>
+          n.parentId === parentId &&
+          (siblingIds
+            ? siblingIds.has(n.id)
+            : (taskMap[n.id]?.canvasSectionId ?? null) === canvasSectionId),
+      )
+      .sort(compareTaskOrder);
+    // Composed in the gap above a card? Then the whole run is RESTAMPED densely
+    // with the new card spliced in — the same thing a drop does, and for the same
+    // reason: a section mixes statuses, so its cards routinely share a position
+    // and the midpoint of two equal positions IS that position (see
+    // `insertRelative`). Plain appends keep the cheap max+1 and touch nothing else.
+    const at = input.insertBefore ? run.findIndex((n) => n.id === input.insertBefore) : -1;
+    const inserting = at !== -1;
+    const position = inserting
+      ? at
+      : Math.max(0, ...run.map((n) => n.position)) + 1;
+    // The WHOLE run is restamped, not just the tail: positions are minted per
+    // (status, parent) and never renumbered, so a section's run is often sparse or
+    // tied — leaving the cards above the gap on their old keys could sort them
+    // below the new one. Ops are filtered to the cards that actually change, so a
+    // run already dense costs only the shove down.
+    const shifted = inserting
+      ? run.map((n, i) => ({ id: n.id, position: i < at ? i : i + 1 }))
+      : [];
+    const restamp = new Map(shifted.map((r) => [r.id, r.position]));
     mutate(
       () => {
         setTaskMap((prev) => ({
@@ -2484,12 +2518,15 @@ export function WorkspaceProvider({
           },
         }));
         setNodes((prev) => [
-          ...prev,
-          { id: tempId, parentId, boardId, status: "backlog", statusSince: now, position: maxPos + 1, createdAt: now },
+          ...prev.map((n) => {
+            const p = restamp.get(n.id);
+            return p === undefined ? n : { ...n, position: p };
+          }),
+          { id: tempId, parentId, boardId, status: "backlog", statusSince: now, position, createdAt: now },
         ]);
       },
-      () =>
-        api("/api/tasks", {
+      async () => {
+        const result = await api("/api/tasks", {
           method: "POST",
           body: JSON.stringify({
             title,
@@ -2498,8 +2535,17 @@ export function WorkspaceProvider({
             boardId,
             parentId,
             canvasSectionId,
+            position,
           }),
-        }),
+        });
+        // The new row already holds its slot, so this batch is the shove down —
+        // after the create, so a failure there leaves the order untouched.
+        const ops = shifted
+          .filter(({ id, position }) => run.find((n) => n.id === id)?.position !== position)
+          .map(({ id, position }) => ({ op: "move", id, target: { position } }));
+        if (ops.length) await bulk(ops);
+        return result;
+      },
       {
         onSuccess: (result) => {
           const real = (result as { task?: Task }).task;
@@ -2804,11 +2850,28 @@ export function WorkspaceProvider({
     loadLogs(id); // surface the "attached" activity entry
   }
 
+  // Deleting is optimistic: the server call drops a Blob object and writes a
+  // log row before `mutate` refetches, which is seconds of a dead-looking UI if
+  // the image only disappears at the end. Drop it from `taskMap` up front — a
+  // failure reverts it via the refetch in `mutate` and explains itself there.
   async function removeAttachment(taskId: string, attachmentId: string) {
-    await mutate(null, () =>
-      api(`/api/tasks/${taskId}/attachments/${attachmentId}`, {
-        method: "DELETE",
-      }),
+    await mutate(
+      () =>
+        setTaskMap((prev) => {
+          const t = prev[taskId];
+          if (!t?.attachments) return prev;
+          return {
+            ...prev,
+            [taskId]: {
+              ...t,
+              attachments: t.attachments.filter((a) => a.id !== attachmentId),
+            },
+          };
+        }),
+      () =>
+        api(`/api/tasks/${taskId}/attachments/${attachmentId}`, {
+          method: "DELETE",
+        }),
     );
     loadLogs(taskId);
   }

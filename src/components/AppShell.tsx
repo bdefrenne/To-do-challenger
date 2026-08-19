@@ -150,13 +150,17 @@ function Notice() {
 }
 
 /** "Deleted · Undo" toast for canvas task deletes still inside their undo
- *  window. Clears itself when the window lapses (delete commits) or on Undo. */
+ *  window. Clears itself when the window lapses (delete commits) or on Undo.
+ *  Undo takes back EVERY task in the window, not just the newest — see
+ *  `undoDelete`; the toast counts them so it's clear how many come back. */
 function DeleteUndoToast() {
   const { pendingDeletes, undoDelete } = useWorkspace();
   if (!pendingDeletes.length) return null;
   const last = pendingDeletes[pendingDeletes.length - 1];
-  // Done tasks are archived, not deleted — the verb follows the latest action.
-  const verb = last.mode === "archive" ? "Archived" : "Deleted";
+  // Done tasks are archived, not deleted; a run of presses can be a mix of both,
+  // and then neither verb is true of all of them.
+  const mixed = pendingDeletes.some((d) => d.mode !== last.mode);
+  const verb = mixed ? "Removed" : last.mode === "archive" ? "Archived" : "Deleted";
   const label =
     pendingDeletes.length > 1
       ? `${verb} ${pendingDeletes.length} tasks`

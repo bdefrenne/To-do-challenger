@@ -2172,8 +2172,9 @@ export function CanvasEditor({
       if (meta && e.key.toLowerCase() === "z") {
         if (isTyping()) return;
         e.preventDefault();
-        // A pending task-delete takes priority over the node history, so Ctrl+Z
-        // right after a DELETE brings the task back; otherwise undo canvas nodes.
+        // Pending task-deletes take priority over the node history, so Ctrl+Z
+        // right after a run of DELETEs brings them ALL back (`undoDelete` with no
+        // id empties the window); otherwise undo canvas nodes.
         if (e.shiftKey) history.redo();
         else if (!undoDelete()) history.undo();
         return;
