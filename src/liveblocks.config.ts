@@ -52,20 +52,37 @@ declare global {
        *  `taskId` + `field` is the original soft field-lock: peers highlight it
        *  and disable that input so two people don't clobber the same field.
        *
-       *  The outline ("text view") adds the three below, and does NOT disable
-       *  anything: rows there are independent task FIELDS, so peers edit
-       *  different rows freely and this is decoration — a ring on the row they're
-       *  on and their caret inside it.
+       *  The outline ("text view") adds the rest. Rows there are independent task
+       *  FIELDS, so peers edit different rows freely; the fields below decorate
+       *  that (a ring on their row, their caret inside it) AND carry the per-row
+       *  lock, because two people in ONE row is the single case that cannot merge.
+       *  See `useRowLock` — the claim IS this presence entry, so it expires with
+       *  the tab and needs no server state.
        *    • `row`  — the field they're in: a task id for a title row, or
-       *      `<taskId>#desc` for a description block. Two people on the SAME row
-       *      is the one unmerged case (last-writer-wins), which the caller shows
-       *      as an amber ring rather than hiding.
+       *      `<taskId>#desc` for a description block.
        *    • `caret` — their character offset in that row.
        *    • `len` — the length of THEIR copy of the text, so a peer whose copy
        *      hasn't caught up yet can skip drawing rather than draw the caret in
-       *      the wrong place. */
+       *      the wrong place.
+       *    • `since` — when they entered `row`. Earliest claim owns it, tie-broken
+       *      on connection id, so every client resolves the same owner without
+       *      asking anyone.
+       *    • `typingAt` — their last keystroke. An owner idle longer than
+       *      `PARK_MS` is "parked": still shown, but no longer blocking, so a
+       *      forgotten caret can't hold a row hostage.
+       *    • `override` — a field this user is deliberately taking over. Beats
+       *      seniority; the previous owner flushes its pending text and yields. */
       editing:
-        | { taskId: string; field: string; row?: string; caret?: number; len?: number }
+        | {
+            taskId: string;
+            field: string;
+            row?: string;
+            caret?: number;
+            len?: number;
+            since?: number;
+            typingAt?: number;
+            override?: string | null;
+          }
         | null;
     };
     Storage: {

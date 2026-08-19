@@ -279,11 +279,27 @@ export function rowFieldKeys(rows: OutlineRow[]): (string | null)[] {
  *   • Rows with no task yet exist only here (their create hasn't landed), so they
  *     are re-inserted after the row they followed rather than dropped.
  */
-/** The field a preserved row hangs off: the nearest one above it. Null when it is
- *  at the very top with nothing identifiable before it. */
-function anchorFieldFor(fields: (string | null)[], index: number): string | null {
-  for (let j = index - 1; j >= 0; j--) if (fields[j]) return fields[j];
-  return null;
+/** What a preserved row sat between locally: the nearest identifiable field above
+ *  it and the nearest one below. `below` is the one that matters — a local row's
+ *  real intent is "before that row", and honouring it keeps a trailing composer
+ *  trailing while a mid-list line stays mid-list. */
+function anchorsFor(
+  fields: (string | null)[],
+  index: number,
+): { above: string | null; below: string | null } {
+  let above: string | null = null;
+  for (let j = index - 1; j >= 0; j--)
+    if (fields[j]) {
+      above = fields[j];
+      break;
+    }
+  let below: string | null = null;
+  for (let j = index + 1; j < fields.length; j++)
+    if (fields[j]) {
+      below = fields[j];
+      break;
+    }
+  return { above, below };
 }
 
 export function mergeOutlineRows(
@@ -306,7 +322,11 @@ export function mergeOutlineRows(
   const seededFields = new Set(rowFieldKeys(seeded).filter((f): f is string => !!f));
   const mine = new Map<string, OutlineRow>();
   currentKeys.forEach((field, i) => {
-    if (field && !mine.has(field)) mine.set(field, current[i]);
+    if (!field) return;
+    // First row for a field wins — EXCEPT the row the caret is in. Two local desc
+    // rows can share one field (`X#desc`), and collapsing them onto the first
+    // row's key would delete the DOM node the caret was sitting in.
+    if (!mine.has(field) || current[i].key === focusedRowKey) mine.set(field, current[i]);
   });
 
   const merged = seeded.map((row, i) => {
@@ -321,7 +341,7 @@ export function mergeOutlineRows(
   });
 
   // Local-only rows (typed, no task yet) — anchored to the field above them.
-  const pending: { afterField: string | null; row: OutlineRow }[] = [];
+  const pending: { above: string | null; below: string | null; row: OutlineRow }[] = [];
   current.forEach((row, i) => {
     const field = currentKeys[i];
     // Already in the server's copy → the map above handled it.
@@ -333,61 +353,104 @@ export function mergeOutlineRows(
     // caret mid-word is worse than any staleness. Every caret-loss bug in this
     // file has been a special case of this rule not existing.
     if (row.key === focusedRowKey) {
-      pending.push({ afterField: anchorFieldFor(currentKeys, i), row });
+      pending.push({ ...anchorsFor(currentKeys, i), row });
       return;
     }
     if (row.desc) {
       // A description exists locally before it exists on the server —
-      // `unitsToRows` only emits a desc row once the task HAS a description. So
-      // text here is unsaved work, not a deletion.
-      if (!row.text.trim()) return;
+      // `unitsToRows` only emits a desc row once the task HAS one. So a desc row
+      // the server lacks is EITHER unsaved work or a description a peer just
+      // cleared, and local text cannot tell those apart. Dirtiness can: keep it
+      // only if this field is unsaved (protected) or its task isn't confirmed
+      // yet. Otherwise the clear is real and must land.
+      const owner = field ? field.replace(/#desc$/, "") : null;
+      const unsaved = !!field && protectedFields.has(field);
+      const ownerPending = !!owner && keepFields.has(owner);
+      if (!unsaved && !ownerPending) return;
     } else if (!row.taskId) {
       if (!row.text.trim()) return; // a blank composer nobody is typing in
     } else if (!field || !keepFields.has(field)) {
       return; // a confirmed row the server dropped = a peer's delete. Apply it.
     }
-    pending.push({ afterField: anchorFieldFor(currentKeys, i), row });
+    pending.push({ ...anchorsFor(currentKeys, i), row });
   });
+  /** The one blank row an empty outline needs. Reuses the blank row already on
+   *  screen when there is one: minting a fresh uuid every merge would change the
+   *  row's identity, remounting the textarea and dropping the caret on every
+   *  refresh of an empty section. */
+  const blankFallback = (): OutlineRow[] => [
+    current.find((row) => !row.desc && !row.taskId && !row.text.trim()) ?? newRow(0),
+  ];
+
   // An outline is never rendered with zero rows — there would be nothing to type
   // in. This is the ONLY place a blank row is invented, so the caller must not
   // pre-seed one: doing both is what made them multiply.
-  if (!pending.length) return merged.length ? merged : [newRow(0)];
+  if (!pending.length) return merged.length ? merged : blankFallback();
 
   const out = [...merged];
   const mergedKeys = rowFieldKeys(out);
-  for (const { afterField, row } of pending) {
-    if (afterField === null) {
-      // No anchor above it. A row with TEXT was typed at the top of the list, so
-      // its position is meaningful and it stays first. A BLANK row is the trailing
-      // composer — the line you are about to type in — so it belongs at the END,
-      // not shoved above a task a peer just added.
-      if (row.text.trim()) out.unshift(row);
-      else out.push(row);
+  const indexOfField = (field: string | null, fromEnd = false) => {
+    if (!field) return -1;
+    if (fromEnd) {
+      for (let i = mergedKeys.length - 1; i >= 0; i--) if (mergedKeys[i] === field) return i;
+      return -1;
+    }
+    return mergedKeys.indexOf(field);
+  };
+
+  for (const { above, below, row } of pending) {
+    // BEFORE whatever followed it locally. This is the rule that keeps a trailing
+    // composer at the bottom when a peer's new task arrives (nothing followed it,
+    // so it goes last) while a line opened mid-list stays where it was opened.
+    const beforeAt = indexOfField(below);
+    if (beforeAt !== -1) {
+      out.splice(beforeAt, 0, row);
       continue;
     }
-    let at = -1;
-    for (let i = mergedKeys.length - 1; i >= 0; i--) {
-      if (mergedKeys[i] === afterField) {
-        at = i;
-        break;
-      }
-    }
-    if (at === -1) {
-      // Its anchor is gone (a peer deleted that task) — keep the row at the end
-      // rather than lose what the user typed.
+    // Nothing followed it locally → it is the last line, and stays the last line
+    // even if the server has since added rows after its anchor.
+    if (above !== null || !row.text.trim()) {
       out.push(row);
       continue;
     }
-    // Insert after the anchor's SUBTREE, not immediately after its title line.
-    // "After the parent" has to mean after everything nested under it, or the row
-    // wedges between a parent and its own subtasks — which is what a peer saw
-    // while someone else was building a nested list. Rows deeper than this one
-    // belong above it; a row at this row's level or shallower ends the search.
-    let insertAt = at + 1;
-    while (insertAt < out.length && (out[insertAt].desc || out[insertAt].indent > row.indent)) {
-      insertAt++;
-    }
-    out.splice(insertAt, 0, row);
+    // No anchor either side and it has TEXT: typed at the very top of the list,
+    // where the position is meaningful.
+    out.unshift(row);
   }
-  return out.length ? out : [newRow(0)];
+  return out.length ? out : blankFallback();
+}
+
+/**
+ * What a row must contain the instant someone takes it over.
+ *
+ * A row is one task field, and a field patch carries the whole value, so the
+ * taker's first keystroke overwrites whatever THEY have on screen. If that is a
+ * snapshot from before the previous owner's last sentence, taking a row silently
+ * deletes work. So a takeover never opens a row against the local copy: it opens
+ * it against `authoritative` — the value everyone else has, which arrives as a
+ * `task-patch` broadcast and needs no database read.
+ *
+ * `pending` is the keystroke that ASKED for a parked row (typing is how you take
+ * one). It was held rather than applied, because applying it would have written
+ * it onto the text we are about to replace. It is replayed here:
+ *   • text unchanged → at the offset the user typed it at, as if nothing happened;
+ *   • text changed → at the END, because an offset into a sentence the user never
+ *     read means nothing, and dropping their character means the keystroke that
+ *     took the row also vanished.
+ */
+export function takeoverText(
+  authoritative: string,
+  mine: string,
+  pending?: { insert: string; at: number } | null,
+): { text: string; caret: number; changed: boolean } {
+  const changed = mine !== authoritative;
+  if (!pending) return { text: authoritative, caret: authoritative.length, changed };
+  const at = changed
+    ? authoritative.length
+    : Math.max(0, Math.min(pending.at, authoritative.length));
+  return {
+    text: authoritative.slice(0, at) + pending.insert + authoritative.slice(at),
+    caret: at + pending.insert.length,
+    changed,
+  };
 }

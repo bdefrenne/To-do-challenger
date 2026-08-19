@@ -1,0 +1,578 @@
+/**
+ * Outline logic checks — the pure rules behind the text view.
+ *
+ * `npm run check:outline`
+ *
+ * Every one of these exists because something broke in front of Ben. The outline
+ * is where co-editing, task creation and deletion all meet, so a wrong answer
+ * here doesn't render oddly — it loses a task, duplicates one, or yanks the caret
+ * out of someone's hands. The merge in particular has been rewritten five times;
+ * this file is what stops each fix reintroducing an earlier bug.
+ *
+ * Pure functions only: no room, no database, no React.
+ */
+
+import {
+  type OutlineRow,
+  mergeOutlineRows,
+  rowFieldKey,
+  rowFieldKeys,
+  parentRowAt,
+  descOwnerAt,
+  foldedDescriptionFor,
+  siblingPositionAt,
+  rowsToUnits,
+  unitsToRows,
+  survivingIds,
+  newRow,
+  takeoverText,
+} from "@/lib/outline";
+import { resolveRowLock, PARK_MS, type RowClaim } from "@/components/workspace/useRowLock";
+
+/* ------------------------------- harness ------------------------------- */
+
+let passed = 0;
+const failures: string[] = [];
+let section = "";
+
+const group = (name: string) => {
+  section = name;
+  console.log(`\n\x1b[1m${name}\x1b[0m`);
+};
+const eq = (name: string, got: unknown, want: unknown) => {
+  const g = JSON.stringify(got);
+  const w = JSON.stringify(want);
+  if (g === w) {
+    passed++;
+    console.log(`  \x1b[32mok\x1b[0m   ${name}`);
+  } else {
+    failures.push(`${section} → ${name}\n       got  ${g}\n       want ${w}`);
+    console.log(`  \x1b[31mFAIL\x1b[0m ${name}\n       got  ${g}\n       want ${w}`);
+  }
+};
+
+/** A row. Defaults keep the call sites readable. */
+const r = (
+  key: string,
+  taskId: string | null,
+  text: string,
+  indent = 0,
+  desc = false,
+): OutlineRow => ({ key, taskId, indent, desc, text });
+/** Rendered shape: indentation + text, descriptions marked. */
+const view = (rows: OutlineRow[]) =>
+  rows.map((x) => `${"  ".repeat(x.indent)}${x.desc ? "// " : ""}${x.text || "task…"}`);
+const keys = (rows: OutlineRow[]) => rows.map((x) => x.key);
+
+/* --------------------------- field identity ---------------------------- */
+
+group("rowFieldKeys — a row IS one task field");
+{
+  const rows = [
+    r("a", "t1", "one"),
+    r("ad", null, "its description", 1, true),
+    r("b", "t2", "two", 1),
+    r("c", null, "not created yet"),
+    r("cd", null, "desc of an uncreated task", 1, true),
+  ];
+  eq("title → task id, desc → owner#desc, uncreated → null", rowFieldKeys(rows), [
+    "t1",
+    "t1#desc",
+    "t2",
+    null,
+    null,
+  ]);
+  eq("single-row helper agrees with the batch", rows.map((_, i) => rowFieldKey(rows, i)), rowFieldKeys(rows));
+  eq("a desc before ANY task has no owner", rowFieldKeys([r("d", null, "orphan", 0, true)]), [null]);
+  eq("out-of-range index is null, not a crash", rowFieldKey(rows, 99), null);
+  eq("empty list", rowFieldKeys([]), []);
+  eq("two desc rows share ONE field (they are one column)",
+     rowFieldKeys([r("a", "t1", "x"), r("d1", null, "l1", 1, true), r("d2", null, "l2", 1, true)]),
+     ["t1", "t1#desc", "t1#desc"]);
+}
+
+/* ------------------------------ structure ------------------------------ */
+
+group("parentRowAt / descOwnerAt — who a row hangs off");
+{
+  const rows = [
+    r("a", "t1", "root"),
+    r("ad", null, "desc", 1, true),
+    r("b", "t2", "child", 1),
+    r("c", "t3", "grandchild", 2),
+    r("d", "t4", "second root"),
+  ];
+  eq("root has no parent", parentRowAt(rows, 0)?.taskId ?? null, null);
+  eq("child's parent is the shallower row above", parentRowAt(rows, 2)?.taskId, "t1");
+  eq("grandchild's parent is the child", parentRowAt(rows, 3)?.taskId, "t2");
+  eq("desc rows are skipped when finding a parent", parentRowAt(rows, 2)?.key, "a");
+  eq("a later root has no parent", parentRowAt(rows, 4)?.taskId ?? null, null);
+  eq("desc belongs to the nearest task above", descOwnerAt(rows, 1)?.taskId, "t1");
+  eq("desc with nothing above → null", descOwnerAt([r("d", null, "x", 0, true)], 0), null);
+  eq("out of range → null", parentRowAt(rows, 99), null);
+  // A row indented deeper than its predecessor allows: rowsToUnits clamps, and the
+  // parent lookup must not invent a level.
+  const skipped = [r("a", "t1", "root"), r("b", "t2", "leaps to 3", 3)];
+  eq("an over-indented row still parents to the row above", parentRowAt(skipped, 1)?.taskId, "t1");
+}
+
+group("foldedDescriptionFor — every desc line of a task is ONE column");
+{
+  const rows = [
+    r("a", "t1", "task"),
+    r("d1", null, "first line", 1, true),
+    r("d2", null, "second line", 1, true),
+    r("b", "t2", "next task"),
+    r("d3", null, "other task's desc", 1, true),
+  ];
+  eq("folds this task's lines only", foldedDescriptionFor(rows, 0), "first line\nsecond line");
+  eq("stops at the next task row", foldedDescriptionFor(rows, 3), "other task's desc");
+  eq("no description → empty string", foldedDescriptionFor([r("a", "t1", "x")], 0), "");
+  eq("blank desc lines are dropped", foldedDescriptionFor([r("a", "t1", "x"), r("d", null, "   ", 1, true)], 0), "");
+  eq("whitespace around a line is trimmed",
+     foldedDescriptionFor([r("a", "t1", "x"), r("d", null, "  hi  ", 1, true)], 0), "hi");
+  eq("a multiline desc row keeps its own newlines",
+     foldedDescriptionFor([r("a", "t1", "x"), r("d", null, "l1\nl2", 1, true)], 0), "l1\nl2");
+}
+
+group("siblingPositionAt — fractional keys, never a renumber");
+{
+  const pos: Record<string, number> = { a: 10, b: 20, c: 30 };
+  const at = (rows: OutlineRow[], i: number, map = pos) =>
+    siblingPositionAt(rows, i, (id) => map[id]);
+  eq("between two siblings → the midpoint",
+     at([r("ka", "a", "a"), r("new", null, "x"), r("kb", "b", "b")], 1), 15);
+  eq("after the last sibling → +1", at([r("ka", "a", "a"), r("new", null, "x")], 1), 11);
+  eq("before the first sibling → -1", at([r("new", null, "x"), r("ka", "a", "a")], 0), 9);
+  eq("no known siblings → 0", at([r("new", null, "x")], 0), 0);
+  eq("a sibling with an unknown position is skipped",
+     at([r("ka", "a", "a"), r("kq", "q", "q"), r("new", null, "x")], 2), 11);
+  eq("desc rows are not siblings",
+     at([r("ka", "a", "a"), r("d", null, "desc", 1, true), r("new", null, "x")], 2), 11);
+  eq("a different parent is a different group",
+     at([r("ka", "a", "a"), r("kb", "b", "b", 1), r("new", null, "x", 1)], 2, { a: 10, b: 20 }), 21);
+  eq("children of different parents don't mix",
+     at([r("ka", "a", "p1"), r("kb", "b", "kid of a", 1), r("kc", "c", "p2"), r("new", null, "kid of c", 1)], 3),
+     0);
+  eq("repeated midpoints keep shrinking (no collision)",
+     at([r("ka", "a", "a"), r("new", null, "x"), r("kb", "b", "b")], 1, { a: 10, b: 11 }), 10.5);
+  eq("out of range → 0", at([], 0), 0);
+}
+
+/* ------------------------ rows ⇄ units round trip ----------------------- */
+
+group("rowsToUnits / unitsToRows — the tree the outline saves");
+{
+  const rows = [
+    r("a", "t1", "parent"),
+    r("ad", null, "about it", 1, true),
+    r("b", "t2", "child", 1),
+    r("c", null, "  ", 2), // blank → dropped
+    r("d", "t3", "second root"),
+  ];
+  const units = rowsToUnits(rows);
+  eq("roots", units.map((u) => u.title), ["parent", "second root"]);
+  eq("description folded onto the parent", units[0].description, "about it");
+  eq("child nested", units[0].children.map((c) => c.title), ["child"]);
+  eq("blank row contributes nothing", survivingIds(units).has("t2"), true);
+  eq("a dropped blank row's id does not survive", [...survivingIds(units)].sort(), ["t1", "t2", "t3"]);
+  eq("round trip preserves the rendered shape",
+     view(unitsToRows(units)),
+     ["parent", "  // about it", "  child", "second root"]);
+  eq("an orphan desc is promoted to a task",
+     rowsToUnits([r("d", null, "orphan", 0, true)]).map((u) => u.title), ["orphan"]);
+  eq("empty rows → no units", rowsToUnits([r("x", null, "")]).length, 0);
+  eq("newRow is blank and unbound", [newRow(2).indent, newRow(2).taskId, newRow(2).text], [2, null, ""]);
+}
+
+/* ------------------------------- the merge ------------------------------ */
+
+group("mergeOutlineRows — nothing on screen, nothing on the server");
+{
+  eq("both empty → one blank line to type in", view(mergeOutlineRows([], [], new Set())), ["task…"]);
+  eq("server empty, my blank row focused → keep MINE (caret intact)",
+     keys(mergeOutlineRows([], [r("mine", null, "")], new Set(), "mine")), ["mine"]);
+  eq("server empty, my blank row unfocused → one row, REUSING its identity",
+     keys(mergeOutlineRows([], [r("stale", null, "")], new Set())), ["stale"]);
+  eq("…and with no blank row to reuse, exactly one is invented",
+     mergeOutlineRows([], [], new Set()).length, 1);
+  eq("server empty, my TYPED row → kept, never invented over",
+     view(mergeOutlineRows([], [r("new", null, "precious")], new Set())), ["precious"]);
+  eq("nothing local → the server's list, as-is",
+     view(mergeOutlineRows([r("s1", "t1", "from server")], [], new Set())), ["from server"]);
+}
+
+group("mergeOutlineRows — keys, so the caret's DOM node survives");
+{
+  const current = [r("k1", "t1", "one"), r("k2", "t2", "two")];
+  const seeded = [r("s1", "t1", "one"), r("s2", "t2", "two")];
+  eq("matching fields keep MY keys", keys(mergeOutlineRows(seeded, current, new Set())), ["k1", "k2"]);
+  eq("a row only the server has takes the server's key",
+     keys(mergeOutlineRows([...seeded, r("s3", "t3", "new")], current, new Set())), ["k1", "k2", "s3"]);
+}
+
+group("mergeOutlineRows — text: whose wins");
+{
+  const current = [r("k1", "t1", "mine, unsaved"), r("k2", "t2", "untouched")];
+  const seeded = [r("s1", "t1", "theirs"), r("s2", "t2", "theirs too")];
+  eq("unprotected → the server's text lands",
+     view(mergeOutlineRows(seeded, current, new Set())), ["theirs", "theirs too"]);
+  eq("protected field → my text stays",
+     view(mergeOutlineRows(seeded, current, new Set(["t1"]))), ["mine, unsaved", "theirs too"]);
+  eq("protection is per field, not per list",
+     view(mergeOutlineRows(seeded, current, new Set(["t2"]))), ["theirs", "untouched"]);
+  eq("focus alone does not protect text (the caller adds the field)",
+     view(mergeOutlineRows(seeded, current, new Set(), "k1")), ["theirs", "theirs too"]);
+}
+
+group("mergeOutlineRows — structure is the server's");
+{
+  eq("a peer's nesting applies, my text is protected",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "parent"), r("s2", "t2", "now a child", 1)],
+       [r("k1", "t1", "parent"), r("k2", "t2", "mine", 0)],
+       new Set(["t2"]))),
+     ["parent", "  mine"]);
+  eq("a peer's reorder applies and keys follow their rows",
+     keys(mergeOutlineRows(
+       [r("s2", "t2", "two"), r("s1", "t1", "one")],
+       [r("k1", "t1", "one"), r("k2", "t2", "two")],
+       new Set())),
+     ["k2", "k1"]);
+  eq("a peer's outdent applies",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "p"), r("s2", "t2", "promoted", 0)],
+       [r("k1", "t1", "p"), r("k2", "t2", "promoted", 1)],
+       new Set())),
+     ["p", "promoted"]);
+}
+
+group("mergeOutlineRows — deletes: apply a peer's, never your own work");
+{
+  const current = [r("k1", "t1", "stays"), r("k2", "t2", "goes")];
+  const seeded = [r("s1", "t1", "stays")];
+  eq("a confirmed row the server dropped is a peer delete",
+     view(mergeOutlineRows(seeded, current, new Set())), ["stays"]);
+  eq("…but NOT the row the caret is in (the invariant)",
+     view(mergeOutlineRows(seeded, current, new Set(), "k2")), ["stays", "goes"]);
+  eq("…and NOT a task we created that the server hasn't echoed",
+     view(mergeOutlineRows(seeded, current, new Set(), null, new Set(["t2"]))), ["stays", "goes"]);
+  eq("keepFields naming a field the server HAS makes no duplicate",
+     view(mergeOutlineRows([r("s1", "t1", "stays"), r("s2", "t2", "goes")], current, new Set(), null, new Set(["t2"]))),
+     ["stays", "goes"]);
+  eq("everything deleted while I hold a row → just my row",
+     view(mergeOutlineRows([], current, new Set(), "k2")), ["goes"]);
+}
+
+group("mergeOutlineRows — pending rows land where they were");
+{
+  eq("trailing composer stays trailing when a peer appends",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first"), r("s2", "t2", "peer's new task")],
+       [r("k1", "t1", "first"), r("blank", null, "")],
+       new Set(), "blank")),
+     ["first", "peer's new task", "task…"]);
+  eq("a line opened mid-list stays mid-list",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first"), r("s2", "t2", "second"), r("s3", "t3", "appended")],
+       [r("k1", "t1", "first"), r("blank", null, ""), r("k2", "t2", "second")],
+       new Set(), "blank")),
+     ["first", "task…", "second", "appended"]);
+  eq("typed pending row keeps its slot",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first"), r("s2", "t2", "second")],
+       [r("k1", "t1", "first"), r("new", null, "typed"), r("k2", "t2", "second")],
+       new Set())),
+     ["first", "typed", "second"]);
+  eq("typed at the very top leads",
+     view(mergeOutlineRows([r("s1", "t1", "a")], [r("new", null, "top"), r("k1", "t1", "a")], new Set())),
+     ["top", "a"]);
+  eq("composer lands after a whole subtree, not inside it",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "parent"), r("s2", "t2", "kid", 1), r("s3", "t3", "grandkid", 2)],
+       [r("k1", "t1", "parent"), r("blank", null, "")],
+       new Set(), "blank")),
+     ["parent", "  kid", "    grandkid", "task…"]);
+  eq("a nested pending row stays nested",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "parent"), r("s2", "t2", "kid", 1)],
+       [r("k1", "t1", "parent"), r("k2", "t2", "kid", 1), r("new", null, "sibling", 1)],
+       new Set(), "new")),
+     ["parent", "  kid", "  sibling"]);
+  eq("its follower was deleted by a peer → falls to the end rather than vanishing",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first")],
+       [r("k1", "t1", "first"), r("new", null, "typed"), r("k2", "t2", "deleted by peer")],
+       new Set())),
+     ["first", "typed"]);
+  eq("two pending rows keep their relative order",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first")],
+       [r("k1", "t1", "first"), r("n1", null, "one"), r("n2", null, "two")],
+       new Set())),
+     ["first", "one", "two"]);
+  eq("blank rows nobody is in are not preserved",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "first")],
+       [r("k1", "t1", "first"), r("b1", null, ""), r("b2", null, "")],
+       new Set())),
+     ["first"]);
+}
+
+group("mergeOutlineRows — descriptions");
+{
+  eq("a peer's new description appears under its owner",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "peer wrote this", 1, true)],
+       [r("k1", "t1", "task")],
+       new Set())),
+     ["task", "  // peer wrote this"]);
+  eq("a peer clearing a description removes the row",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "was here", 1, true)],
+       new Set())),
+     ["task"]);
+  eq("MY unsaved description survives (the server has none yet)",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "typing now", 1, true)],
+       new Set(["t1#desc"]), "d1")),
+     ["task", "  // typing now"]);
+  eq("…and keeps its key so the caret lives",
+     keys(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "typing now", 1, true)],
+       new Set(["t1#desc"]), "d1")),
+     ["k1", "d1"]);
+  eq("an unsaved description of an UNCONFIRMED task survives too",
+     view(mergeOutlineRows(
+       [],
+       [r("k1", "t1", "just created"), r("d1", null, "and described", 1, true)],
+       new Set(), "d1", new Set(["t1"]))),
+     ["just created", "  // and described"]);
+  eq("a blank description nobody is in is dropped",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task")],
+       [r("k1", "t1", "task"), r("d1", null, "   ", 1, true)],
+       new Set())),
+     ["task"]);
+  eq("description sits between parent and children, never after them",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "desc", 1, true), r("s2", "t2", "kid", 1)],
+       [r("k1", "t1", "task"), r("d1", null, "desc", 1, true), r("k2", "t2", "kid", 1)],
+       new Set())),
+     ["task", "  // desc", "  kid"]);
+  eq("protecting the title does NOT protect the description",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "server title"), r("sd", null, "server desc", 1, true)],
+       [r("k1", "t1", "my title"), r("d1", null, "my desc", 1, true)],
+       new Set(["t1"]))),
+     ["my title", "  // server desc"]);
+  eq("two local desc rows for one task collapse to the canonical single row",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "l1\nl2", 1, true)],
+       [r("k1", "t1", "task"), r("d1", null, "l1", 1, true), r("d2", null, "l2", 1, true)],
+       new Set())),
+     ["task", "  // l1\nl2"]);
+  eq("…and when the caret is in the SECOND of them, it is not duplicated",
+     view(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "l1\nl2", 1, true)],
+       [r("k1", "t1", "task"), r("d1", null, "l1", 1, true), r("d2", null, "l2", 1, true)],
+       new Set(), "d2")),
+     ["task", "  // l1\nl2"]);
+  eq("…keeping the FOCUSED row's key, so the caret survives the collapse",
+     keys(mergeOutlineRows(
+       [r("s1", "t1", "task"), r("sd", null, "l1\nl2", 1, true)],
+       [r("k1", "t1", "task"), r("d1", null, "l1", 1, true), r("d2", null, "l2", 1, true)],
+       new Set(), "d2")),
+     ["k1", "d2"]);
+}
+
+group("mergeOutlineRows — hostile inputs must not throw");
+{
+  eq("focusedRowKey naming a row that doesn't exist",
+     view(mergeOutlineRows([r("s1", "t1", "a")], [r("k1", "t1", "a")], new Set(), "ghost")), ["a"]);
+  eq("protectedFields naming an absent field",
+     view(mergeOutlineRows([r("s1", "t1", "a")], [r("k1", "t1", "a")], new Set(["nope"]))), ["a"]);
+  eq("keepFields naming an absent field",
+     view(mergeOutlineRows([r("s1", "t1", "a")], [r("k1", "t1", "a")], new Set(), null, new Set(["nope"]))), ["a"]);
+  eq("a server task with an empty title still renders a row",
+     view(mergeOutlineRows([r("s1", "t1", "")], [], new Set())), ["task…"]);
+  eq("duplicate keys on the local side don't multiply rows",
+     mergeOutlineRows([r("s1", "t1", "a")], [r("dup", "t1", "a"), r("dup", null, "")], new Set()).length, 1);
+}
+
+group("mergeOutlineRows — idempotence (the property that stops runaway growth)");
+{
+  const scenarios: [string, OutlineRow[], OutlineRow[], Set<string>, string | null, Set<string>][] = [
+    ["empty everything", [], [], new Set(), null, new Set()],
+    ["server emptied, blank focused", [], [r("mine", null, "")], new Set(), "mine", new Set()],
+    ["server emptied, typed row", [], [r("n", null, "text")], new Set(), null, new Set()],
+    ["peer appended", [r("s1", "t1", "a"), r("s2", "t2", "b")], [r("k1", "t1", "a"), r("blank", null, "")], new Set(), "blank", new Set()],
+    ["mid-list composer", [r("s1", "t1", "a"), r("s2", "t2", "b")], [r("k1", "t1", "a"), r("blank", null, ""), r("k2", "t2", "b")], new Set(), "blank", new Set()],
+    ["nested tree + desc", [r("s1", "t1", "p"), r("sd", null, "d", 1, true), r("s2", "t2", "k", 1)], [r("k1", "t1", "p"), r("d1", null, "d", 1, true), r("k2", "t2", "k", 1), r("blank", null, "")], new Set(), "blank", new Set()],
+    ["unconfirmed subtask", [r("s1", "t1", "p")], [r("k1", "t1", "p"), r("k2", "t2", "sub", 1)], new Set(["t2"]), "k2", new Set(["t2"])],
+    ["unsaved description", [r("s1", "t1", "p")], [r("k1", "t1", "p"), r("d1", null, "typing", 1, true)], new Set(["t1#desc"]), "d1", new Set()],
+    ["peer deleted my focused row", [r("s1", "t1", "a")], [r("k1", "t1", "a"), r("k2", "t2", "gone")], new Set(), "k2", new Set()],
+    ["everything at once", [r("s1", "t1", "a"), r("s3", "t3", "c", 1)], [r("k1", "t1", "a"), r("n", null, "typed"), r("k2", "t2", "unconfirmed"), r("blank", null, "")], new Set(["t2"]), "blank", new Set(["t2"])],
+  ];
+  for (const [name, seeded, current, prot, focus, keep] of scenarios) {
+    const once = mergeOutlineRows(seeded, current, prot, focus, keep);
+    const twice = mergeOutlineRows(seeded, once, prot, focus, keep);
+    const thrice = mergeOutlineRows(seeded, twice, prot, focus, keep);
+    eq(`stable: ${name}`, JSON.stringify([twice, thrice]), JSON.stringify([once, once]));
+  }
+  // The runaway Ben actually saw: a peer wipes the list while my blank row is
+  // focused, and every refresh re-ran the merge.
+  let rows: OutlineRow[] = [r("mine", null, "")];
+  const counts = new Set<number>();
+  for (let i = 0; i < 50; i++) {
+    rows = mergeOutlineRows([], rows, new Set(), "mine");
+    counts.add(rows.length);
+  }
+  eq("50 merges over an emptied list never grow", [...counts], [1]);
+  eq("…and it is still my row", keys(rows), ["mine"]);
+}
+
+group("mergeOutlineRows — scale sanity");
+{
+  const seeded: OutlineRow[] = [];
+  const current: OutlineRow[] = [];
+  for (let i = 0; i < 300; i++) {
+    seeded.push(r(`s${i}`, `t${i}`, `task ${i}`, i % 3));
+    current.push(r(`k${i}`, `t${i}`, `task ${i}`, i % 3));
+  }
+  current.push(r("blank", null, ""));
+  const t0 = process.hrtime.bigint();
+  const merged = mergeOutlineRows(seeded, current, new Set(), "blank");
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  eq("300 rows merge to 301 (all rows + my composer)", merged.length, 301);
+  eq("…keeping local keys", merged[0].key, "k0");
+  eq("…in under 50ms", ms < 50, true);
+}
+
+/* -------------------------------- locking ------------------------------- */
+
+group("resolveRowLock — ownership from presence alone");
+{
+  const NOW = 1_000_000;
+  const c = (
+    id: number,
+    name: string,
+    field: string,
+    since: number,
+    typingAt = since,
+    override?: string,
+  ): RowClaim => ({ id, name, color: `#${id}`, field, since, typingAt, override });
+
+  eq("nobody in the row", resolveRowLock("t1", [], 1, NOW).state, "free");
+  eq("no field at all", resolveRowLock(null, [c(2, "B", "t1", NOW)], 1, NOW).state, "free");
+  eq("claims on other rows are irrelevant", resolveRowLock("t2", [c(2, "B", "t1", NOW)], 1, NOW).state, "free");
+  eq("a title lock does not lock the description",
+     resolveRowLock("t1#desc", [c(2, "B", "t1", NOW)], 1, NOW).state, "free");
+  eq("only me → mine, nobody waiting",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW)], 1, NOW), { state: "mine", waiting: [] });
+
+  const both = [c(1, "Me", "t1", NOW - 5000, NOW), c(2, "Ben", "t1", NOW - 1000, NOW)];
+  eq("earliest claim owns it", resolveRowLock("t1", both, 1, NOW).state, "mine");
+  eq("…and names who is waiting",
+     (resolveRowLock("t1", both, 1, NOW) as { waiting: { name: string }[] }).waiting.map((w) => w.name),
+     ["Ben"]);
+  eq("the later arrival sees a live peer lock",
+     resolveRowLock("t1", both, 2, NOW), { state: "peer", owner: { name: "Me", color: "#1" }, live: true });
+  eq("a third party names the same owner",
+     (resolveRowLock("t1", both, 9, NOW) as { owner: { name: string } }).owner.name, "Me");
+
+  eq("three claimants: two waiting",
+     (resolveRowLock("t1", [...both, c(3, "C", "t1", NOW)], 1, NOW) as { waiting: unknown[] }).waiting.length, 2);
+
+  // Live vs parked.
+  eq("idle beyond PARK_MS → parked (takeable by typing)",
+     resolveRowLock("t1", [c(2, "B", "t1", NOW - 9000, NOW - PARK_MS - 1)], 1, NOW),
+     { state: "peer", owner: { name: "B", color: "#2" }, live: false });
+  eq("exactly at the boundary counts as live",
+     (resolveRowLock("t1", [c(2, "B", "t1", NOW, NOW - PARK_MS)], 1, NOW) as { live: boolean }).live, true);
+  eq("a clock ahead of ours is live, not parked",
+     (resolveRowLock("t1", [c(2, "B", "t1", NOW, NOW + 5000)], 1, NOW) as { live: boolean }).live, true);
+  eq("MY parked claim is still mine (live only matters for peers)",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW - 60_000, NOW - 60_000)], 1, NOW).state, "mine");
+  eq("a peer who never typed is parked from the start",
+     (resolveRowLock("t1", [c(2, "B", "t1", NOW, 0)], 1, NOW) as { live: boolean }).live, false);
+
+  // Takeover.
+  eq("an override beats seniority",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW - 5000, NOW), c(2, "Ben", "t1", NOW - 100, NOW, "t1")], 1, NOW),
+     { state: "peer", owner: { name: "Ben", color: "#2" }, live: true });
+  eq("…and the taker sees it as theirs",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW - 5000, NOW), c(2, "Ben", "t1", NOW - 100, NOW, "t1")], 2, NOW).state,
+     "mine");
+  eq("an override for another field is ignored here",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW - 5000, NOW), c(2, "B", "t1", NOW, NOW, "t9")], 1, NOW).state,
+     "mine");
+  eq("two overrides: the latest intent wins",
+     (resolveRowLock("t1", [c(1, "A", "t1", NOW - 100, NOW, "t1"), c(2, "B", "t1", NOW - 50, NOW, "t1")], 9, NOW) as {
+       owner: { name: string };
+     }).owner.name, "B");
+  eq("overriding a row I already own is a no-op",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW - 5000, NOW, "t1")], 1, NOW).state, "mine");
+  eq("an override on an otherwise free row just claims it",
+     resolveRowLock("t1", [c(1, "Me", "t1", NOW, NOW, "t1")], 1, NOW).state, "mine");
+
+  // Determinism.
+  const tie = [c(7, "Seven", "t1", NOW - 1000, NOW), c(3, "Three", "t1", NOW - 1000, NOW)];
+  eq("identical `since` → lowest connection id owns", resolveRowLock("t1", tie, 3, NOW).state, "mine");
+  eq("…the other yields", resolveRowLock("t1", tie, 7, NOW).state, "peer");
+  eq("…and every client agrees on the name",
+     (resolveRowLock("t1", tie, 9, NOW) as { owner: { name: string } }).owner.name, "Three");
+  eq("claim order in the array does not matter",
+     JSON.stringify(resolveRowLock("t1", [...tie].reverse(), 9, NOW)),
+     JSON.stringify(resolveRowLock("t1", tie, 9, NOW)));
+  eq("zero timestamps are still ordered",
+     (resolveRowLock("t1", [c(5, "Zero", "t1", 0, 0), c(6, "Later", "t1", NOW, NOW)], 9, NOW) as {
+       owner: { name: string };
+     }).owner.name, "Zero");
+}
+
+/* ------------------------------- takeover ------------------------------- */
+// Taking a row means overwriting a field wholesale, so what the taker holds at
+// that instant IS what everyone gets. These are the rules that stop a takeover
+// deleting the previous owner's last sentence.
+{
+  group("takeoverText");
+
+  eq("adopts the shared value, not the local snapshot",
+     takeoverText("their latest", "my stale copy").text, "their latest");
+  eq("…and says it changed", takeoverText("their latest", "my stale copy").changed, true);
+  eq("identical text is not a change (nothing is shown to the user)",
+     takeoverText("same", "same").changed, false);
+  eq("with no keystroke to replay the caret lands at the end",
+     takeoverText("their latest", "x").caret, "their latest".length);
+
+  // The parked path: typing IS the takeover, so that character must survive.
+  eq("an unchanged line replays the keystroke where it was typed",
+     takeoverText("hello world", "hello world", { insert: "X", at: 5 }).text, "helloX world");
+  eq("…with the caret after it",
+     takeoverText("hello world", "hello world", { insert: "X", at: 5 }).caret, 6);
+  eq("a CHANGED line appends instead — an offset into unread text means nothing",
+     takeoverText("they rewrote it", "hello world", { insert: "X", at: 5 }).text,
+     "they rewrote itX");
+  eq("…and the keystroke is never dropped",
+     takeoverText("they rewrote it", "hello world", { insert: "X", at: 5 }).text.includes("X"),
+     true);
+  eq("an offset past the end of their text is clamped, not NaN",
+     takeoverText("hi", "hi", { insert: "!", at: 99 }).text, "hi!");
+  eq("a negative offset is clamped too",
+     takeoverText("hi", "hi", { insert: "!", at: -3 }).text, "!hi");
+  eq("adopting an empty field is not a special case",
+     takeoverText("", "leftovers", { insert: "a", at: 4 }).text, "a");
+}
+
+/* -------------------------------- summary ------------------------------- */
+
+console.log(
+  failures.length
+    ? `\n\x1b[31m${failures.length} failed\x1b[0m, ${passed} passed\n\n${failures.join("\n\n")}\n`
+    : `\n\x1b[32mall ${passed} checks passed\x1b[0m\n`,
+);
+process.exit(failures.length ? 1 : 0);

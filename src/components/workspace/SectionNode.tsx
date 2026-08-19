@@ -19,7 +19,7 @@
  * (`node.content`) trails it inline, dimmed and regular weight.
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
@@ -28,6 +28,12 @@ import type { TaskStatus, Importance } from "@/lib/types";
 import { useWorkspace, type DropPos, type TaskNode } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
 import { refId } from "@/lib/ref-id";
+import { resolveRowLock, type RowClaim, type RowLock } from "./useRowLock";
+
+/** How long a takeover waits for the old owner to yield before going ahead
+ *  anyway. Their tab may be asleep, frozen or gone — a row nobody can take is a
+ *  worse outcome than one taken a beat early. */
+const TAKEOVER_WAIT_MS = 1500;
 import { useEventCallback } from "./useEventCallback";
 import {
   isInboxNode,
@@ -291,6 +297,10 @@ export function SectionNode({
           e.len ?? "",
           o.info?.name ?? "Someone",
           o.info?.color ?? "#888",
+          o.connectionId,
+          e.since ?? 0,
+          e.typingAt ?? 0,
+          e.override ?? "",
         ].join("\u0001");
       })
       .filter(Boolean)
@@ -313,6 +323,24 @@ export function SectionNode({
     return map;
   }, [peerSig]);
 
+  /** Peers' row claims, for `resolveRowLock`. Same string, parsed for ownership
+   *  rather than for drawing. */
+  const peerClaims = useMemo<RowClaim[]>(() => {
+    if (!peerSig) return [];
+    return peerSig.split("\u0002").map((entry) => {
+      const [row, , , name, color, id, since, typingAt, override] = entry.split("\u0001");
+      return {
+        id: Number(id),
+        name,
+        color,
+        field: row,
+        since: Number(since),
+        typingAt: Number(typingAt),
+        override: override || null,
+      };
+    });
+  }, [peerSig]);
+
   // Publish our own caret, throttled — presence is cheap but not free, and a
   // trailing update makes sure the final resting position always lands.
   const [myField, setMyField] = useState<string | null>(null);
@@ -320,18 +348,48 @@ export function SectionNode({
     at: 0,
     timer: null,
   });
+  // The claim behind the lock: `since` is stamped when we ENTER a row (so
+  // seniority is per row, not per keystroke), `typingAt` only when we actually
+  // type (so a parked caret stops blocking), and `override` while we are
+  // deliberately taking a row from someone.
+  const claimRef = useRef<{ field: string | null; since: number; typingAt: number }>({
+    field: null,
+    since: 0,
+    typingAt: 0,
+  });
+  const [override, setOverride] = useState<string | null>(null);
+  const overrideRef = useRef<string | null>(null);
+  useEffect(() => void (overrideRef.current = override), [override]);
   const publishCaret = useCallback(
-    (field: string | null, offset: number, len: number) => {
+    (field: string | null, offset: number, len: number, typed = false) => {
       setMyField(field);
+      const claim = claimRef.current;
+      if (claim.field !== field) {
+        // New row: a fresh claim, and any takeover intent belonged to the old one.
+        claim.field = field;
+        claim.since = Date.now();
+        claim.typingAt = typed ? Date.now() : 0;
+        if (overrideRef.current) {
+          overrideRef.current = null;
+          setOverride(null);
+        }
+      } else if (typed) {
+        claim.typingAt = Date.now();
+      }
       const send = () => {
         caretThrottle.current.at = Date.now();
         updateMyPresence({
           editing: {
             taskId: sectionId,
             field: "outline",
-            row: field ?? undefined,
+            // From the ref, not the captured argument: the throttle can drop a
+            // call, and the send that does go must describe where we are NOW.
+            row: claimRef.current.field ?? undefined,
             caret: offset,
             len,
+            since: claimRef.current.since,
+            typingAt: claimRef.current.typingAt,
+            override: overrideRef.current,
           },
         });
       };
@@ -383,22 +441,199 @@ export function SectionNode({
   // (its own pin); the hook owns the rows, the keys, the autosave and the
   // delete-safety rules. See `useOutlineDraft`.
   const outlineTarget = useMemo(() => ({ canvasSectionId: pin }), [pin]);
-  const { rows, saving, inputRefs, setText, onRowKeyDown, seed, flush } = useOutlineDraft({
-    active: mode === "authoring",
-    units,
-    scopeNodes: sectionNodes,
-    boardId,
-    rootTarget: outlineTarget,
-    // Only broadcast keystrokes when someone else is actually in this outline —
-    // a peer applying a text patch rebuilds every section's unit tree on their
-    // canvas, so it isn't worth paying while you type alone.
-    peersPresent: remoteEditor !== null,
-    onLeave: () => setMode("committed"),
-  });
+  // Do we hold a field? A peer's lock means no — and so does a takeover still in
+  // flight, where the row is claimed but its real text hasn't landed yet. Both
+  // sources are declared below this hook call, so they are read through refs and
+  // the predicate itself never changes identity.
+  const lockForRef = useRef<((field: string | null) => RowLock) | null>(null);
+  const takingFieldRef = useRef<string | null>(null);
+  const ownsFieldStable = useCallback((field: string) => {
+    if (takingFieldRef.current === field) return false;
+    return lockForRef.current?.(field).state !== "peer";
+  }, []);
+  const { rows, saving, inputRefs, setText, onRowKeyDown, seed, flush, adoptField, flushSends } =
+    useOutlineDraft({
+      active: mode === "authoring",
+      units,
+      scopeNodes: sectionNodes,
+      boardId,
+      rootTarget: outlineTarget,
+      // Only broadcast keystrokes when someone else is actually in this outline —
+      // a peer applying a text patch rebuilds every section's unit tree on their
+      // canvas, so it isn't worth paying while you type alone.
+      peersPresent: remoteEditor !== null,
+      // The re-seed protects the row the caret is in; this says when that right
+      // exists. Read through refs, because `lockFor` changes identity on every
+      // presence tick and this must not re-arm anything.
+      ownsField: ownsFieldStable,
+      onLeave: () => setMode("committed"),
+    });
   const enterAuthoring = useCallback(() => {
     seed();
     setMode("authoring");
   }, [seed]);
+
+  /* ---------------- per-row locks ---------------- */
+  // One editor per row at a time. Ownership is resolved from presence alone (see
+  // `useRowLock`), so there is nothing to release: a claim dies with its tab.
+  const myConnId = useSelf((me) => me.connectionId) ?? -1;
+  // A PARKED lock becomes takeable purely by time passing, with no event to
+  // trigger a render — so tick while peers are in this outline, and only then. An
+  // idle canvas must not wake up once a second.
+  const [, tickLocks] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (mode !== "authoring" || !peerClaims.length) return;
+    const t = setInterval(tickLocks, 1000);
+    return () => clearInterval(t);
+  }, [mode, peerClaims.length, tickLocks]);
+
+  const lockFor = useCallback(
+    (field: string | null): RowLock => {
+      const mine: RowClaim[] = myField
+        ? [
+            {
+              id: myConnId,
+              name: "You",
+              color: "#000",
+              field: myField,
+              since: claimRef.current.since,
+              typingAt: claimRef.current.typingAt,
+              override,
+            },
+          ]
+        : [];
+      return resolveRowLock(field, [...peerClaims, ...mine], myConnId, Date.now());
+    },
+    [peerClaims, myField, myConnId, override],
+  );
+
+  // Keep the refs the `ownsField` predicate reads pointed at the live values.
+  useEffect(() => {
+    lockForRef.current = lockFor;
+  }, [lockFor]);
+
+  /** A takeover in progress: claimed, but NOT yet editable. `pending` is the
+   *  keystroke that asked for a parked row, held rather than applied to text we
+   *  were about to replace. */
+  const [taking, setTaking] = useState<{
+    field: string;
+    pending?: { insert: string; at: number };
+  } | null>(null);
+  /** A field whose text was NOT what we thought when we took it — flagged briefly
+   *  so nobody starts typing over a line that rewrote itself. */
+  const [changedField, setChangedField] = useState<string | null>(null);
+
+  /**
+   * Take a row from whoever holds it.
+   *
+   * Deliberately NOT instant. Publishing the claim makes us the owner on the next
+   * render, and if the row went editable there we would be typing over our own
+   * click-time snapshot — the previous owner has kept typing since, and their
+   * characters reach us as patches our focused row refuses to render. So the row
+   * stays read-only through a short "taking over…" beat and only opens once we
+   * hold their current text (`adoptField`, resolved in the effect below).
+   *
+   * The intent is published immediately even so: the point of pressing this is
+   * that the OTHER side finds out now — that is what makes them flush and yield.
+   */
+  const takeOver = useCallback(
+    (field: string, pending?: { insert: string; at: number }) => {
+      const at = Date.now();
+      overrideRef.current = field;
+      setOverride(field);
+      claimRef.current = { field, since: at, typingAt: at };
+      // Synchronously, not in an effect: the draft's re-seed runs before this
+      // component's effects do, and it must not spend a pass protecting a row we
+      // have just declared we don't hold yet.
+      takingFieldRef.current = field;
+      setTaking({ field, pending });
+      updateMyPresence({
+        editing: {
+          taskId: sectionId,
+          field: "outline",
+          row: field,
+          since: at,
+          typingAt: at,
+          override: field,
+        },
+      });
+    },
+    [sectionId, updateMyPresence],
+  );
+
+  // Completing a takeover. We cannot observe the old owner's flush resolving — but
+  // we do not need to. Their yield path puts the throttled keystrokes on the wire
+  // FIRST and drops the claim second (see the yield effect below), so their claim
+  // disappearing means their last characters are already ahead of it and
+  // `taskMap` has them. That is the signal, and it costs one hop, not one write.
+  //
+  // The timeout is not a nicety: a frozen, sleeping or offline tab never yields,
+  // and a row that can never be taken is worse than a stale one.
+  useEffect(() => {
+    if (!taking) return;
+    const done = () => {
+      const { changed } = adoptField(taking.field, taking.pending);
+      takingFieldRef.current = null;
+      setTaking(null);
+      if (changed) setChangedField(taking.field);
+    };
+    if (!peerClaims.some((c) => c.field === taking.field)) {
+      done();
+      return;
+    }
+    const t = setTimeout(done, TAKEOVER_WAIT_MS);
+    return () => clearTimeout(t);
+  }, [taking, peerClaims, adoptField]);
+
+  // Clear the "this line changed" flag on its own timer, so it never outlives the
+  // moment it is explaining.
+  useEffect(() => {
+    if (!changedField) return;
+    const t = setTimeout(() => setChangedField(null), 4000);
+    return () => clearTimeout(t);
+  }, [changedField]);
+
+  // Yielding: a peer has named OUR row in their `override`.
+  //
+  // Two things have to happen, and their ORDER is the whole point. The taker is
+  // sitting read-only waiting for our last characters, and what tells them we are
+  // done is our claim disappearing — so the characters must be on the wire before
+  // the claim goes, or they would start typing over the tail of our sentence.
+  //
+  //   1. `flushSends()` — synchronous, puts the throttled keystrokes into a
+  //      `task-patch` broadcast the taker applies with no DB read. THEN release
+  //      the claim. One hop, so the handover feels immediate.
+  //   2. `flush()` — the Postgres write, awaited only because the notice we show
+  //      afterwards promises the text was saved. The taker never waits on this;
+  //      making them wait would have cost them a second on every takeover.
+  const [yieldedTo, setYieldedTo] = useState<string | null>(null);
+  useEffect(() => {
+    if (mode !== "authoring" || !myField) return;
+    const taker = peerClaims.find((c) => c.override === myField);
+    if (!taker) return;
+    let hide: ReturnType<typeof setTimeout> | null = null;
+    flushSends();
+    void flush().then(() => {
+      setYieldedTo(taker.name);
+      hide = setTimeout(() => setYieldedTo(null), 3000);
+    });
+    // Blurring is what releases our claim (see the blur path in `OutlineEditor`,
+    // which reports a null field), so no separate teardown of `myField` here.
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      [...inputRefs.current.values()].some((node) => node === active)
+    ) {
+      active.blur();
+    }
+    claimRef.current = { field: null, since: 0, typingAt: 0 };
+    updateMyPresence({
+      editing: { taskId: sectionId, field: "outline", since: 0, typingAt: 0, override: null },
+    });
+    return () => {
+      if (hide) clearTimeout(hide);
+    };
+  }, [peerClaims, myField, mode, flush, flushSends, inputRefs, sectionId, updateMyPresence]);
 
 
   /* ---------------- content-driven height ---------------- */
@@ -832,8 +1067,12 @@ export function SectionNode({
             onText={setText}
             onKeyDown={onRowKeyDown}
             peers={peerFields}
-            myField={myField}
             onCaret={publishCaret}
+            lockFor={lockFor}
+            onTakeOver={takeOver}
+            yieldedTo={yieldedTo}
+            takingField={taking?.field ?? null}
+            changedField={changedField}
           />
         ) : (
           <CommittedList

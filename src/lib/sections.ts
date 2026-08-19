@@ -249,9 +249,9 @@ export const masterSectionsByBoard = (
 export const LEGACY_WEEK_LANE_PREFIX = "wk-";
 
 /**
- * The ids of the trays arranged around THIS WEEK — TODAY above, INBOX to its
- * left, BACKLOG and LATER below — which travel together as one rigid unit on
- * the canvas.
+ * The ids of the trays arranged around THIS WEEK — TODAY above, INBOX to THIS
+ * WEEK's left, BACKLOG and LATER below — which travel together as one rigid unit
+ * on the canvas.
  * Grabbing any one of them drags the others along, preserving whatever relative
  * offset they currently sit at (see `onNodePointerDown` in CanvasEditor).
  *
@@ -266,27 +266,17 @@ export const LEGACY_WEEK_LANE_PREFIX = "wk-";
 /**
  * Has a human placed this group by hand?
  *
- * Auto-placement is a convenience for a group nobody has touched — the tray
- * column, and the trays arranged around THIS WEEK. The moment someone drags one,
- * that position is the answer and nothing may recompute it: a layout you
- * arranged and that silently springs back is worse than no layout at all.
+ * Auto-placement is a convenience for an ORDINARY group nobody has touched. The
+ * moment someone drags one, that position is the answer and nothing may
+ * recompute it: a layout you arranged and that silently springs back is worse
+ * than no layout at all.
  *
- * Set on the group you GRABBED, and only that one. The anchored trays travel
- * together, so an earlier version flagged every group in the drag — reasoning
- * that it would be odd for two of them to spring back. The consequence was that
- * one drag of any tray pinned all five at once and killed the arrangement rules
- * permanently: nothing could place TODAY above THIS WEEK or INBOX beside it ever
- * again, and the boxes were left overlapping wherever that drag had put them.
- * Pinning only the grabbed group gives the behaviour that was actually wanted —
- * the whole arrangement moves with your hand, the group you held stays put, and
- * the others go on being arranged around it.
- *
- * Reads `data.placed`, not the old `data.pinned`: rows written under the
- * every-group rule carry a `pinned` that means something this code no longer
- * means, and there is no way to tell those apart from a deliberate one. The
- * reconciler strips the dead key from its own trays (see `CanvasEditor`) rather
- * than leaving it to confuse the next reader, which is exactly what the
- * long-dead `anchoredToWeek` flag did.
+ * NOT for the machine-managed trays any more (TD2-171). Their positions are all
+ * derived from one stored origin — the head tray's own x/y — and a drag moves
+ * the whole column rigidly, so your hand already IS the stored truth and there
+ * is nothing to opt out of. A per-tray flag there was actively harmful: a
+ * flagged tray stopped being arranged while `computeGroupLayout` went on growing
+ * its box, so it grew straight through its neighbour's frame.
  *
  * The flag lives in Liveblocks storage alongside x/y, so it is SHARED — one
  * arrangement everyone sees, not a per-viewer preference.
@@ -294,10 +284,13 @@ export const LEGACY_WEEK_LANE_PREFIX = "wk-";
 export const isPinnedGroup = (n: Pick<CanvasNode, "data">): boolean =>
   n.data?.placed === true;
 
-/** Keys a group may carry that no longer mean anything: `pinned` from the
+/** Keys a TRAY may carry that no longer mean anything: `pinned` from the
  *  every-group-in-the-drag rule, `anchoredToWeek` from an opt-in anchor that was
- *  deleted years of commits ago and read nowhere. */
-export const DEAD_GROUP_KEYS = ["pinned", "anchoredToWeek"] as const;
+ *  deleted years of commits ago and read nowhere, and `placed` from when a tray
+ *  could opt out of the arrangement — left on, it's what lets a tray overlap its
+ *  neighbour (TD2-171). Swept from the trays only: `placed` still means what it
+ *  says on a group you made yourself. */
+export const DEAD_GROUP_KEYS = ["pinned", "anchoredToWeek", "placed"] as const;
 
 export function anchoredTrayGroupIds(
   canvasNodes: readonly CanvasNode[],

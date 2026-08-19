@@ -12,6 +12,7 @@ import {
   siblingPositionAt,
   mergeOutlineRows,
   rowFieldKey,
+  takeoverText,
   type TaskUnit,
 } from "@/lib/outline";
 import type { TaskPlacement } from "@/lib/types";
@@ -81,6 +82,7 @@ export function useOutlineDraft({
   boardId,
   rootTarget,
   peersPresent = false,
+  ownsField,
   onLeave,
 }: {
   /** True while the caller is showing text mode — the master switch. */
@@ -99,18 +101,27 @@ export function useOutlineDraft({
    *  the text is pure cost. Presence answers it; default false keeps the
    *  single-user surfaces (the Boards view) cheap. */
   peersPresent?: boolean;
+  /** Whether WE hold a field, per the caller's lock. The live re-seed protects the
+   *  row the caret is in — but only when the caret has a right to be there. Sitting
+   *  in a peer's locked row focuses it too, and protecting THAT freezes their line
+   *  at your click-time snapshot. Absent = single-user surface, everything owned. */
+  ownsField?: (field: string) => boolean;
   /** Escape in the editor — the caller returns to card mode. */
   onLeave: () => void;
 }) {
   const ws = useWorkspace();
   const peersRef = useRef(peersPresent);
   useEffect(() => void (peersRef.current = peersPresent), [peersPresent]);
+  const ownsFieldRef = useRef(ownsField);
+  useEffect(() => void (ownsFieldRef.current = ownsField), [ownsField]);
   // Kept in refs so the async op paths never close over a stale render.
   const rootTargetRef = useRef(rootTarget);
   const scopeRef = useRef(scopeNodes);
+  const unitsRef = useRef(units);
   useEffect(() => {
     rootTargetRef.current = rootTarget;
     scopeRef.current = scopeNodes;
+    unitsRef.current = units;
   });
   /** Ids this session has seen (baseline + what it created). A delete op naming
    *  anything else is a bug, not a user intent — see `commitStructure`. */
@@ -287,7 +298,7 @@ export function useOutlineDraft({
     sendTimers.current.set(key, { timer, run });
   }, []);
   /** Run every throttled send now. Called before anything that must not lose the
-   *  last character: Esc, leaving text mode, unmount. */
+   *  last character: Esc, leaving text mode, unmount, and yielding a row. */
   const flushSends = useCallback(() => {
     for (const [key, { timer, run }] of [...sendTimers.current]) {
       clearTimeout(timer);
@@ -700,6 +711,64 @@ export function useOutlineDraft({
     }
   };
 
+  /* ---------------- takeover ---------------- */
+
+  /**
+   * Force ONE field's text back to what everyone else has, and hand back whether
+   * that changed anything on screen.
+   *
+   * This is the one place allowed to overwrite the row the caret is in. The live
+   * re-seed deliberately protects that row — re-seeding under someone's fingers
+   * moves their caret mid-word — but the protection keys on focus, and a peer's
+   * LOCKED row is focused the moment you click it while still being read-only. So
+   * a row you are only *waiting* on freezes at its click-time snapshot while its
+   * owner keeps typing. Taking the row without this call means your first
+   * keystroke persists that stale snapshot over their work.
+   *
+   * The value comes from `units` (i.e. `taskMap`), which is already current: the
+   * owner's keystrokes arrive as `task-patch` broadcasts and `applyRemotePatch`
+   * writes them with no DB read. Nothing here waits on Postgres.
+   *
+   * `pending` is the keystroke that TRIGGERED a takeover on a parked row — it was
+   * held rather than applied, because applying it would have written it onto the
+   * stale base. Replayed at its own offset when the text turns out to be
+   * unchanged, and appended when it isn't: the character is never dropped, and
+   * never lands in the middle of a sentence the user hasn't read.
+   */
+  const adoptField = useCallback(
+    (field: string, pending?: { insert: string; at: number }) => {
+      const seeded = unitsToRows(unitsRef.current);
+      const index = seeded.findIndex((_, i) => rowFieldKey(seeded, i) === field);
+      // No server copy of this field (a row whose create is still in flight, or
+      // one a peer just deleted): there is nothing truer than what we have.
+      if (index === -1) return { changed: false, text: null as string | null };
+
+      const current = rowsRef.current;
+      const mineIndex = current.findIndex((_, i) => rowFieldKey(current, i) === field);
+      if (mineIndex === -1) return { changed: false, text: null as string | null };
+
+      const { text, caret, changed } = takeoverText(
+        seeded[index].text,
+        current[mineIndex].text,
+        pending,
+      );
+
+      // Our copy was already current AND nothing to replay — leave the row (and
+      // the caret) exactly as it is rather than churning state for a no-op.
+      if (!changed && !pending) return { changed: false, text };
+
+      // Whatever we had typed here is void: we did not own this field, so it was
+      // never ours to protect from the re-seed.
+      dirtyFieldsRef.current.delete(field);
+      const key = current[mineIndex].key;
+      const next = writeRows((rs) => rs.map((r) => (r.key === key ? { ...r, text } : r)));
+      if (pending) persistText(next, mineIndex);
+      setFocus({ key, caret });
+      return { changed, text };
+    },
+    [persistText, writeRows],
+  );
+
   /* ---------------- flush ---------------- */
 
   /** Everything out now: pending creates, structural ops, and the batched text.
@@ -745,12 +814,18 @@ export function useOutlineDraft({
     const protectedFields = new Set(dirtyFieldsRef.current);
     // Whatever the caret is in, even if untouched — re-seeding it would move the
     // caret under the user's fingers.
+    //
+    // UNLESS a peer holds that field. A read-only row still takes focus when you
+    // click it, so waiting in someone else's locked line would otherwise freeze it
+    // at the moment you clicked while they carried on typing — and then your first
+    // keystroke after taking the row would persist that stale snapshot over their
+    // work. You have no caret to protect in a row you cannot type in.
     const el = document.activeElement;
     const focusedKey = [...inputRefs.current.entries()].find(([, node]) => node === el)?.[0];
     if (focusedKey) {
       const index = current.findIndex((r) => r.key === focusedKey);
       const field = index >= 0 ? rowFieldKey(current, index) : null;
-      if (field) protectedFields.add(field);
+      if (field && (ownsFieldRef.current?.(field) ?? true)) protectedFields.add(field);
     }
 
     // No `[newRow(0)]` fallback here — `mergeOutlineRows` invents the blank row
@@ -812,5 +887,12 @@ export function useOutlineDraft({
     seed,
     /** Send everything pending now (view toggle / Escape / unmount). */
     flush,
+    /** Adopt a field's current shared value before taking the row over. */
+    adoptField,
+    /** Put the throttled keystrokes on the wire NOW, without waiting for the
+     *  Postgres round-trip `flush` also does. This is what a taker needs from us:
+     *  peers apply the broadcast with no DB read, so our last characters reach
+     *  them in one hop instead of one write. */
+    flushSends,
   };
 }

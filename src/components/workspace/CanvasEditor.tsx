@@ -51,6 +51,7 @@ import {
   DEFAULT_PEN_COLOR,
   DEFAULT_PEN_WIDTH,
 } from "./DrawNode";
+import { hullAround, type Hull } from "./trayHull";
 import { uploadCanvasImage } from "./uploadCanvasImage";
 import { CanvasStickyNote, STICKY_WIDTH } from "./CanvasStickyNote";
 import { useWorkspace, type TaskEdit } from "./WorkspaceContext";
@@ -94,6 +95,8 @@ const GRID_STEP = 24;
 const MIN_GRID_PITCH = 12;
 /** Breathing room between the tray hull and the tray boxes it wraps. */
 const TRAY_HULL_PAD = 20;
+/** The hull's corner radius — light, and shrunk per-corner on short runs. */
+const TRAY_HULL_RADIUS = 18;
 
 // 1%, not a "readable" floor: `fitViewport` clamps to MIN_SCALE too, so the
 // floor doubles as a cap on how much canvas a fit can frame — at 0.2 a canvas
@@ -1075,9 +1078,13 @@ export function CanvasEditor({
       // on its neighbours. The reconciler owns these lanes, so it repairs them.
       // Dead flags on this tray's own group: `pinned` meant something else
       // (every group in a drag, which froze the arrangement), `anchoredToWeek`
-      // gated an anchor that no longer exists. Left in place they read as live
-      // state to the next person, which is precisely how `anchoredToWeek` cost a
-      // day of archaeology. The reconciler owns this group, so it cleans it.
+      // gated an anchor that no longer exists, and `placed` used to let a tray
+      // opt out of the arrangement — a tray carrying it keeps its stored y while
+      // its box goes on growing, which is exactly how TODAY ended up overlapping
+      // THIS WEEK (TD2-171). Clearing it is what puts an already-dragged tray
+      // back in the derived column. Left in place they read as live state to the
+      // next person, which is precisely how `anchoredToWeek` cost a day of
+      // archaeology. The reconciler owns this group, so it cleans it.
       if (group && DEAD_GROUP_KEYS.some((k) => k in (group.data ?? {}))) {
         const cleaned = { ...(group.data ?? {}) };
         for (const k of DEAD_GROUP_KEYS) delete cleaned[k];
@@ -1122,82 +1129,80 @@ export function CanvasEditor({
   ]);
 
   /**
-   * Arrange the trays around THIS WEEK — TODAY above it, INBOX to its LEFT,
-   * BACKLOG under it, LATER under BACKLOG — but only for as long as nobody has
-   * said otherwise.
+   * Arrange the tray column: TODAY, THIS WEEK, BACKLOG, LATER stacked downward
+   * with INBOX beside THIS WEEK — every one of them DERIVED from a single stored
+   * origin (TD2-171).
    *
-   * THIS WEEK is the head because it's the one you work out of. The column
-   * around it reads as a timescale: TODAY above (nearest), then this week, then
-   * BACKLOG and LATER as what you push DOWN into. INBOX sits beside the whole
-   * thing because triage is a sideways move — what's arrived, not yet a when.
+   * The origin is the head tray's own x/y. There is exactly one stored position
+   * for the whole column, so no tray's box can ever claim the ground another
+   * tray stands on: growth is absorbed by pushing everything BELOW further down,
+   * which is the only direction that can't collide with something that isn't
+   * derived from it.
+   *
+   * That's the fix for the overlap. It used to be THIS WEEK that owned a stored
+   * y, with TODAY hung ABOVE it (`week.y - today.height`): every card added to
+   * TODAY moved TODAY's top edge up instead of extending it down, and the moment
+   * a tray was dragged it carried `placed` and stopped being arranged at all —
+   * so it went on auto-fitting its height straight through its neighbour's
+   * frame. Two nodes claiming the same y, with nothing to resolve it.
    *
    * The stacking has to be continuous rather than a one-time placement, because
    * `computeGroupLayout` keeps auto-fitting each group's box to its own content
    * forever (a task added, a note expanded, a lane created all grow it), so a
-   * snapshot of the neighbour's height goes stale the moment it grows and the
-   * frames start to overlap.
+   * snapshot of the neighbour's height goes stale the moment it grows.
    *
-   * But continuous derivation must never outrank a human. A group carrying
-   * `pinned` was dragged somewhere deliberately, so this leaves it exactly where
-   * it is and hangs the rest of the stack off its real position. Without that
-   * guard the position is derived rather than stored, dragging BACKLOG snaps it
-   * back on the next render, and — worse — it can be driven by a feedback loop:
-   * the THIS WEEK fallback below used to seed itself from BACKLOG while this
-   * effect seeded BACKLOG from THIS WEEK, which marched the whole trio ~2,100px
-   * down the canvas on every materialisation until it was off-screen (BEN-74).
+   * Moving the column is still yours: the trays travel as one rigid unit on a
+   * drag (see `anchoredTrayGroupIds`), so grabbing ANY of them translates the
+   * head too — the origin follows your hand and the rest re-derive around it,
+   * landing exactly where you dropped them. No per-tray opt-out is needed, and
+   * there's no cycle to run away with (BEN-74): the origin is stored data that
+   * nothing derives from a measured height.
    */
   useEffect(() => {
     if (!nodesMap) return;
-    const week = nodes.find(
-      (n) => n.id === systemGroupId("thisWeek", canvasId),
-    );
-    if (!week) return;
+    // TODAY is the head — the nearest horizon, and the top of the timescale the
+    // column reads as (today → this week → backlog → later, pushing DOWN).
+    const head = nodes.find((n) => n.id === systemGroupId("today", canvasId));
+    if (!head) return;
+    const below = (["thisWeek", "backlog", "later"] as const)
+      .map((kind) => nodes.find((n) => n.id === systemGroupId(kind, canvasId)))
+      .filter((n): n is CanvasNode => n !== undefined);
     const inbox = nodes.find((n) => n.id === systemGroupId("inbox", canvasId));
-    const today = nodes.find((n) => n.id === systemGroupId("today", canvasId));
-    const backlog = nodes.find((n) => n.id === systemGroupId("backlog", canvasId));
-    const later = nodes.find((n) => n.id === systemGroupId("later", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
-    /** Place a group unless a human already has. Returns where it actually
-     *  ended up — pinned or not — so the next one down follows the truth on
-     *  screen rather than where this effect wishes it were. */
-    const place = (
-      group: CanvasNode | undefined,
-      x: number,
-      y: number,
-    ): CanvasNode | null => {
-      if (!group) return null;
-      if (isPinnedGroup(group)) return group;
+    /** Put a derived tray at (x,y). Returns where it ended up so the next one
+     *  down stacks off the truth rather than off a patch that hasn't landed. */
+    const place = (group: CanvasNode, x: number, y: number): CanvasNode => {
       if (group.x !== x || group.y !== y) {
         patches.push({ id: group.id, patch: { x, y } });
       }
       return { ...group, x, y };
     };
-    // RESCUE. The head of the stack is placed once, at creation, and nothing
-    // ever moves it again — so a canvas that ran the old ratcheting code is left
-    // with the trio thousands of px below everything, looking deleted, with no
-    // path back. Pull it home if it has drifted absurdly far and nobody has
-    // claimed its position. `pinned` is the whole safety argument: a group you
-    // put somewhere is exempt no matter how far out it sits.
-    const home = trayColumnBase(nodes, week.id);
-    if (!isPinnedGroup(week) && week.y - home.y > TRAY_DRIFT_LIMIT) {
-      patchMany([{ id: week.id, patch: { x: home.x, y: home.y } }]);
-      return; // BACKLOG/LATER follow on the next pass, off the corrected head
+    // RESCUE. The head's position is stored and nothing but a drag moves it — so
+    // a canvas left over from the old ratcheting code can have the column
+    // thousands of px below everything, looking deleted, with no path back. Pull
+    // it home if it has drifted absurdly far from the user's content.
+    const home = trayColumnBase(nodes, head.id);
+    if (head.y - home.y > TRAY_DRIFT_LIMIT) {
+      patchMany([{ id: head.id, patch: { x: home.x, y: home.y } }]);
+      return; // the rest follow on the next pass, off the corrected head
     }
 
-    // THIS WEEK owns its own position; everything else hangs off it.
-    let above = week;
-    above = place(backlog, above.x, above.y + above.height + TRAY_GAP) ?? above;
-    place(later, above.x, above.y + above.height + TRAY_GAP);
-    // TODAY above, INBOX to the left. Both measured from their OWN size, so a
-    // tray that has grown (every board gets a lane now — TD-138) still sits
-    // flush against THIS WEEK instead of overlapping it or drifting away.
-    //
-    // Anchoring upward is safe here in a way it wasn't for the old fallback:
-    // TODAY's position is derived from `week`, and nothing derives `week` from
-    // TODAY, so growth moves TODAY's top edge and stops. A cycle in that
-    // direction is what marched the whole arrangement off-screen (BEN-74).
-    if (today) place(today, week.x, week.y - today.height - TRAY_GAP);
-    if (inbox) place(inbox, week.x - inbox.width - TRAY_GAP, week.y);
+    // Walk down the column, each tray measured from the one above it.
+    let above = head;
+    const placed = new Map<string, CanvasNode>();
+    for (const g of below) {
+      above = place(g, head.x, above.y + above.height + TRAY_GAP);
+      placed.set(g.id, above);
+    }
+    // INBOX sits beside the column because triage is a sideways move — what's
+    // arrived, not yet a when. It rides THIS WEEK's row, not TODAY's: THIS WEEK
+    // is where triage actually lands most of the time, so the two you compare
+    // while sorting sit side by side. Falls back to the head while THIS WEEK
+    // hasn't been materialised yet, so INBOX is never left unplaced.
+    // Measured from INBOX's OWN width so a tray that has grown still sits flush
+    // against the column instead of overlapping it.
+    const inboxRow = placed.get(systemGroupId("thisWeek", canvasId) ?? "") ?? head;
+    if (inbox) place(inbox, head.x - inbox.width - TRAY_GAP, inboxRow.y);
     if (patches.length) patchMany(patches);
   }, [nodesMap, nodes, canvasId, patchMany]);
 
@@ -2287,11 +2292,17 @@ export function CanvasEditor({
           // one stops being auto-arranged (see `isPinnedGroup`). The others
           // travelled with it and go on being arranged around it — flagging
           // them all is what froze the whole layout after a single drag.
+          //
+          // A TRAY is never flagged (TD2-171): the column travels rigidly and
+          // its head's x/y is the stored origin the rest derive from, so the
+          // drag has already recorded your intent. Flagging one would only let
+          // it drop out of the stack and grow into its neighbour.
+          //
           // Re-read: `node` is a pointerdown snapshot, so merging its `data`
           // would revert anything written during the drag (a peer renaming the
           // group, the reconciler cleaning a dead key).
           const dragged =
-            node.kind === "section_group"
+            node.kind === "section_group" && systemGroupOf(node) === null
               ? (nodesRef.current.find((n) => n.id === node.id) ?? node)
               : null;
           if (dragged && !isPinnedGroup(dragged)) {
@@ -2555,31 +2566,37 @@ export function CanvasEditor({
     return slotCaretRect(g, members, dropSlotIndex, groupLayoutOf(g));
   }, [dropSlotIndex, groupDropTarget, nodes, draggingIds]);
 
-  // The purple hull around the machine-managed trays (INBOX / TODAY / THIS WEEK
-  // / BACKLOG / LATER). Those five travel as one rigid unit when you drag any of
+  // The outline around the machine-managed trays (INBOX / TODAY / THIS WEEK /
+  // BACKLOG / LATER). Those five travel as one rigid unit when you drag any of
   // them (see `anchoredTrayGroupIds`), and nothing on screen said so — the
-  // outline is that fact, drawn. Derived from the trays' live boxes each render,
-  // so it tracks the arrangement (and a re-derived group height) without any
-  // stored state of its own; it is not a node, so it can't be selected, dragged
-  // or deleted.
-  const trayHull = useMemo(() => {
+  // outline is that fact, drawn.
+  //
+  // It follows each tray's SILHOUETTE, not a bounding box over the lot: the
+  // trays are spread across the canvas, so one rectangle around them all would
+  // enclose big empty quadrants and claim those are part of the group.
+  // `hullAround` unions the padded boxes and traces the result, so trays sitting
+  // flush come back as one shape and trays standing apart keep their own.
+  //
+  // Two hulls, because THIS WEEK is drawn in orange while the rest are purple —
+  // it's the row you're actually working out of, so it gets the warm colour the
+  // app already uses for "now". Traced separately (rather than per tray) so
+  // same-coloured trays that touch still merge into one shape.
+  //
+  // Derived from the trays' live boxes each render, so it tracks a drag (and a
+  // re-derived group height) without any stored state of its own; it is not a
+  // node, so it can't be selected, dragged or deleted.
+  const trayHulls = useMemo(() => {
     const ids = anchoredTrayGroupIds(nodes, canvasId);
-    if (ids.size < 2) return null;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of nodes) {
-      if (!ids.has(n.id)) continue;
-      minX = Math.min(minX, n.x);
-      minY = Math.min(minY, n.y);
-      maxX = Math.max(maxX, n.x + (n.width ?? 0));
-      maxY = Math.max(maxY, n.y + (n.height ?? 0));
-    }
-    if (!Number.isFinite(minX)) return null;
-    return {
-      x: minX - TRAY_HULL_PAD,
-      y: minY - TRAY_HULL_PAD,
-      w: maxX - minX + TRAY_HULL_PAD * 2,
-      h: maxY - minY + TRAY_HULL_PAD * 2,
-    };
+    if (ids.size < 2) return [];
+    const weekId = systemGroupId("thisWeek", canvasId);
+    const boxesOf = (want: boolean) =>
+      nodes
+        .filter((n) => ids.has(n.id) && (n.id === weekId) === want)
+        .map((n) => ({ x: n.x, y: n.y, w: n.width ?? 0, h: n.height ?? 0 }));
+    return [
+      { color: "var(--color-accent)", hull: hullAround(boxesOf(false), TRAY_HULL_PAD, TRAY_HULL_RADIUS) },
+      { color: "var(--color-orange)", hull: hullAround(boxesOf(true), TRAY_HULL_PAD, TRAY_HULL_RADIUS) },
+    ].filter((h): h is { color: string; hull: Hull } => h.hull !== null);
   }, [nodes, canvasId]);
 
   // Frames render behind everything (they're backdrops); text + sections layer
@@ -2801,20 +2818,31 @@ export function CanvasEditor({
             opacity: pendingFit ? 0 : undefined,
           }}
         >
-          {/* The trays' shared outline. First sibling with no z-index, so it
-              paints behind every node — a backdrop, never a target
-              (`pointer-events-none` keeps clicks going to the canvas beneath). */}
-          {trayHull ? (
-            <div
-              className="pointer-events-none absolute rounded-2xl border-2 border-accent/40 bg-accent/[0.04]"
-              style={{
-                left: trayHull.x,
-                top: trayHull.y,
-                width: trayHull.w,
-                height: trayHull.h,
-              }}
-            />
-          ) : null}
+          {/* The trays' outlines. First siblings with no z-index, so they paint
+              behind every node — backdrops, never targets
+              (`pointer-events-none` keeps clicks going to the canvas beneath).
+              Each svg is sized to its hull's own bounds and shifted by them, so
+              the path can be written in canvas coordinates; `overflow-visible`
+              leaves room for the stroke, which straddles the path. */}
+          {trayHulls.map(({ color, hull }) => (
+            <svg
+              key={color}
+              aria-hidden="true"
+              className="pointer-events-none absolute overflow-visible"
+              style={{ left: hull.x, top: hull.y, width: hull.w, height: hull.h }}
+              viewBox={`${hull.x} ${hull.y} ${hull.w} ${hull.h}`}
+            >
+              <path
+                d={hull.path}
+                fill={color}
+                fillOpacity={0.04}
+                stroke={color}
+                strokeOpacity={0.5}
+                strokeWidth={3.5}
+                strokeLinejoin="round"
+              />
+            </svg>
+          ))}
 
           {ordered.map((node) => {
             const bid = node.data?.boardId as string | undefined;

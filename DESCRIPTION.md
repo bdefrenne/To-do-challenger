@@ -54,7 +54,13 @@ edit and a human edit go through the exact same door.
   instead of a whole-list diff — which is what makes concurrent edits commute
   instead of overwriting each other. You see who is on which line and **their
   caret**, as a vertical bar at their exact character. Two people in the *same*
-  field is the one case that can't merge: last write wins, and the row says so.
+  field is the one case that can't merge, so that row is **held by one editor at
+  a time** — the claim is just their caret, so it dies with their tab, and a
+  cursor someone parked and walked away from stops blocking after a few seconds.
+  You can always take a line over (**⌘⏎**, or simply type in a parked one); the
+  row stays read-only for the moment that takes, so you inherit its current text
+  rather than typing over a snapshot, and it tells you if the line moved while
+  you waited.
 - **Integrations:** Vercel Blob (pictures), Google Calendar, a Telegram bot.
 
 ## Constraints
