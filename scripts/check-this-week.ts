@@ -37,6 +37,7 @@ import {
   moveTask,
   bulkUpdate,
   deleteTask,
+  purgeTask,
   resolveThisWeekSection,
   resolvePlacementSection,
   getCanvas,
@@ -120,6 +121,15 @@ const stubSection = (id: string, data: Record<string, unknown>): CanvasNode => (
   position: 0,
   data,
 });
+
+/** Cleanup means GONE. DELETE is a soft delete now (TD2-196) — a scratch task
+ *  removed with `deleteTask` alone would sit in the Trash after every run — so
+ *  the checks bin it and then purge it, which is also the two-step the app makes
+ *  a person take. */
+async function scrub(id: string): Promise<void> {
+  await deleteTask(id, ME);
+  await purgeTask(id, ME);
+}
 
 async function main() {
   const roster = await db.select({ id: users.id, email: users.email, name: users.name }).from(users);
@@ -704,7 +714,7 @@ async function cleanup() {
     .returning({ id: canvasNodes.id });
   for (const id of scratch) {
     try {
-      await deleteTask(id, ME);
+      await scrub(id);
     } catch {
       /* best effort */
     }

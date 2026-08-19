@@ -221,6 +221,11 @@ export interface Task {
   /** ISO timestamp a done task was archived (hidden from active views); null
    *  when not archived. Cleared on un-archive or when the task leaves "done". */
   archivedAt?: string | null;
+  /** ISO timestamp the task was DELETED — it's in the Trash, off every active
+   *  view, restorable one press at a time until the bin is emptied. Null when
+   *  the task is live. Sorting the Trash on this is what makes it a bin: newest
+   *  deleted first. */
+  deletedAt?: string | null;
   /** Nested sub-tasks, revealed when the row is expanded. */
   subtasks?: Task[];
   /** Image attachments (pasted or uploaded). */

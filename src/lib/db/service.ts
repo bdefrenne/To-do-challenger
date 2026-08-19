@@ -274,6 +274,7 @@ function rowToTask(
     lockedAt: iso(row.lockedAt) ?? null,
     completedAt: iso(row.completedAt),
     archivedAt: iso(row.archivedAt) ?? null,
+    deletedAt: iso(row.deletedAt) ?? null,
     createdAt: iso(row.createdAt)!,
     updatedAt: iso(row.updatedAt),
     attachments: attachments.length ? attachments : undefined,
@@ -893,15 +894,21 @@ async function attachmentsByTask(
 export async function resolveTaskId(
   handle: string,
   _userId?: string,
+  opts?: { includeTrashed?: boolean },
 ): Promise<string | null> {
   if (!handle) return null;
+  // A task in the Trash resolves to NOTHING, so every id-taking entry point
+  // refuses it without a check of its own: it can't be edited, moved, completed,
+  // commented on or nested under. `restoreTask` / `purgeTask` are the two callers
+  // that pass `includeTrashed` — they're the only operations a deleted task has.
+  const live = opts?.includeTrashed ? undefined : isNull(tasks.deletedAt);
 
   // Fast path: a direct UUID (what most callers already pass).
   const direct = (
     await db
       .select({ id: tasks.id })
       .from(tasks)
-      .where(eq(tasks.id, handle))
+      .where(and(eq(tasks.id, handle), live))
       .limit(1)
   )[0];
   if (direct) return direct.id;
@@ -916,7 +923,7 @@ export async function resolveTaskId(
     await db
       .select({ id: tasks.id })
       .from(tasks)
-      .where(sql`upper(${tasks.ref}) = ${norm}`)
+      .where(and(sql`upper(${tasks.ref}) = ${norm}`, live))
       .limit(1)
   )[0];
   if (locked) return locked.id;
@@ -930,7 +937,7 @@ export async function resolveTaskId(
     db
       .select()
       .from(tasks)
-      .where(and(eq(tasks.seq, seq), eq(tasks.refLocked, false))),
+      .where(and(eq(tasks.seq, seq), eq(tasks.refLocked, false), live)),
     codeCtx(),
   ]);
   const match = seqRows.find((row) => resolvePrefix(row, ctx) === prefix);
@@ -943,7 +950,7 @@ async function ownsTask(id: string, _userId?: string): Promise<boolean> {
     await db
       .select({ id: tasks.id })
       .from(tasks)
-      .where(eq(tasks.id, id))
+      .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
       .limit(1)
   )[0];
   return !!row;
@@ -992,6 +999,10 @@ export interface TaskFilter {
   includeArchived?: boolean;
   /** Return ONLY archived tasks (for the Archived view). Overrides includeArchived. */
   archivedOnly?: boolean;
+  /** Include soft-DELETED tasks alongside live ones (default: excluded). */
+  includeDeleted?: boolean;
+  /** Return ONLY deleted tasks — the Trash view. Overrides includeDeleted. */
+  deletedOnly?: boolean;
   /** DELTA read: only tasks whose `updatedAt` is strictly after this instant
    *  (an ISO timestamp, not a date). Pair it with `listTaskIds` to spot
    *  deletions — see the `?since=` branch of /api/tasks. */
@@ -1106,6 +1117,13 @@ function taskWhere(_userId: string, filter?: TaskFilter): SQL | undefined {
   // powers the Archived view; `includeArchived` returns both.
   if (filter?.archivedOnly) conds.push(isNotNull(tasks.archivedAt));
   else if (!filter?.includeArchived) conds.push(isNull(tasks.archivedAt));
+  // Deleted tasks are in the Trash, which is nowhere: they leave every active
+  // read here (this is the one WHERE the board, table, kanban, search, digests
+  // and delta syncs all share) and come back only via `deletedOnly`, which is
+  // what the Trash view asks for. `resolveTaskId` is the matching fence on the
+  // write side — see `deleteTask`.
+  if (filter?.deletedOnly) conds.push(isNotNull(tasks.deletedAt));
+  else if (!filter?.includeDeleted) conds.push(isNull(tasks.deletedAt));
 
   if (filter?.includeDone === false) conds.push(ne(tasks.status, "done"));
 
@@ -1332,7 +1350,11 @@ export async function getTask(
       db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(asc(taskAttachments.createdAt)),
       db.select().from(taskNotes).where(eq(taskNotes.taskId, id)).orderBy(asc(taskNotes.createdAt)),
       db.select().from(taskCommits).where(eq(taskCommits.taskId, id)).orderBy(asc(taskCommits.createdAt)),
-      db.select().from(tasks).where(eq(tasks.parentId, id)).orderBy(...TASK_ORDER),
+      db
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.parentId, id), isNull(tasks.deletedAt)))
+        .orderBy(...TASK_ORDER),
       codeCtx(userId),
     ]);
   const cCount = logRows.filter((l) => l.kind === "comment").length;
@@ -1450,6 +1472,7 @@ async function nextPosition(
     .where(
       and(
         eq(tasks.status, status),
+        isNull(tasks.deletedAt),
         parentId === null
           ? sql`${tasks.parentId} is null`
           : eq(tasks.parentId, parentId),
@@ -2121,18 +2144,18 @@ async function openDescendants(
   // depth cap still ride as bound parameters via the embedded `inArray`.
   const res = await db.execute(sql`
     WITH RECURSIVE sub AS (
-      SELECT id, parent_id, title, status, archived_at, position, created_at,
-             parent_id AS root_id, 1 AS depth
+      SELECT id, parent_id, title, status, archived_at, deleted_at, position,
+             created_at, parent_id AS root_id, 1 AS depth
         FROM ${tasks}
        WHERE ${inArray(tasks.parentId, rootIds)}
       UNION ALL
-      SELECT c.id, c.parent_id, c.title, c.status, c.archived_at, c.position,
-             c.created_at, sub.root_id, sub.depth + 1
+      SELECT c.id, c.parent_id, c.title, c.status, c.archived_at, c.deleted_at,
+             c.position, c.created_at, sub.root_id, sub.depth + 1
         FROM ${tasks} c JOIN sub ON c.parent_id = sub.id
        WHERE sub.depth < ${MAX_SUBTREE_DEPTH}
     )
     SELECT root_id, id, title, status, depth FROM sub
-     WHERE status <> 'done' AND archived_at IS NULL
+     WHERE status <> 'done' AND archived_at IS NULL AND deleted_at IS NULL
      ORDER BY depth DESC, position, created_at, id
   `);
   const rows = (res as unknown as { rows: Record<string, unknown>[] }).rows ?? [];
@@ -2418,6 +2441,7 @@ export async function archiveAllDone(
   const conds: (SQL | undefined)[] = [
     eq(tasks.status, "done"),
     isNull(tasks.archivedAt),
+    isNull(tasks.deletedAt),
   ];
   if (scope.boardId) conds.push(eq(tasks.boardId, scope.boardId));
   if (scope.projectId) conds.push(eq(tasks.projectId, scope.projectId));
@@ -2455,52 +2479,186 @@ export async function addComment(
   return { id: row.id, at: iso(row.at)!, kind: "comment", message: row.message };
 }
 
-/** Delete a task (cascades to its logs + attachment rows; subtasks are
- *  re-parented to top, and re-positioned at the end of their new root group).
- *  Blob objects are cleaned up first, since the DB cascade drops the rows but
- *  not the files in Vercel Blob. */
-export async function deleteTask(handle: string, userId: string): Promise<boolean> {
+/**
+ * DELETE a task — into the Trash, not out of Postgres (TD2-196).
+ *
+ * The row stays exactly where it is and keeps its id, its ref, its logs, its
+ * attachments and its place in the tree; `deletedAt` is what takes it off every
+ * surface. Two fences make that stick, and they're the same two archiving uses:
+ * `taskWhere` drops it from every list/search/digest read, and `resolveTaskId`
+ * refuses its handle, so no later write can touch a task that's in the bin.
+ *
+ * Cascades over the SUBTREE, like `archiveTask`. Deleting a parent used to
+ * promote its children to top level, which is the only thing you can do when the
+ * parent is about to stop existing — but it loses the shape of the work, and
+ * there's nothing to promote them back into on the way out. Now the branch goes
+ * in whole and `restoreTask` brings it back whole.
+ *
+ * Nothing here is irreversible: `purgeTask` / `emptyTrash` are the only calls
+ * that drop rows and blobs, and they only accept a task that's already in the
+ * Trash.
+ */
+export async function deleteTask(
+  handle: string,
+  userId: string,
+  author = "You",
+): Promise<boolean> {
   const id = await resolveTaskId(handle, userId);
   if (!id) return false;
-  const attachmentRows = await db
+  const now = new Date();
+  // `deleted_at IS NULL` on the UPDATE so a descendant already in the bin keeps
+  // the stamp it went in with — its own row in the Trash, its own place in the
+  // "deleted at" order.
+  await db.execute(sql`
+    WITH RECURSIVE sub AS (
+      SELECT ${id}::text AS id
+      UNION ALL
+      SELECT t.id FROM ${tasks} t JOIN sub ON t.parent_id = sub.id
+    )
+    UPDATE ${tasks} SET deleted_at = ${now}, updated_at = ${now}
+    WHERE id IN (SELECT id FROM sub) AND deleted_at IS NULL
+  `);
+  await log(id, "updated", "Deleted — moved to Trash", author);
+  return true;
+}
+
+/**
+ * Bring a task back from the Trash, with its subtree.
+ *
+ * A restore has to land somewhere VISIBLE, and there's one way it wouldn't: the
+ * task's parent may still be in the bin (a child can be restored on its own, by
+ * handle, from the API or MCP), and the boards only render a task whose parent is
+ * present. So a restored task with a trashed parent is un-nested to top level and
+ * re-positioned at the end of its status group — the same repair `deleteTask`
+ * used to do on the way out, now on the way back in, where it's recoverable.
+ */
+export async function restoreTask(
+  handle: string,
+  userId: string,
+  author = "You",
+): Promise<TaskDTO | null> {
+  const id = await resolveTaskId(handle, userId, { includeTrashed: true });
+  if (!id) return null;
+  const current = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
+  if (!current) return null;
+  if (!current.deletedAt) return rowToTask(current, 0, undefined, await codeCtx(userId));
+
+  const now = new Date();
+  await db.execute(sql`
+    WITH RECURSIVE sub AS (
+      SELECT ${id}::text AS id
+      UNION ALL
+      SELECT t.id FROM ${tasks} t JOIN sub ON t.parent_id = sub.id
+    )
+    UPDATE ${tasks} SET deleted_at = NULL, updated_at = ${now}
+    WHERE id IN (SELECT id FROM sub)
+  `);
+
+  let orphaned = false;
+  if (current.parentId) {
+    const parent = (
+      await db
+        .select({ deletedAt: tasks.deletedAt })
+        .from(tasks)
+        .where(eq(tasks.id, current.parentId))
+    )[0];
+    if (!parent || parent.deletedAt) {
+      orphaned = true;
+      await db
+        .update(tasks)
+        .set({
+          parentId: null,
+          position: await nextPosition(userId, current.status, null),
+          updatedAt: now,
+        })
+        .where(eq(tasks.id, id));
+    }
+  }
+
+  await log(
+    id,
+    "updated",
+    `Restored from Trash${orphaned ? " · un-nested to top level (its parent is still deleted)" : ""}`,
+    author,
+  );
+  const [counts, ctx] = await Promise.all([commentCounts(userId), codeCtx(userId)]);
+  const row = (await db.select().from(tasks).where(eq(tasks.id, id)))[0];
+  return row ? rowToTask(row, counts.get(id) ?? 0, undefined, ctx) : null;
+}
+
+/** The ids in a task's subtree, itself included — one statement, any depth. */
+async function subtreeIds(id: string): Promise<string[]> {
+  const res = await db.execute(sql`
+    WITH RECURSIVE sub AS (
+      SELECT ${id}::text AS id
+      UNION ALL
+      SELECT t.id FROM ${tasks} t JOIN sub ON t.parent_id = sub.id
+    )
+    SELECT id FROM sub
+  `);
+  const rows = (res as unknown as { rows: Record<string, unknown>[] }).rows ?? [];
+  return rows.map((r) => String(r.id));
+}
+
+/** Drop the Vercel Blob objects behind a set of tasks' attachments. The DB
+ *  cascade takes the rows; the files are ours to clean up. */
+async function purgeBlobs(ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  const rows = await db
     .select({ url: taskAttachments.url })
     .from(taskAttachments)
-    .where(eq(taskAttachments.taskId, id));
-  if (attachmentRows.length) {
-    await delBlobs(attachmentRows.map((a) => a.url));
-  }
-  // Subtasks outlive their parent, but a subtask's `position` was allocated
-  // INSIDE the parent's group — it means "3rd under that parent", nothing at all
-  // at root level. Promoting it as-is drops the orphan into the middle of its
-  // section's ordering, next to unrelated tasks. So re-stamp each one at the end
-  // of the root group it's joining; positions are per (status, parent), hence a
-  // separate running counter per status.
-  const orphans = await db
-    .select({ id: tasks.id, status: tasks.status })
-    .from(tasks)
-    .where(eq(tasks.parentId, id))
-    .orderBy(...TASK_ORDER);
-  if (orphans.length) {
-    const nextByStatus = new Map<TaskStatus, number>();
-    for (const status of new Set(orphans.map((o) => o.status)))
-      nextByStatus.set(status, await nextPosition(userId, status, null));
-    const [first, ...rest] = orphans.map((o) => {
-      const position = nextByStatus.get(o.status)!;
-      nextByStatus.set(o.status, position + 1);
-      return db
-        .update(tasks)
-        .set({ parentId: null, position })
-        .where(eq(tasks.id, o.id));
-    });
-    // One atomic HTTP transaction (the neon-http driver has no interactive
-    // ones), so a partial promotion can't leave orphans on a stale position.
-    await db.batch([first, ...rest]);
-  }
-  const res = await db
-    .delete(tasks)
-    .where(eq(tasks.id, id))
-    .returning();
+    .where(inArray(taskAttachments.taskId, ids));
+  if (rows.length) await delBlobs(rows.map((a) => a.url));
+}
+
+/**
+ * Delete a task FOREVER — rows, logs, attachment rows and blobs, whole subtree.
+ *
+ * Only from the Trash: permanent deletion is the second of two deliberate steps,
+ * and requiring the first one is what stops a stray DELETE (a keypress, a bulk
+ * op, an agent) from being unrecoverable. It also means the subtree this drops is
+ * one a person has already seen listed in the bin.
+ */
+export async function purgeTask(handle: string, userId: string): Promise<boolean> {
+  const id = await resolveTaskId(handle, userId, { includeTrashed: true });
+  if (!id) return false;
+  const current = (
+    await db.select({ deletedAt: tasks.deletedAt }).from(tasks).where(eq(tasks.id, id))
+  )[0];
+  if (!current) return false;
+  if (!current.deletedAt)
+    throw new ValidationError(
+      "Only a deleted task can be deleted forever — delete it first, then empty it from the Trash",
+    );
+  const ids = await subtreeIds(id);
+  await purgeBlobs(ids);
+  const res = await db.delete(tasks).where(inArray(tasks.id, ids)).returning({ id: tasks.id });
   return res.length > 0;
+}
+
+/**
+ * EMPTY THE TRASH — the big button. Every deleted task in scope (a board, a
+ * project, or everywhere when no scope is given) is gone for good. Returns how
+ * many rows were dropped.
+ *
+ * One pass over `deleted_at IS NOT NULL` rather than a walk per subtree: deleting
+ * cascades, and a live task can never sit under a deleted one (`resolveTaskId`
+ * won't resolve a trashed parent to nest under), so the trashed set IS whole
+ * subtrees and can be dropped in a single statement.
+ */
+export async function emptyTrash(
+  userId: string,
+  scope: { boardId?: string; projectId?: string } = {},
+): Promise<number> {
+  const conds: (SQL | undefined)[] = [isNotNull(tasks.deletedAt)];
+  if (scope.boardId) conds.push(eq(tasks.boardId, scope.boardId));
+  if (scope.projectId) conds.push(eq(tasks.projectId, scope.projectId));
+  const rows = await db.select({ id: tasks.id }).from(tasks).where(and(...conds));
+  if (!rows.length) return 0;
+  const ids = rows.map((r) => r.id);
+  await purgeBlobs(ids);
+  const res = await db.delete(tasks).where(inArray(tasks.id, ids)).returning({ id: tasks.id });
+  return res.length;
 }
 
 /* -------------------------------------------------------------------- */
@@ -3704,6 +3862,9 @@ export async function listCompletions(
       and(
         eq(taskStatusEvents.toStatus, "done"),
         ...effectiveWindow(w, tz),
+        // Archived work still shipped (see above) — deleted work is in the Trash,
+        // which is off every surface until it's restored.
+        isNull(tasks.deletedAt),
         // A board-less task in a project still carries `projectId`, so this is
         // the right column rather than a join through boards.
         opts.projectId ? eq(tasks.projectId, opts.projectId) : undefined,
@@ -4162,6 +4323,7 @@ export async function listOpenDays(
         and(
           eq(taskStatusEvents.creditedTo, userId),
           eq(tasks.projectId, projectId),
+          isNull(tasks.deletedAt),
           sql`${taskStatusEvents.at} >= ${from}`,
         ),
       ),

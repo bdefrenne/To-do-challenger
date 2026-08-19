@@ -67,6 +67,16 @@ of the RYDR board set.)
 - A project's/board's description lives in `DESCRIPTION.md` in its repo and
   mirrors the app; keep the two in sync (see above). This is the *description*
   layer — distinct from this instructions file.
+- **Deleting is soft (TD2-196).** `tasks.deletedAt` means "in the Trash". Two
+  fences keep it off every surface, and a new read path must go through one of
+  them rather than filtering for itself: `taskWhere` (every list/search/digest
+  read) and `resolveTaskId` (every write, which is why a trashed task simply
+  can't be edited). A query that builds its own WHERE on `tasks` — a recursive
+  subtree CTE, a join from `task_status_events` — has to add
+  `deleted_at IS NULL` itself; `purgeTask` / `emptyTrash` are the only calls that
+  drop rows, and they refuse anything not already in the Trash. Scripts that make
+  scratch tasks must PURGE them (see `scrub` in the check scripts) or the bin
+  fills up with test residue.
 - **Visual-review notes.** When Ben asks you to flag something for a later
   visual check, add a `review`-type note to the relevant task
   (`add_note type:"review"`). Never add review notes on your own initiative —

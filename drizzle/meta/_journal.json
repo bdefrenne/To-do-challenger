@@ -239,6 +239,13 @@
       "when": 1786200000000,
       "tag": "0033_add_canvas_project",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1786300000000,
+      "tag": "0034_add_task_deleted_at",
+      "breakpoints": true
     }
   ]
 }

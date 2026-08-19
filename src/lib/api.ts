@@ -132,6 +132,14 @@ export const taskFilterShape = {
     .boolean()
     .optional()
     .describe("return ONLY archived tasks (the Archived view)"),
+  includeDeleted: z
+    .boolean()
+    .optional()
+    .describe("also include deleted tasks, the ones in the Trash (excluded by default)"),
+  deletedOnly: z
+    .boolean()
+    .optional()
+    .describe("return ONLY deleted tasks — the Trash, newest deleted first"),
   /** Callers that want done work hidden pass `false` themselves — notably the
    *  MCP tools, which default it off. Left undefined, done tasks are included,
    *  because the web board needs its Done column. */

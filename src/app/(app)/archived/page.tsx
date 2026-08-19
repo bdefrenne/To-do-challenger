@@ -25,7 +25,8 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 /**
  * Archived view — done tasks that were tucked away (Delete on a done task, or
  * "Archive done"). Un-archive sends one back to its board (with its subtree);
- * Delete removes it for good. Fetched independently of the live workspace store
+ * Delete moves it to the Trash (see /trash), from where it can still be
+ * restored. Fetched independently of the live workspace store
  * so archived tasks never pollute the active boards.
  */
 export default function ArchivedPage() {
@@ -77,8 +78,11 @@ export default function ArchivedPage() {
       }),
     );
 
+  // DELETE is a soft delete now (TD2-196): an archived task deleted from here
+  // moves to the Trash, where it can still be restored — or destroyed by the
+  // "Empty trash" button, the one place that ends anything.
   const remove = (id: string, title: string) => {
-    if (!confirm(`Delete “${title}” permanently? This can't be undone.`)) return;
+    if (!confirm(`Move “${title}” to the Trash? You can restore it from there.`)) return;
     void run(id, () => apiFetch(`/api/tasks/${id}`, { method: "DELETE" }));
   };
 
@@ -86,7 +90,7 @@ export default function ArchivedPage() {
     <div className="min-h-screen">
       <PageHeader
         title="Archived"
-        subtitle="Done tasks you've tucked away. Un-archive to send one back to its board, or delete it for good."
+        subtitle="Done tasks you've tucked away. Un-archive to send one back to its board, or delete it to move it to the Trash."
       />
       <div className="px-8 py-6">
         <div className="mx-auto max-w-3xl">

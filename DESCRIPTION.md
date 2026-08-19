@@ -45,6 +45,13 @@ edit and a human edit go through the exact same door.
   it parks in DONE THIS WEEK first, on the canvas — which has no such tray — it
   sits in its board's lane until DELETE archives it), **↑/→/↓** file it in THIS
   WEEK / BACKLOG / LATER. **?** shows the cheatsheet.
+- **Nothing is deleted by accident.** DELETE is a **soft delete**: the task keeps
+  its id, ref, activity and subtasks, leaves every board, list, canvas and search,
+  and lands in the **Trash** — newest deleted first — where **Restore** puts the
+  whole branch back where it was. Only the Trash's **Empty trash** button (or a
+  per-row *Delete forever*) actually destroys anything, and it refuses a task that
+  hasn't been deleted first, so the irreversible step is always the second one.
+  Archiving is the separate, tidier exit for *finished* work.
 - **Live co-editing in a section's text view.** A canvas section flips between
   cards and an **outline** — one editable document over its task list. Several
   people can be in it at once and edit **different rows simultaneously**: a row is

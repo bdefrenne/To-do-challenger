@@ -32,6 +32,7 @@ import {
   bulkApply,
   mintRef,
   deleteTask,
+  purgeTask,
 } from "../src/lib/db/service";
 import { withLogContext, type LogSource } from "../src/lib/db/log-context";
 import type { TaskStatus } from "../src/lib/types";
@@ -105,6 +106,15 @@ const MUTATORS: { name: string; drive: (id: string) => Promise<unknown> }[] = [
       bulkApply(ME, [{ op: "update", id, patch: { status: "building" } }], AUTHOR),
   },
 ];
+
+/** Cleanup means GONE. DELETE is a soft delete now (TD2-196) — a scratch task
+ *  removed with `deleteTask` alone would sit in the Trash after every run — so
+ *  the checks bin it and then purge it, which is also the two-step the app makes
+ *  a person take. */
+async function scrub(id: string): Promise<void> {
+  await deleteTask(id, ME);
+  await purgeTask(id, ME);
+}
 
 async function main() {
   const wanted = process.argv[2];
@@ -254,7 +264,7 @@ async function main() {
 
 main()
   .then(async () => {
-    for (const id of scratch) await deleteTask(id, ME);
+    for (const id of scratch) await scrub(id);
     console.log(
       `\nCleaned up ${scratch.length} scratch task(s).\n` +
         `${pass} passed, ${failures.length} failed.`,
@@ -267,7 +277,7 @@ main()
   .catch(async (e) => {
     for (const id of scratch) {
       try {
-        await deleteTask(id, ME);
+        await scrub(id);
       } catch {
         /* best effort — a leftover is titled "[check:assign] scratch" */
       }

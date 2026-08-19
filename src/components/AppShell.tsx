@@ -38,6 +38,7 @@ const NAV = [
   { href: "/notes", label: "Notes", icon: "✎" },
   { href: "/calendar", label: "Calendar", icon: "▦" },
   { href: "/archived", label: "Archived", icon: "🗄" },
+  { href: "/trash", label: "Trash", icon: "🗑" },
 ];
 
 const SIDEBAR_KEY = "sidebar:open";

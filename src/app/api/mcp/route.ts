@@ -48,6 +48,8 @@ import {
   archiveTask,
   addComment,
   deleteTask,
+  purgeTask,
+  restoreTask,
   bulkUpdate,
   bulkApply,
   getAttachmentById,
@@ -276,6 +278,7 @@ const COMPACT_FIELDS = [
   "importance",
   "completedAt",
   "archivedAt",
+  "deletedAt",
   "dependsOn",
 ] as const;
 
@@ -562,9 +565,24 @@ const handler = createMcpHandler(
 
     server.tool(
       "delete_task",
-      "Delete a task. Its subtasks are re-parented to the top level (not deleted).",
+      "Delete a task — into the Trash, not out of existence. It leaves every board, list, canvas and search (and stops accepting edits), keeps its ref and its subtasks, and can be restored with restore_task. Its subtasks go with it and come back with it. Pass `forever: true` ONLY to purge a task that is ALREADY in the Trash — that drops its rows, logs and images for good and cannot be undone, so ask the human first.",
+      { id: taskHandle, forever: z.boolean().optional().default(false) },
+      async ({ id, forever }) =>
+        text(
+          forever
+            ? { ok: await purgeTask(id, currentUser()), deleted: "forever" }
+            : { ok: await deleteTask(id, currentUser(), AI_AUTHOR), deleted: "trash" },
+        ),
+    );
+
+    server.tool(
+      "restore_task",
+      "Bring a task back from the Trash, with its subtasks. Find deleted tasks with search_tasks deletedOnly:true (they're hidden from every normal read). A task whose parent is still deleted comes back at top level.",
       { id: taskHandle },
-      async ({ id }) => text({ ok: await deleteTask(id, currentUser()) }),
+      async ({ id }) => {
+        const task = await restoreTask(id, currentUser(), AI_AUTHOR);
+        return task ? text({ task }) : text({ error: "Task not found in the Trash" });
+      },
     );
 
     server.tool(

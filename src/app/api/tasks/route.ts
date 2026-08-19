@@ -1,7 +1,8 @@
 /*
   /api/tasks
     GET  — list all tasks (nested tree). ?flat=1 for a flat list,
-           ?format=markdown for an AI-skimmable board.
+           ?format=markdown for an AI-skimmable board,
+           ?deleted=only for the Trash.
     POST — create a task.
 */
 
@@ -38,6 +39,8 @@ export const GET = route(async (req: NextRequest, { userId }) => {
   // ?archived=only  → just archived tasks (the Archived view)
   // ?archived=include|all → active + archived; anything else (or absent) hides them
   const archived = sp.get("archived");
+  // ?deleted=only → just the Trash; ?deleted=include|all → live + deleted
+  const deleted = sp.get("deleted");
   const limit = sp.get("limit");
   const sort = sp.get("sort");
   const filter: TaskFilter = {
@@ -55,6 +58,8 @@ export const GET = route(async (req: NextRequest, { userId }) => {
     overdue: boolParam(sp.get("overdue")),
     archivedOnly: archived === "only",
     includeArchived: archived === "include" || archived === "all",
+    deletedOnly: deleted === "only",
+    includeDeleted: deleted === "include" || deleted === "all",
     includeDone: boolParam(sp.get("includeDone")),
     // Activity windows — the same axes the MCP tools expose (see taskFilterShape
     // in @/lib/api): what moved, shipped, was edited or created in a range.

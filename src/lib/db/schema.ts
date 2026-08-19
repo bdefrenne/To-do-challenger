@@ -492,6 +492,12 @@ export const tasks = pgTable(
     /** Set when a done task is archived (hidden from active views); cleared on
      *  un-archive or when the task leaves "done". Only done tasks can be set. */
     archivedAt: timestamp("archived_at", { withTimezone: true }),
+    /** Set when the task was DELETED — a soft delete. The row stays put, drops
+     *  out of every active read (see `taskWhere` / `resolveTaskId`) and shows up
+     *  in the Trash, newest-deleted first, until it's restored or purged.
+     *  Cascades over the subtree like `archivedAt`, so a restore brings the
+     *  branch back intact. */
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -506,6 +512,7 @@ export const tasks = pgTable(
     index("tasks_parent_idx").on(t.parentId),
     index("tasks_status_idx").on(t.status),
     index("tasks_archived_idx").on(t.archivedAt),
+    index("tasks_deleted_idx").on(t.deletedAt),
     index("tasks_canvas_section_idx").on(t.canvasSectionId),
     /* Activity windows — "what moved / shipped / was edited between X and Y". */
     index("tasks_status_since_idx").on(t.statusSince),

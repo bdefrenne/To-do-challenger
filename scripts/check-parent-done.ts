@@ -38,6 +38,7 @@ import {
   bulkUpdate,
   archiveTask,
   deleteTask,
+  purgeTask,
   resolvePlacementSection,
 } from "../src/lib/db/service";
 import { withLogContext } from "../src/lib/db/log-context";
@@ -116,6 +117,15 @@ async function pair(childStatus: TaskStatus) {
   const parent = await mk({ status: "review" });
   const child = await mk({ parentId: parent, status: childStatus });
   return { parent, child };
+}
+
+/** Cleanup means GONE. DELETE is a soft delete now (TD2-196) — a scratch task
+ *  removed with `deleteTask` alone would sit in the Trash after every run — so
+ *  the checks bin it and then purge it, which is also the two-step the app makes
+ *  a person take. */
+async function scrub(id: string): Promise<void> {
+  await deleteTask(id, ME);
+  await purgeTask(id, ME);
 }
 
 async function main() {
@@ -326,7 +336,7 @@ async function main() {
   // Children first: deleting a parent would orphan/cascade unpredictably.
   for (const id of ids.reverse()) {
     try {
-      await as(() => deleteTask(id, ME));
+      await as(() => scrub(id));
     } catch {
       /* fall through to the hard delete below */
     }

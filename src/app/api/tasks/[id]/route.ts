@@ -2,12 +2,16 @@
   /api/tasks/:id
     GET    — one task + its activity log/comments
     PATCH  — update fields (partial)
-    DELETE — remove the task
+    DELETE — move the task to the Trash (a soft delete: it keeps its id, ref
+             and subtree, and can be restored). `?forever=1` on a task that is
+             ALREADY in the Trash deletes it for good — rows, logs, blobs and
+             all — and 400s on a live task, so permanent deletion is always the
+             second of two deliberate steps.
 */
 
 import { NextRequest } from "next/server";
 import { route, json, error, body, updateTaskSchema, type AuthedCtx } from "@/lib/api";
-import { getTask, updateTask, deleteTask } from "@/lib/db/service";
+import { getTask, updateTask, deleteTask, purgeTask } from "@/lib/db/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -33,9 +37,11 @@ export const PATCH = route(async (req: NextRequest, ctx: AuthedCtx) => {
   return json({ task });
 });
 
-export const DELETE = route(async (_req: NextRequest, ctx: AuthedCtx) => {
+export const DELETE = route(async (req: NextRequest, ctx: AuthedCtx) => {
   const { id } = await ctx.params;
-  const ok = await deleteTask(id, ctx.userId);
+  const sp = new URL(req.url).searchParams;
+  const forever = sp.has("forever") && sp.get("forever") !== "false" && sp.get("forever") !== "0";
+  const ok = forever ? await purgeTask(id, ctx.userId) : await deleteTask(id, ctx.userId);
   if (!ok) return error("Task not found", 404);
-  return json({ ok: true });
+  return json({ ok: true, deleted: forever ? "forever" : "trash" });
 });

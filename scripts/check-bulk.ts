@@ -40,6 +40,7 @@ import {
   createTask,
   moveTask,
   deleteTask,
+  purgeTask,
   bulkApply,
   listProjects,
 } from "../src/lib/db/service";
@@ -110,6 +111,15 @@ async function pinOf(id: string): Promise<string | null> {
     .from(tasks)
     .where(eq(tasks.id, id));
   return row?.pin ?? null;
+}
+
+/** Cleanup means GONE. DELETE is a soft delete now (TD2-196) — a scratch task
+ *  removed with `deleteTask` alone would sit in the Trash after every run — so
+ *  the checks bin it and then purge it, which is also the two-step the app makes
+ *  a person take. */
+async function scrub(id: string): Promise<void> {
+  await deleteTask(id, ME);
+  await purgeTask(id, ME);
 }
 
 async function main() {
@@ -382,7 +392,7 @@ async function main() {
 
 main()
   .then(async () => {
-    for (const id of scratch) await deleteTask(id, ME);
+    for (const id of scratch) await scrub(id);
     console.log(
       `\nCleaned up ${scratch.length} scratch task(s).\n` +
         `${pass} passed, ${failures.length} failed.`,
@@ -395,7 +405,7 @@ main()
   .catch(async (e) => {
     for (const id of scratch) {
       try {
-        await deleteTask(id, ME);
+        await scrub(id);
       } catch {
         /* best effort — a leftover is titled "[check:bulk] scratch" */
       }
