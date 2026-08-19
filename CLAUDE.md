@@ -44,8 +44,10 @@ of the RYDR board set.)
 - `npm run dev` — dev server
 - `npm run db:generate` / `npm run db:migrate` — Drizzle migrations
 - `npx tsc --noEmit` · `npm run lint` · `npm run build` — checks before committing
-- `npm run check:outline` — the outline/text-view logic checks (167 pure assertions:
-  the row⇄field merge, per-row locks, fractional positions, delete subtrees).
+- `npm run check:outline` — the outline/text-view logic checks (222 pure assertions:
+  the row⇄field merge, per-row locks, fractional positions, delete subtrees, what
+  each structural key does to the row list, and the create/move op payloads those
+  rows produce).
   **Run it after touching anything in `src/lib/outline.ts`,
   `useOutlineDraft.ts`, `OutlineEditor.tsx` or `useRowLock.ts`** — that code is
   co-editing, task creation and deletion at once, so a wrong answer there loses a

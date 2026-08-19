@@ -6,8 +6,10 @@
  * nearest task above it. Task rows carry a bound `taskId` so re-editing patches
  * the same task instead of duplicating it.
  *
- * Keyboard mapping lives in SectionNode; here we only convert rows ⇄ a task
- * tree. This file is UI-free and side-effect-free so it's easy to test.
+ * Which key does what lives in SectionNode; what a key DOES to the rows lives
+ * here, alongside the rows ⇄ tree conversion and the op payloads a row edit
+ * produces. This file is UI-free and side-effect-free so it's easy to test —
+ * everything that needs a room, a socket or a DOM stays in `useOutlineDraft`.
  *
  * **Changing anything here? Run `npm run check:outline`.** These rules decide
  * whether a task is created, deleted, or has someone's caret ripped out of it, and
@@ -419,6 +421,253 @@ export function mergeOutlineRows(
     out.unshift(row);
   }
   return out.length ? out : blankFallback();
+}
+
+/* ------------------------------------------------------------------ *
+ * Structural keys — what Shift+Tab, Tab, Enter and Backspace DO to the row list.
+ *
+ * These used to live inside `onRowKeyDown`, where they were reachable only
+ * through a real keyboard event on a mounted textarea — so the row surgery for
+ * "pop this description line out as a subtask" was never checked by anything, and
+ * neither was the create payload it leads to. That is precisely the seam TD2-188
+ * went through: the rows were right, the op was right, and the position was lost
+ * one layer further down with no test in between.
+ *
+ * So each key is a pure rows → `RowEdit` function here, and the hook does only
+ * what a hook can: write the rows, send the fields, move the caret.
+ * ------------------------------------------------------------------ */
+
+/** Everything one structural keystroke changes. The hook applies it; this file
+ *  decides it. */
+export interface RowEdit {
+  /** The new row list. */
+  rows: OutlineRow[];
+  /** Where the caret goes — always a row that exists in `rows`. */
+  focus: { key: string; caret: number };
+  /** Indexes into `rows` whose text must be re-sent (a row that changed text, or
+   *  changed which field it writes). */
+  persist: number[];
+  /** A task whose parent or order the USER changed → needs a move op. Present
+   *  (even as null) means "tell the structural commit"; absent means nothing
+   *  moved. */
+  movedId?: string | null;
+  /** A task the edit deletes. `indent`/`from` describe the subtree left behind,
+   *  which has to be re-parented — see `noteDeleted`. */
+  deleted?: { taskId: string | null; indent: number; from: number };
+  /** Index of a task row whose folded description changed and must be written
+   *  now (not on the throttle) — the owner a popped line was taken from. */
+  descOwner?: number;
+  /** A row now has text but no task, so creates should be pumped. */
+  creates?: boolean;
+}
+
+/** The deepest indent the task row at `index` may take: (nearest task above)+1.
+ *  -1 = there is no task above to nest under, so Tab means nothing. */
+export function maxTaskIndentAt(rows: OutlineRow[], index: number): number {
+  for (let i = index - 1; i >= 0; i--) if (!rows[i].desc) return rows[i].indent + 1;
+  return -1;
+}
+
+/**
+ * SHIFT+TAB inside a description: pop the line the caret is on out as a bullet —
+ * a task at the description's own indent, i.e. a subtask of its owner. Lines
+ * above stay the description; lines below become a description of the new
+ * bullet. The bullet takes the caret.
+ */
+export function popDescLine(rows: OutlineRow[], index: number, caret: number): RowEdit | null {
+  const row = rows[index];
+  if (!row?.desc) return null;
+  const val = row.text;
+  const at = Math.max(0, Math.min(caret, val.length));
+  const lineStart = val.lastIndexOf("\n", at - 1) + 1;
+  const nl = val.indexOf("\n", at);
+  const lineEnd = nl === -1 ? val.length : nl;
+  const before = val.slice(0, lineStart).replace(/\n$/, "");
+  const currentLine = val.slice(lineStart, lineEnd);
+  const after = val.slice(lineEnd).replace(/^\n/, "");
+
+  const bullet = newRow(row.indent, false, currentLine);
+  const inserts: OutlineRow[] = [bullet];
+  if (after.trim()) inserts.push(newRow(row.indent + 1, true, after));
+  const copy = rows.slice();
+  if (before.trim()) {
+    copy[index] = { ...row, text: before };
+    copy.splice(index + 1, 0, ...inserts);
+  } else {
+    copy.splice(index, 1, ...inserts); // the desc had only this line → replace it
+  }
+  const kept = copy.findIndex((r) => r.desc && r.key === row.key);
+  const bulletIndex = copy.findIndex((r) => r.key === bullet.key);
+  const owner = descOwnerAt(copy, bulletIndex);
+  const ownerIndex = owner ? copy.findIndex((r) => r.key === owner.key) : -1;
+  return {
+    rows: copy,
+    focus: { key: bullet.key, caret: currentLine.length },
+    persist: kept >= 0 ? [kept] : [],
+    // The owner lost a line whether or not a desc row survived to carry the
+    // write — when it didn't, this is the ONLY thing that clears the column.
+    ...(ownerIndex >= 0 ? { descOwner: ownerIndex } : {}),
+    creates: true,
+  };
+}
+
+/** TAB / SHIFT+TAB on a task row: outdent, nest one deeper, or — already as deep
+ *  as allowed — stop being a task and join the owner's description. Null when
+ *  the key means nothing (the first line, or the left edge). */
+export function retabRow(
+  rows: OutlineRow[],
+  index: number,
+  opts: { shift: boolean; caret: number },
+): RowEdit | null {
+  const row = rows[index];
+  if (!row || row.desc) return null;
+  const max = maxTaskIndentAt(rows, index);
+  if (max < 0) return null; // first line — nothing above to nest under
+  const focus = { key: row.key, caret: opts.caret };
+  if (opts.shift) {
+    if (row.indent === 0) return null; // at the left edge, nothing happens
+    return {
+      rows: rows.map((r) => (r.key === row.key ? { ...r, indent: r.indent - 1 } : r)),
+      focus,
+      persist: [],
+      movedId: row.taskId,
+    };
+  }
+  if (row.indent < max) {
+    return {
+      rows: rows.map((r) => (r.key === row.key ? { ...r, indent: r.indent + 1 } : r)),
+      focus,
+      persist: [],
+      movedId: row.taskId,
+    };
+  }
+  // Deepest role already → the line becomes its parent's description. The task
+  // stops existing: an explicit delete, and its text joins the owner's field.
+  const copy = rows.map((r) => (r.key === row.key ? { ...r, desc: true, taskId: null } : r));
+  const di = copy.findIndex((r) => r.key === row.key);
+  return {
+    rows: copy,
+    focus,
+    persist: di >= 0 ? [di] : [],
+    deleted: { taskId: row.taskId, indent: row.indent, from: index + 1 },
+  };
+}
+
+/** ENTER on a task row: split at the caret into a new sibling. A bound task keeps
+ *  its id on the head (same task, renamed); the tail is a new task. */
+export function splitRow(rows: OutlineRow[], index: number, caret: number): RowEdit | null {
+  const row = rows[index];
+  if (!row || row.desc) return null;
+  const at = Math.max(0, Math.min(caret, row.text.length));
+  const created = newRow(row.indent, false, row.text.slice(at));
+  const copy = rows.slice();
+  copy[index] = { ...row, text: row.text.slice(0, at) };
+  copy.splice(index + 1, 0, created);
+  return {
+    rows: copy,
+    focus: { key: created.key, caret: 0 },
+    persist: [index], // the head's title changed
+    creates: true,
+  };
+}
+
+/** BACKSPACE at offset 0: merge into the previous row, whose id and role win.
+ *  This row is dropped, so its task — if it had one — is deliberately deleted. */
+export function mergeIntoPrevious(rows: OutlineRow[], index: number): RowEdit | null {
+  const row = rows[index];
+  const prev = rows[index - 1];
+  if (!row || !prev || row.desc) return null;
+  const copy = rows.slice();
+  copy[index - 1] = { ...prev, text: prev.text + row.text };
+  copy.splice(index, 1);
+  return {
+    rows: copy,
+    focus: { key: prev.key, caret: prev.text.length },
+    persist: [index - 1],
+    deleted: { taskId: row.taskId, indent: row.indent, from: index },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Op payloads — the last step before the wire.
+ *
+ * `position` here is the whole point of the fractional key: it says WHERE the
+ * line was opened. It was computed correctly, put on the op correctly, and then
+ * dropped by the request schema and by `createTask` (TD2-188) — so these are
+ * built here, where a check can read them, rather than inline in an async pump.
+ * ------------------------------------------------------------------ */
+
+/** The next row a create is allowed to run for: has text, has no task, isn't
+ *  already being created, and has no unbound ancestor to wait for (a child can't
+ *  be created before its parent has an id). -1 when there is nothing to do. */
+export function nextCreatableIndex(
+  rows: OutlineRow[],
+  busy: (row: OutlineRow) => boolean,
+): number {
+  return rows.findIndex((r, i) => {
+    if (r.desc || r.taskId || busy(r)) return false;
+    if (!r.text.trim()) return false;
+    const parent = parentRowAt(rows, i);
+    return !parent || !!parent.taskId;
+  });
+}
+
+/** The `create` op for a row: its title, the description folded from the desc
+ *  rows under it, its parent, and the fractional key that places it between its
+ *  neighbours. Only a ROOT line carries the pin/bucket — a subtask inherits its
+ *  parent's. */
+export function createOpFor(
+  rows: OutlineRow[],
+  index: number,
+  opts: {
+    boardId: string;
+    positionOf: (taskId: string) => number | undefined;
+    rootTarget: Record<string, unknown>;
+  },
+): {
+  op: "create";
+  input: {
+    title: string;
+    description?: string;
+    boardId: string;
+    parentId?: string;
+    position: number;
+  } & Record<string, unknown>;
+} | null {
+  const row = rows[index];
+  if (!row || row.desc || !row.text.trim()) return null;
+  const parent = parentRowAt(rows, index);
+  const description = foldedDescriptionFor(rows, index);
+  return {
+    op: "create",
+    input: {
+      title: row.text.trim(),
+      description: description || undefined,
+      boardId: opts.boardId,
+      parentId: parent?.taskId ?? undefined,
+      position: siblingPositionAt(rows, index, opts.positionOf),
+      ...(parent ? {} : opts.rootTarget),
+    },
+  };
+}
+
+/** The `move` op for a bound row: where it now hangs and where it now sorts. */
+export function moveOpFor(
+  rows: OutlineRow[],
+  index: number,
+  positionOf: (taskId: string) => number | undefined,
+): { op: "move"; id: string; target: { parentId: string | null; position: number } } | null {
+  const row = rows[index];
+  if (!row || row.desc || !row.taskId) return null;
+  const parent = parentRowAt(rows, index);
+  return {
+    op: "move",
+    id: row.taskId,
+    target: {
+      parentId: parent?.taskId ?? null,
+      position: siblingPositionAt(rows, index, positionOf),
+    },
+  };
 }
 
 /**

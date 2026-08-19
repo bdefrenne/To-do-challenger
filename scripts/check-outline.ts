@@ -14,6 +14,7 @@
 
 import {
   type OutlineRow,
+  type RowEdit,
   mergeOutlineRows,
   rowFieldKey,
   rowFieldKeys,
@@ -26,6 +27,14 @@ import {
   survivingIds,
   newRow,
   takeoverText,
+  maxTaskIndentAt,
+  popDescLine,
+  retabRow,
+  splitRow,
+  mergeIntoPrevious,
+  nextCreatableIndex,
+  createOpFor,
+  moveOpFor,
 } from "@/lib/outline";
 import { resolveRowLock, PARK_MS, type RowClaim } from "@/components/workspace/useRowLock";
 
@@ -625,6 +634,228 @@ group("the move pass needs the positions it just wrote");
        2,
        (id) => (id === "new1" ? 1 : dbPos[id]),
      ), 2);
+}
+
+/* ------------------- structural keys → rows → op payload ----------------- */
+
+/* The layer between the row math and the database. It used to live inside
+ * `onRowKeyDown`, reachable only through a real keystroke on a mounted textarea,
+ * so NOTHING checked what Shift+Tab does to the list or what the create op ends
+ * up carrying — which is the seam TD2-188 slipped through. */
+
+/** How a RowEdit reads: the rendered rows, plus where the caret ended up. */
+const editView = (edit: RowEdit | null) =>
+  edit && [...view(edit.rows), `caret → ${edit.rows.find((r) => r.key === edit.focus.key)?.text ?? "?"}@${edit.focus.caret}`];
+
+group("popDescLine — Shift+Tab pops the caret's line out as a subtask");
+{
+  // The reported list: a task, its description, three subtasks.
+  const base = () => [
+    r("kt", "t", "New task here"),
+    r("kd", null, "desc", 1, true),
+    r("ka", "a", "sous task", 1),
+    r("kb", "b", "subtask", 1),
+  ];
+  const one = popDescLine(base(), 1, 4);
+  eq("a one-line description becomes the bullet, in place", editView(one), [
+    "New task here",
+    "  desc",
+    "  sous task",
+    "  subtask",
+    "caret → desc@4",
+  ]);
+  eq("the bullet is a TASK row, unbound, at the description's own indent",
+     one && [one.rows[1].desc, one.rows[1].taskId, one.rows[1].indent], [false, null, 1]);
+  eq("nothing is left to persist — the desc row is gone", one?.persist, []);
+  eq("…so the owner's description is written directly, and is now empty",
+     one && [one.descOwner, foldedDescriptionFor(one.rows, one.descOwner!)], [0, ""]);
+  eq("a create is pumped for the new bullet", one?.creates, true);
+  eq("no task moved and none was deleted",
+     one && ["movedId" in one, !!one.deleted], [false, false]);
+
+  // Caret in the MIDDLE of a three-line block: lines above stay the
+  // description, lines below become the new bullet's own description.
+  const block = [
+    r("kt", "t", "New task here"),
+    r("kd", null, "first\nsecond\nthird", 1, true),
+    r("ka", "a", "sous task", 1),
+  ];
+  const mid = popDescLine(block, 1, "first\nsec".length);
+  eq("the caret's line pops, above stays, below follows it", editView(mid), [
+    "New task here",
+    "  // first",
+    "  second",
+    "    // third",
+    "  sous task",
+    "caret → second@6",
+  ]);
+  eq("the surviving desc row is re-persisted (it lost a line)", mid?.persist, [1]);
+  eq("…and the owner keeps only the lines above",
+     mid && foldedDescriptionFor(mid.rows, 0), "first");
+  eq("the trailing lines belong to the BULLET now, not the owner",
+     mid && foldedDescriptionFor(mid.rows, 2), "third");
+
+  eq("the caret on the FIRST line of a block leaves nothing above",
+     editView(popDescLine(block, 1, 0)),
+     ["New task here", "  first", "    // second\nthird", "  sous task", "caret → first@5"]);
+  eq("the caret on the LAST line leaves nothing below",
+     editView(popDescLine(block, 1, "first\nsecond\nthi".length)),
+     ["New task here", "  // first\nsecond", "  third", "  sous task", "caret → third@5"]);
+  eq("an out-of-range caret is clamped, not NaN",
+     popDescLine(block, 1, 999)?.focus.caret, 5);
+  eq("a whitespace-only remainder is dropped, not kept as an empty desc",
+     popDescLine([r("kt", "t", "T"), r("kd", null, "line\n   ", 1, true)], 1, 0)?.rows.length, 2);
+  eq("it refuses a row that isn't a description", popDescLine(base(), 0, 0), null);
+}
+
+group("retabRow — Tab cycles a task row's role");
+{
+  // A row may only nest one level below the row above it — you cannot skip a
+  // level, so what Tab does depends entirely on the line before.
+  const rows = [
+    r("kt", "t", "New task here"),
+    r("ka", "a", "sous task", 1),
+    r("kb", "b", "subtask", 1),
+    r("kr", "r", "another root"),
+  ];
+  eq("the first line has nothing to nest under", maxTaskIndentAt(rows, 0), -1);
+  eq("…so Tab means nothing there", retabRow(rows, 0, { shift: false, caret: 0 }), null);
+  eq("a row may go one deeper than the row above it", maxTaskIndentAt(rows, 2), 2);
+  eq("Tab nests under the sibling above", editView(retabRow(rows, 2, { shift: false, caret: 3 })),
+     ["New task here", "  sous task", "    subtask", "another root", "caret → subtask@3"]);
+  eq("…and says the task moved", retabRow(rows, 2, { shift: false, caret: 0 })?.movedId, "b");
+  eq("Shift+Tab outdents", editView(retabRow(rows, 2, { shift: true, caret: 0 })),
+     ["New task here", "  sous task", "subtask", "another root", "caret → subtask@0"]);
+  eq("Shift+Tab at the left edge does nothing",
+     retabRow(rows, 3, { shift: true, caret: 0 })?.movedId ?? "no edit", "no edit");
+  eq("Tab on a row already as deep as the line above allows is NOT a nest",
+     retabRow(rows, 1, { shift: false, caret: 0 })?.rows[1].desc, true);
+  // Already as deep as allowed: the line stops being a task and joins the
+  // description of the task above — a DELETE, and the subtree it leaves behind
+  // has to be re-parented.
+  const nested = [r("kt", "t", "New task here"), r("ka", "a", "sous task", 1), r("kb", "b", "deep", 2)];
+  const deep = retabRow(nested, 2, { shift: false, caret: 0 });
+  eq("Tab past the deepest role turns the line into a description",
+     editView(deep), ["New task here", "  sous task", "    // deep", "caret → deep@0"]);
+  eq("…the row is unbound and its task deleted",
+     deep && [deep.rows[2].taskId, deep.deleted?.taskId], [null, "b"]);
+  eq("…with the subtree to re-parent named", deep?.deleted, { taskId: "b", indent: 2, from: 3 });
+  eq("…and the new desc row is re-persisted onto its owner", deep?.persist, [2]);
+  eq("it refuses a description row", retabRow([r("kd", null, "d", 1, true)], 0, { shift: false, caret: 0 }), null);
+}
+
+group("splitRow / mergeIntoPrevious — Enter and Backspace");
+{
+  const rows = [r("kt", "t", "New task here"), r("ka", "a", "sous task", 1)];
+  const split = splitRow(rows, 1, 5);
+  eq("Enter splits at the caret into a sibling", editView(split),
+     ["New task here", "  sous ", "  task", "caret → task@0"]);
+  eq("the head keeps the task id, the tail is new",
+     split && [split.rows[1].taskId, split.rows[2].taskId], ["a", null]);
+  eq("the head's title is re-persisted and a create is pumped",
+     split && [split.persist, split.creates], [[1], true]);
+  eq("Enter at the end opens an empty line", splitRow(rows, 1, 99)?.rows[2].text, "");
+
+  const merged = mergeIntoPrevious(rows, 1);
+  eq("Backspace at offset 0 merges into the row above", editView(merged),
+     ["New task heresous task", "caret → New task heresous task@13"]);
+  eq("…the merged-away task is deleted, with its subtree named",
+     merged?.deleted, { taskId: "a", indent: 1, from: 1 });
+  eq("…and the surviving row is re-persisted", merged?.persist, [0]);
+  eq("there is nothing above the first row", mergeIntoPrevious(rows, 0), null);
+}
+
+group("createOpFor — the op that carries WHERE the line was opened (TD2-188)");
+{
+  const pos: Record<string, number> = { t: 1, a: 2, b: 3, c: 4 };
+  const opts = {
+    boardId: "board-1",
+    positionOf: (id: string) => pos[id],
+    rootTarget: { canvasSectionId: "section-1" },
+  };
+  // Drive the ACTUAL keystroke, then read the payload it leads to — the two ends
+  // of the seam, in one assertion.
+  const popped = popDescLine(
+    [
+      r("kt", "t", "New task here"),
+      r("kd", null, "desc", 1, true),
+      r("ka", "a", "sous task", 1),
+      r("kb", "b", "subtask", 1),
+      r("kc", "c", "sub", 1),
+    ],
+    1,
+    4,
+  )!;
+  eq("a popped description line creates a FIRST subtask, keyed before its siblings",
+     createOpFor(popped.rows, 1, opts)?.input,
+     { title: "desc", description: undefined, boardId: "board-1", parentId: "t", position: 1 });
+  eq("…and it is the row the caret is in", popped.rows[1].key, popped.focus.key);
+  eq("a subtask does NOT carry the root pin — it inherits its parent's",
+     Object.keys(createOpFor(popped.rows, 1, opts)!.input).includes("canvasSectionId"), false);
+
+  const root = [r("kn", null, "typed at the top"), r("kt", "t", "New task here")];
+  eq("a ROOT line carries the pin/bucket, and a key before the first root",
+     createOpFor(root, 0, opts)?.input,
+     {
+       title: "typed at the top",
+       description: undefined,
+       boardId: "board-1",
+       parentId: undefined,
+       position: 0,
+       canvasSectionId: "section-1",
+     });
+
+  eq("the description rows under a new line ride along on the create",
+     createOpFor(
+       [r("kn", null, "new task"), r("kd1", null, "line one", 1, true), r("kd2", null, "line two", 1, true)],
+       0,
+       opts,
+     )?.input.description,
+     "line one\nline two");
+  eq("a blank line has nothing to create", createOpFor([r("kn", null, "   ")], 0, opts), null);
+  eq("a description row is never a create", createOpFor([r("kd", null, "d", 0, true)], 0, opts), null);
+
+  // An Enter split mid-list asks for the midpoint, through the same path.
+  const split = splitRow(
+    [r("kt", "t", "T"), r("ka", "a", "AB", 1), r("kb", "b", "B", 1)],
+    1,
+    1,
+  )!;
+  eq("an Enter split keys the tail between its neighbours",
+     createOpFor(split.rows, 2, opts)?.input.position, 2.5);
+}
+
+group("nextCreatableIndex — a child waits for its parent's id");
+{
+  const none = () => false;
+  eq("the first unbound row with text wins",
+     nextCreatableIndex([r("kt", "t", "T"), r("kn", null, "new"), r("kn2", null, "later")], none), 1);
+  eq("a blank row is not a create", nextCreatableIndex([r("kn", null, "   ")], none), -1);
+  eq("a description row is not a create", nextCreatableIndex([r("kd", null, "d", 0, true)], none), -1);
+  eq("a child of an unbound parent waits — the parent goes first",
+     nextCreatableIndex([r("kp", null, "parent"), r("kc", null, "child", 1)], none), 0);
+  eq("…and once the parent is claimed, the child is still not next",
+     nextCreatableIndex(
+       [r("kp", null, "parent"), r("kc", null, "child", 1)],
+       (row) => row.key === "kp",
+     ), -1);
+  eq("a child of a BOUND parent goes immediately",
+     nextCreatableIndex([r("kp", "p", "parent"), r("kc", null, "child", 1)], none), 1);
+  eq("nothing to do", nextCreatableIndex([r("kt", "t", "T")], none), -1);
+}
+
+group("moveOpFor — a move states its parent AND its position");
+{
+  const pos: Record<string, number> = { t: 1, a: 2, b: 3 };
+  const positionOf = (id: string) => pos[id];
+  const rows = [r("kt", "t", "T"), r("ka", "a", "A", 1), r("kb", "b", "B", 1)];
+  eq("a nested row moves under its new parent, keyed after its sibling",
+     moveOpFor(rows, 2, positionOf), { op: "move", id: "b", target: { parentId: "t", position: 3 } });
+  const out = retabRow(rows, 2, { shift: true, caret: 0 })!;
+  eq("Shift+Tab to root moves it to the root group",
+     moveOpFor(out.rows, 2, positionOf), { op: "move", id: "b", target: { parentId: null, position: 2 } });
+  eq("an unbound row has no move op", moveOpFor([r("kn", null, "new")], 0, positionOf), null);
+  eq("a description row has no move op", moveOpFor([r("kd", null, "d", 0, true)], 0, positionOf), null);
 }
 
 /* -------------------------------- locking ------------------------------- */

@@ -3,16 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type OutlineRow,
+  type RowEdit,
   newRow,
   unitsToRows,
   flattenUnits,
-  parentRowAt,
   descOwnerAt,
   foldedDescriptionFor,
-  siblingPositionAt,
   mergeOutlineRows,
   rowFieldKey,
   takeoverText,
+  popDescLine,
+  retabRow,
+  splitRow,
+  mergeIntoPrevious,
+  nextCreatableIndex,
+  createOpFor,
+  moveOpFor,
   type TaskUnit,
 } from "@/lib/outline";
 import type { TaskPlacement } from "@/lib/types";
@@ -368,35 +374,26 @@ export function useOutlineDraft({
     try {
       for (;;) {
         const current = rowsRef.current;
-        const index = current.findIndex((r, i) => {
-          if (r.desc || r.taskId || creatingRef.current.has(r.key)) return false;
-          if (createdKeysRef.current.has(r.key)) return false; // already has a task
-          if (!r.text.trim()) return false;
-          const parent = parentRowAt(current, i);
-          return !parent || !!parent.taskId; // wait for an unbound ancestor
-        });
+        const index = nextCreatableIndex(
+          current,
+          (r) => creatingRef.current.has(r.key) || createdKeysRef.current.has(r.key),
+        );
         if (index === -1) break;
         const row = current[index];
-        const parent = parentRowAt(current, index);
-        const position = siblingPositionAt(current, index, positionOf);
-        const description = foldedDescriptionFor(current, index);
+        // Title, folded description, parent, and the fractional key that says
+        // WHERE the line was opened — built in `outline.ts` so a check can read
+        // the payload without a room (TD2-188).
+        const op = createOpFor(current, index, {
+          boardId: board,
+          positionOf,
+          rootTarget: rootTargetRef.current as Record<string, unknown>,
+        });
+        if (!op) break;
+        const position = op.input.position;
         creatingRef.current.add(row.key);
         createdKeysRef.current.add(row.key);
         bufferRef.current.set(row.key, row.text);
-        const [result] = await ws.bulk([
-          {
-            op: "create",
-            input: {
-              title: row.text.trim(),
-              description: description || undefined,
-              boardId: board,
-              parentId: parent?.taskId ?? undefined,
-              position,
-              // Only roots carry the pin/bucket — a subtask inherits its parent's.
-              ...(parent ? {} : rootTargetRef.current),
-            },
-          },
-        ]);
+        const [result] = await ws.bulk([op]);
         creatingRef.current.delete(row.key);
         const id = result?.ok ? result.id : undefined;
         if (!id) {
@@ -459,14 +456,10 @@ export function useOutlineDraft({
       if (deletedRef.current.has(id)) continue;
       const index = current.findIndex((r) => r.taskId === id);
       if (index === -1) continue;
-      const parent = parentRowAt(current, index);
-      const position = siblingPositionAt(current, index, positionOf);
-      localPosRef.current.set(id, position);
-      moves.push({
-        op: "move",
-        id,
-        target: { parentId: parent?.taskId ?? null, position },
-      });
+      const op = moveOpFor(current, index, positionOf);
+      if (!op) continue;
+      localPosRef.current.set(id, op.target.position);
+      moves.push(op);
     }
     // Deletes: only ids the user actually deleted, and only ones this session
     // knows. An id from nowhere means a bug upstream — log it, don't delete it.
@@ -560,21 +553,27 @@ export function useOutlineDraft({
     [persistText, pumpCreates, writeRows],
   );
 
-  /** The deepest indent a task at `index` may take = (nearest task above)+1.
-   *  -1 means there's no task above to nest under (the very first line). */
-  const maxTaskIndent = (index: number) => {
-    for (let i = index - 1; i >= 0; i--) if (!rows[i].desc) return rows[i].indent + 1;
-    return -1;
-  };
-
-  /** Apply a row-list change, then re-persist the fields it touched. Keeping the
-   *  two together is what stops a structural key silently losing text. */
-  const applyRows = (
-    nextRows: OutlineRow[],
-    persistIndexes: number[] = [],
-  ) => {
-    writeRows(() => nextRows);
-    persistIndexes.forEach((i) => persistText(nextRows, i));
+  /** Apply one structural edit: the new rows, the fields it touched, the ops it
+   *  implies, and the caret. The DECISION is pure (`outline.ts`); this is the
+   *  half that needs a room, a socket and a DOM. Keeping them together in one
+   *  place is what stops a structural key silently losing text. */
+  const applyEdit = (edit: RowEdit) => {
+    writeRows(() => edit.rows);
+    edit.persist.forEach((i) => persistText(edit.rows, i));
+    if ("movedId" in edit) noteMoved(edit.movedId ?? null);
+    if (edit.deleted)
+      noteDeleted(edit.deleted.taskId, edit.rows, edit.deleted.indent, edit.deleted.from);
+    if (edit.descOwner !== undefined) {
+      // Immediately, not on the text throttle: the row that WAS carrying this
+      // description may not exist any more, so there is nothing left to flush.
+      const owner = edit.rows[edit.descOwner];
+      if (owner?.taskId)
+        ws.editTaskLive(owner.taskId, {
+          description: foldedDescriptionFor(edit.rows, edit.descOwner),
+        });
+    }
+    if (edit.creates) void pumpCreates();
+    setFocus(edit.focus);
   };
 
   const onRowKeyDown = (
@@ -582,6 +581,7 @@ export function useOutlineDraft({
     row: OutlineRow,
     index: number,
   ) => {
+    const caretAt = () => e.currentTarget.selectionStart ?? row.text.length;
     if (e.key === "Escape") {
       e.preventDefault();
       void flush();
@@ -592,41 +592,11 @@ export function useOutlineDraft({
     // ---- Description rows: a plain multiline block ----
     if (row.desc) {
       if (e.key === "Tab" && e.shiftKey) {
-        // SHIFT+TAB inside a description: pop the CURRENT line out as a bullet
-        // (a task at the description's own indent = a subtask of its owner),
-        // leaving the lines above as the description; lines below follow it.
+        // Pop the line the caret is on out as a bullet — a subtask of the task
+        // this description belongs to.
         e.preventDefault();
-        const val = row.text;
-        const caret = e.currentTarget.selectionStart ?? val.length;
-        const lineStart = val.lastIndexOf("\n", caret - 1) + 1;
-        const nl = val.indexOf("\n", caret);
-        const lineEnd = nl === -1 ? val.length : nl;
-        const before = val.slice(0, lineStart).replace(/\n$/, "");
-        const currentLine = val.slice(lineStart, lineEnd);
-        const after = val.slice(lineEnd).replace(/^\n/, "");
-
-        const bullet = newRow(row.indent, false, currentLine);
-        const inserts: OutlineRow[] = [bullet];
-        if (after.trim()) inserts.push(newRow(row.indent + 1, true, after));
-        const copy = rows.slice();
-        if (before.trim()) {
-          copy[index] = { ...row, text: before };
-          copy.splice(index + 1, 0, ...inserts);
-        } else {
-          copy.splice(index, 1, ...inserts); // desc had only this line → replace it
-        }
-        // The owner's description lost a line, and a new task row appeared.
-        applyRows(copy, [copy.findIndex((r) => r.desc && r.key === row.key)].filter((i) => i >= 0));
-        const owner = descOwnerAt(copy, copy.findIndex((r) => r.key === bullet.key));
-        if (owner) {
-          const oi = copy.findIndex((r) => r.key === owner.key);
-          if (oi >= 0 && owner.taskId)
-            ws.editTaskLive(owner.taskId, {
-              description: foldedDescriptionFor(copy, oi),
-            });
-        }
-        void pumpCreates();
-        setFocus({ key: bullet.key, caret: currentLine.length });
+        const edit = popDescLine(rows, index, caretAt());
+        if (edit) applyEdit(edit);
         return;
       }
       if (e.key === "Tab") e.preventDefault(); // forward Tab: no-op (deepest role)
@@ -637,65 +607,20 @@ export function useOutlineDraft({
     // ---- Task rows ----
     if (e.key === "Tab") {
       e.preventDefault();
-      const max = maxTaskIndent(index);
-      if (max < 0) return; // first line — nothing above to nest under
-      if (e.shiftKey) {
-        // Outdent one level; at the left edge, nothing happens.
-        if (row.indent > 0) {
-          applyRows(rows.map((r) => (r.key === row.key ? { ...r, indent: r.indent - 1 } : r)));
-          noteMoved(row.taskId);
-          setFocus({ key: row.key, caret: e.currentTarget.selectionStart ?? row.text.length });
-        }
-        return;
-      }
-      if (row.indent < max) {
-        // Nest one level deeper (subtask / sub-subtask …).
-        applyRows(rows.map((r) => (r.key === row.key ? { ...r, indent: r.indent + 1 } : r)));
-        noteMoved(row.taskId);
-      } else {
-        // Already as deep as allowed → this line becomes the task's description.
-        // The task itself stops existing: an explicit delete, and its text joins
-        // the owner's description field.
-        const copy = rows.map((r) =>
-          r.key === row.key ? { ...r, desc: true, taskId: null } : r,
-        );
-        applyRows(copy);
-        noteDeleted(row.taskId, copy, row.indent, index + 1);
-        const di = copy.findIndex((r) => r.key === row.key);
-        if (di >= 0) persistText(copy, di);
-      }
-      setFocus({ key: row.key, caret: e.currentTarget.selectionStart ?? row.text.length });
+      const edit = retabRow(rows, index, { shift: e.shiftKey, caret: caretAt() });
+      if (edit) applyEdit(edit);
       return;
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      const caret = e.currentTarget.selectionStart ?? row.text.length;
-      // Split at the caret → a new sibling task at the same indent. A bound task
-      // keeps its id on the head (same task, renamed); the tail is a new task.
-      const head = row.text.slice(0, caret);
-      const tail = row.text.slice(caret);
-      const created = newRow(row.indent, false, tail);
-      const copy = rows.slice();
-      copy[index] = { ...row, text: head };
-      copy.splice(index + 1, 0, created);
-      // The head's title changed, and the tail needs a task of its own.
-      applyRows(copy, [index]);
-      void pumpCreates();
-      setFocus({ key: created.key, caret: 0 });
+      const edit = splitRow(rows, index, caretAt());
+      if (edit) applyEdit(edit);
       return;
     }
     if (e.key === "Backspace" && (e.currentTarget.selectionStart ?? 0) === 0 && index > 0) {
-      // Merge into the previous row (its id/role win); this row is dropped, so its
-      // task — if it had one — is deliberately deleted.
       e.preventDefault();
-      const prev = rows[index - 1];
-      const mergedCaret = prev.text.length;
-      const copy = rows.slice();
-      copy[index - 1] = { ...prev, text: prev.text + row.text };
-      copy.splice(index, 1);
-      applyRows(copy, [index - 1]);
-      noteDeleted(row.taskId, copy, row.indent, index);
-      setFocus({ key: prev.key, caret: mergedCaret });
+      const edit = mergeIntoPrevious(rows, index);
+      if (edit) applyEdit(edit);
       return;
     }
     if (e.key === "ArrowUp" && index > 0) {
