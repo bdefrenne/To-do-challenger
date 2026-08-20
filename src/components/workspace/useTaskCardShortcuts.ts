@@ -22,9 +22,10 @@ export const CARD_SHORTCUTS = [
   { keys: ["1", "2"], label: "Importance: Elevated · High" },
   { keys: ["Space"], label: "Assign / unassign yourself" },
   { keys: ["Delete", "⌫"], label: "Delete — done or in review: park in DONE THIS WEEK" },
-  { keys: ["↑"], label: "Send to THIS WEEK" },
-  { keys: ["→"], label: "Send to BACKLOG" },
-  { keys: ["↓"], label: "Send to LATER" },
+  { keys: ["↑"], label: "Send to THIS WEEK — top, do it next" },
+  { keys: ["→"], label: "Send to THIS WEEK — bottom of the queue" },
+  { keys: ["↓"], label: "Send to BACKLOG" },
+  { keys: ["←"], label: "Send to LATER" },
 ] as const;
 
 /**
@@ -83,11 +84,17 @@ export function useTaskCardShortcuts(
   useCardShortcut(ref, "delete", del);
   useCardShortcut(ref, "backspace", del);
 
-  // Laid out the way the groups sit on the canvas: UP to this week's work, RIGHT
-  // to the backlog, DOWN to later.
-  const send = (to: "thisWeek" | "backlog" | "later") =>
-    live(() => id && triage && sendToPlacement(id, to));
+  // UP and RIGHT are the same destination at opposite ends: UP is "do this next"
+  // (top of the queue), RIGHT is "this week, but after the rest" (bottom). DOWN
+  // and LEFT push it out of the week — both to the top of their lane, so what you
+  // just deferred is what you see first when you come back to that pile.
+  //
+  // Off the canvas there's no lane to position within, so UP and RIGHT collapse
+  // to the same gesture — see `sendToPlacement`.
+  const send = (to: "thisWeek" | "backlog" | "later", end: "top" | "bottom" = "top") =>
+    live(() => id && triage && sendToPlacement(id, to, end));
   useCardShortcut(ref, "arrowup", send("thisWeek"));
-  useCardShortcut(ref, "arrowright", send("backlog"));
-  useCardShortcut(ref, "arrowdown", send("later"));
+  useCardShortcut(ref, "arrowright", send("thisWeek", "bottom"));
+  useCardShortcut(ref, "arrowdown", send("backlog"));
+  useCardShortcut(ref, "arrowleft", send("later"));
 }

@@ -1,5 +1,7 @@
 "use client";
 
+import { ChevronRight } from "lucide-react";
+
 /**
  * One bucket's header: a full-width gradient band with white text — the rule you
  * scan the page by, and the hit target that folds everything under it away.
@@ -60,7 +62,7 @@ export function SeparatorHeader({
           collapsed ? "" : "rotate-90",
         ].join(" ")}
       >
-        ▶
+        <ChevronRight size={14} strokeWidth={2} />
       </span>
       <span
         className={[

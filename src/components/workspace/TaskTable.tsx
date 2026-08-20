@@ -1,5 +1,6 @@
 "use client";
 
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
@@ -219,7 +220,11 @@ function GroupHeader({
       onDrop={onDropInto}
     >
       <button onClick={onToggle} className="text-faint hover:text-fg" aria-label="Toggle group">
-        {collapsed ? "▸" : "▾"}
+        {collapsed ? (
+          <ChevronRight aria-hidden size={14} strokeWidth={2} />
+        ) : (
+          <ChevronDown aria-hidden size={14} strokeWidth={2} />
+        )}
       </button>
       <span
         className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide ${tone.bg} ${tone.text} ${tone.border}`}

@@ -501,8 +501,8 @@ export async function resolvePlacementSection(
     // (`WEEK_GROUP_FALLBACK`), because a hand-made group has no id to find.
     //
     // Without this, filing into a group the canvas hasn't drawn yet silently did
-    // nothing and the card stayed in INBOX — invisible for a brand-new tray
-    // (TODAY on every existing canvas), for any canvas whose trays haven't been
+    // nothing and the card stayed in INBOX — invisible for a brand-new tray on
+    // an existing canvas, for any canvas whose trays haven't been
     // materialised, and for THIS WEEK on every canvas with no starred group,
     // which made the board view's THIS WEEK band unfillable (TD2-2).
     return systemLaneId(placement, canvasId, boardId);
@@ -528,12 +528,61 @@ export async function resolvePlacementSection(
   return systemLaneId(placement, group.canvasId, boardId);
 }
 
+/**
+ * WHERE IN a lane a filed card lands — the position to stamp for "top" / "bottom".
+ *
+ * The sibling of `resolvePlacementSection`: that one answers *which* lane a
+ * placement means, this one answers *where in it*, and both live here so every
+ * surface gets the same answer. Before this, "the top of BACKLOG" was a thing
+ * the mounted canvas worked out from the nodes it happened to be rendering — so
+ * the same keypress positioned a card on the canvas and didn't off it, and an
+ * agent filing through MCP had no way to say "do this one next" at all.
+ *
+ * A lane = the top-level, live tasks on one board carrying one pin (or NO pin,
+ * which is what an INBOX lane is). Its members are mixed-status, so their
+ * positions routinely TIE — `position` is minted per (status, parent) and never
+ * renumbered. That's why this returns min-1 / max+1 rather than an index into a
+ * restamped run: strictly-before-everything and strictly-after-everything are
+ * the only two answers ties can't corrupt, and they move exactly one row instead
+ * of renumbering a lane that other views (a kanban column) are ordering too.
+ * `position` is double precision, so the walk outward has room to spare.
+ *
+ * `excludeId` is the card being sent: counting its own current position would
+ * make "send it to the top" mean "sit just above where you already are".
+ */
+export async function positionAtEnd(
+  pin: string | null,
+  boardId: string | null,
+  end: "top" | "bottom",
+  excludeId?: string,
+): Promise<number> {
+  const [agg] = await db
+    .select({
+      min: sql<number | null>`min(${tasks.position})`,
+      max: sql<number | null>`max(${tasks.position})`,
+    })
+    .from(tasks)
+    .where(
+      and(
+        isNull(tasks.deletedAt),
+        isNull(tasks.archivedAt),
+        isNull(tasks.parentId),
+        boardId === null ? isNull(tasks.boardId) : eq(tasks.boardId, boardId),
+        pin === null ? isNull(tasks.canvasSectionId) : eq(tasks.canvasSectionId, pin),
+        ...(excludeId ? [sql`${tasks.id} <> ${excludeId}`] : []),
+      ),
+    );
+  // Empty lane: any number will do, and 0 keeps the run near where positions
+  // normally live rather than drifting from whatever the last card held.
+  if (agg?.min == null || agg?.max == null) return 0;
+  return end === "top" ? Number(agg.min) - 1 : Number(agg.max) + 1;
+}
+
 /** How a placement change reads on the activity timeline. Every move is
  *  announced — a card that relocated itself with no explanation is the thing
  *  these lines exist to prevent. */
 const PLACEMENT_LOG: Record<TaskPlacement, string> = {
   inbox: "📥 Moved back to INBOX",
-  today: "☀️ Moved to TODAY",
   thisWeek: "📅 Moved to THIS WEEK",
   backlog: "🗂️ Moved to BACKLOG",
   later: "🕓 Moved to LATER",
@@ -1669,6 +1718,11 @@ export interface UpdateTaskInput {
   placement?: TaskPlacement;
   /** Older boolean spelling of `placement`: true = thisWeek, false = inbox. */
   thisWeek?: boolean;
+  /** Which END of the destination lane to land at — see `positionAtEnd`. Works
+   *  with or without a `placement`: with one it says where in the lane it's
+   *  being filed into, without one it re-ends the task in the lane it's already
+   *  in ("actually, do this next"). */
+  end?: "top" | "bottom";
   value?: FibPoints | null;
   difficulty?: FibPoints | null;
   importance?: Importance;
@@ -1809,6 +1863,16 @@ export async function updateTask(
       values.canvasSectionId = target;
     else placed = null;
   }
+  // Where in the lane. Independent of whether the lane CHANGED: re-ending a card
+  // inside the lane it already sits in is the whole point of having both ends on
+  // the keyboard, and `placed` is null for exactly that case.
+  if (patch.end) {
+    const pin =
+      values.canvasSectionId !== undefined
+        ? (values.canvasSectionId as string | null)
+        : current.canvasSectionId;
+    values.position = await positionAtEnd(pin, current.boardId, patch.end, id);
+  }
 
   const [row] = await db
     .update(tasks)
@@ -1887,6 +1951,11 @@ export async function moveTask(
     placement?: TaskPlacement;
     /** Older boolean spelling of `placement`: true = thisWeek, false = inbox. */
     thisWeek?: boolean;
+    /** Which END of the destination lane to land at — see `positionAtEnd`. The
+     *  keyboard's send-arrows and any agent that means "do this one next". An
+     *  explicit `position` wins: a drag knows an exact index, which is a
+     *  stricter answer than an end. */
+    end?: "top" | "bottom";
   },
   userId: string,
   author = "You",
@@ -1923,8 +1992,6 @@ export async function moveTask(
   // completion, so it can't close over unfinished children either.
   if (statusChanged && status === "done") await assertSubtreeDone(id, current.title);
   const boardChanged = boardId !== current.boardId;
-  const position =
-    target.position ?? (await nextPosition(userId, status, parentId ?? null));
 
   // A task follows its board's project (so the code prefix falls back
   // board → project → user). Board-less → user-scoped (projectId null).
@@ -2015,6 +2082,16 @@ export async function moveTask(
     canvasSectionId = await resolvePlacementSection("thisWeek", boardId, current.projectId);
     if (canvasSectionId !== null) placed = "thisWeek";
   }
+
+  // Position LAST, because "top"/"bottom" is relative to the lane resolved just
+  // above — the pin has to be settled before we can ask where in it to land.
+  // Precedence: an explicit position (a drag's exact index) > an end > append to
+  // the (status, parent) group, which is what a move that says nothing wants.
+  const position =
+    target.position ??
+    (target.end
+      ? await positionAtEnd(canvasSectionId, boardId, target.end, id)
+      : await nextPosition(userId, status, parentId ?? null));
 
   // Same work-entry claim as updateTask: a move that parks the task in
   // Analyzing/Building from an agent surface records who's on it.
@@ -4229,7 +4306,7 @@ export async function markDayReady(
   day: string,
 ): Promise<WorkDay> {
   // A snapshot is of the list AS IT STANDS, so it can only honestly be taken for
-  // the day you're in. Allowing a past day would record today's TODAY as that
+  // the day you're in. Allowing a past day would record this week's board as that
   // morning's plan — a fiction, stored as a fact, and the drift figures computed
   // from it would be nonsense.
   const current = currentWorkingDay();
@@ -4237,8 +4314,11 @@ export async function markDayReady(
     throw new ValidationError(
       `A snapshot records the list as it stands now, so it can only be taken for the current working day (${current}), not ${day}.`,
     );
-  const today = await tasksInPlacement(userId, projectId, "today");
-  const snapshot: WorkDaySnapshotEntry[] = today.map((t) => ({
+  // THIS WEEK, since TD2-202 retired the TODAY bucket this used to freeze. Same
+  // meaning — the list you commit to in the morning — read off the tray the work
+  // actually sits in now.
+  const planned = await tasksInPlacement(userId, projectId, "thisWeek");
+  const snapshot: WorkDaySnapshotEntry[] = planned.map((t) => ({
     taskId: t.id,
     ...(t.code ? { ref: t.code } : {}),
     title: t.title,
@@ -4665,8 +4745,68 @@ export async function updateProject(
   return rowToProject(row);
 }
 
-/** Delete a project (cascades to its boards, and their tasks). */
+/**
+ * How many tasks a cascade would take with a board/project — live, archived AND
+ * trashed, because the point is what would be DESTROYED, and a `tasks` row is a
+ * row whatever view it's hidden from.
+ *
+ * `trashed` is reported separately so the refusal can name the fix: an ordinary
+ * task has to be moved or deleted, one already in the Trash has to be restored
+ * and moved, or emptied.
+ */
+async function cascadeTaskCount(
+  scope: { boardId?: string; projectId?: string },
+): Promise<{ total: number; trashed: number }> {
+  const where = scope.boardId
+    ? eq(tasks.boardId, scope.boardId)
+    : eq(tasks.projectId, scope.projectId!);
+  const [row] = await db
+    .select({
+      total: sql<number>`count(*)`,
+      trashed: sql<number>`count(${tasks.deletedAt})`,
+    })
+    .from(tasks)
+    .where(where);
+  return { total: Number(row?.total ?? 0), trashed: Number(row?.trashed ?? 0) };
+}
+
+/** The refusal, phrased as the thing to do next. */
+function tasksInTheWayError(
+  what: string,
+  name: string,
+  counts: { total: number; trashed: number },
+): ValidationError {
+  const n = counts.total;
+  const trashed =
+    counts.trashed > 0
+      ? ` (${counts.trashed} of them in the Trash — restore and move them, or empty the Trash)`
+      : "";
+  return new ValidationError(
+    `Can’t delete ${what} “${name}”: it still holds ${n} task${n === 1 ? "" : "s"}${trashed}. ` +
+      `Move them to another ${what} first, or delete them — deleting ${what === "board" ? "a board" : "a project"} ` +
+      `would destroy them outright, and nothing else in the app can do that.`,
+    { code: "tasks_in_the_way", taskCount: n, trashedCount: counts.trashed },
+  );
+}
+
+/**
+ * Delete a project — REFUSED while it still holds tasks (TD2-196).
+ *
+ * Every other way of deleting a task puts it in the Trash, where it can be
+ * restored; the row cascade here is the one path that would end tasks for good,
+ * which makes it the one path that must not be reachable by accident. So the
+ * cascade is kept for the project's own furniture (boards, canvas, members) and
+ * closed for tasks: empty it first, deliberately, through the door that has an
+ * undo.
+ */
 export async function deleteProject(userId: string, id: string): Promise<boolean> {
+  const [project] = await db
+    .select({ name: projects.name })
+    .from(projects)
+    .where(eq(projects.id, id));
+  if (!project) return false;
+  const counts = await cascadeTaskCount({ projectId: id });
+  if (counts.total > 0) throw tasksInTheWayError("project", project.name, counts);
   const res = await db
     .delete(projects)
     .where(eq(projects.id, id))
@@ -4891,8 +5031,17 @@ export async function reorderBoards(
   return true;
 }
 
-/** Delete a board (cascades to its tasks + their logs). */
+/** Delete a board — REFUSED while it still holds tasks, for the reason
+ *  `deleteProject` gives: the row cascade is the only path in the app that can
+ *  end a task without it passing through the Trash first. */
 export async function deleteBoard(userId: string, id: string): Promise<boolean> {
+  const [board] = await db
+    .select({ name: boards.name })
+    .from(boards)
+    .where(eq(boards.id, id));
+  if (!board) return false;
+  const counts = await cascadeTaskCount({ boardId: id });
+  if (counts.total > 0) throw tasksInTheWayError("board", board.name, counts);
   const res = await db
     .delete(boards)
     .where(eq(boards.id, id))

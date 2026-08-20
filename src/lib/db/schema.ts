@@ -897,8 +897,8 @@ export const canvasNodes = pgTable(
 
      ready_at + snapshot  what the todo looked like when you committed to the
                           day. The only thing here that can't be reconstructed:
-                          TODAY is a mutable bucket, so by evening the morning's
-                          list is genuinely gone. Compared against what actually
+                          THIS WEEK is a mutable bucket, so by evening the
+                          morning's list is genuinely gone. Compared against what actually
                           shipped, it answers "was my list clear enough?".
      drafted_at + summary the standup prose. Authored judgement — the why, the
                           cost, what's next — which was never in the data.

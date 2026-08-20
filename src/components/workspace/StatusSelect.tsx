@@ -1,5 +1,6 @@
 "use client";
 
+import { Check } from "lucide-react";
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 
@@ -35,7 +36,7 @@ export function StatusSelect({
           >
             <span className={`h-2 w-2 rounded-full ${t.dot}`} aria-hidden />
             <span className="truncate">{STATUS_LABEL[s]}</span>
-            {current ? <span className="ml-auto text-accent">✓</span> : null}
+            {current ? <span className="ml-auto text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
           </button>
         );
       })}

@@ -25,41 +25,40 @@
 import type { CanvasNode, Task, TaskPlacement, TaskStatus } from "./types";
 
 /* --------------------------- System groups ---------------------------
- * Three groups on every canvas are MACHINE-MANAGED: the editor creates them,
- * names them, and keeps one lane per board inside each. They're the triage
+ * Every group on a canvas is MACHINE-MANAGED: the editor creates them, names
+ * them, and keeps one lane per board inside each. They're the triage
  * destinations — where a card goes when it isn't scheduled:
  *
  *   INBOX           untriaged. The odd one out: its lanes mean "unpinned", so a
  *                   task lands here by having no pin at all (`isInboxNode`).
- *   TODAY           on today's shortlist — the daily counterpart to THIS WEEK.
- *                   Machine-managed rather than hand-starred, so it exists on
- *                   every canvas and agents can file into it without the user
- *                   having made a group first. A real pin.
+ *   THIS WEEK       to be done this week, or being worked on now. A real pin.
+ *                   Hand-curated until TD-137 (the user made the group, named it
+ *                   and starred it), which is why some of the reasoning further
+ *                   down this file still treats it as the odd one out.
  *   BACKLOG         triaged, not scheduled. A real pin.
  *   LATER           deliberately deferred. A real pin.
  *   DONE THIS WEEK  finished, not yet swept. The holding pen that makes deleting
  *                   a done card a two-step move (see `deletionOf`).
  *
- * THIS WEEK is deliberately NOT one of these — it's hand-curated (the user makes
- * the group, names it, stars it) and lives further down this file.
+ * TODAY was a fifth, retired in TD2-202: a daily shortlist nobody filed into, so
+ * its cards were moved to the top of THIS WEEK and the tray deleted. Its nodes
+ * are swept by the canvas reconciler, alongside DONE THIS WEEK's.
  *
  * Each group carries its kind as a `data` flag (`data.backlog === true`), set on
  * the `section_group` AND on every lane inside it, so a node can be classified
  * without walking to its parent. */
 export type SystemGroup =
   | "inbox"
-  | "today"
   | "thisWeek"
   | "backlog"
   | "later"
   | "doneThisWeek";
 
-/** The five kinds in display order — also the order they're stacked down the
- *  left of a canvas: what's arriving, what's on today's list, what's parked,
- *  what's finished. */
+/** The kinds in display order — also the order they're stacked down the
+ *  left of a canvas: what's arriving, what's on this week's board, what's
+ *  parked, what's finished. */
 export const SYSTEM_GROUPS: readonly SystemGroup[] = [
   "inbox",
-  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -69,7 +68,6 @@ export const SYSTEM_GROUPS: readonly SystemGroup[] = [
 /** Header text for each system group's container. */
 export const SYSTEM_GROUP_TITLE: Record<SystemGroup, string> = {
   inbox: "INBOX",
-  today: "TODAY",
   thisWeek: "THIS WEEK",
   backlog: "BACKLOG",
   later: "LATER",
@@ -249,9 +247,9 @@ export const masterSectionsByBoard = (
 export const LEGACY_WEEK_LANE_PREFIX = "wk-";
 
 /**
- * The ids of the trays arranged around THIS WEEK — INBOX to THIS WEEK's left
- * with TODAY under it, BACKLOG and LATER below — which travel together as one
- * rigid unit on the canvas.
+ * The ids of the trays arranged around THIS WEEK — INBOX to THIS WEEK's left,
+ * BACKLOG and LATER below — which travel together as one rigid unit on the
+ * canvas.
  * Grabbing any one of them drags the others along, preserving whatever relative
  * offset they currently sit at (see `onNodePointerDown` in CanvasEditor).
  *
@@ -299,7 +297,6 @@ export function anchoredTrayGroupIds(
   const existing = new Set(canvasNodes.map((n) => n.id));
   const ids = [
     systemGroupId("thisWeek", canvasId),
-    systemGroupId("today", canvasId),
     systemGroupId("inbox", canvasId),
     systemGroupId("backlog", canvasId),
     systemGroupId("later", canvasId),
@@ -433,12 +430,11 @@ export function buildSectionMembership(
 export type PlacementMap = Record<string, TaskPlacement>;
 
 /** Display order of the buckets in the board views — the triage ladder read top
- *  to bottom: what's unsorted, what just finished, what's on today, this week,
+ *  to bottom: what's unsorted, what just finished, what's on this week's board,
  *  and what's parked. */
 export const PLACEMENT_ORDER: readonly TaskPlacement[] = [
   "inbox",
   "doneThisWeek",
-  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -481,10 +477,10 @@ export const placementTitle = (
  * The gradient behind a bucket's separator bar — a full-width band with white
  * text, so the separators CUT the page rather than sitting in it.
  *
- * The ramp carries the ladder's meaning, warm → cool → grey: TODAY is a sunrise
- * because it's the only bucket that means *now*, THIS WEEK cools through blue to
- * indigo, DONE THIS WEEK settles into the same green the finished cards use, and
- * everything unscheduled greys out, fading further the further out it is.
+ * The ramp carries the ladder's meaning, warm → cool → grey: THIS WEEK — the only
+ * bucket that means *now* — cools through blue to indigo, DONE THIS WEEK settles
+ * into the same green the finished cards use, and everything unscheduled greys
+ * out, fading further the further out it is.
  *
  * Each runs left→right from its DARKEST stop, which is where the label sits — so
  * the white text keeps its contrast even on the pale end of the grey ramp, and
@@ -496,7 +492,6 @@ export const placementTitle = (
 export const PLACEMENT_BAR: Record<TaskPlacement, string> = {
   inbox: "bg-linear-to-r from-slate-700 via-slate-600 to-slate-400",
   doneThisWeek: "bg-linear-to-r from-emerald-700 via-emerald-600 to-teal-400",
-  today: "bg-linear-to-r from-rose-600 via-orange-500 to-amber-400",
   thisWeek: "bg-linear-to-r from-indigo-700 via-blue-600 to-sky-400",
   backlog: "bg-linear-to-r from-slate-600 via-slate-500 to-slate-300",
   later: "bg-linear-to-r from-slate-500 via-slate-400 to-slate-200",

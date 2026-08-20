@@ -17,6 +17,10 @@
 */
 
 import {
+  ArrowUpRight,
+  MapPin,
+} from "lucide-react";
+import {
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -827,7 +831,12 @@ function EventDetailDialog({
       </div>
       <h2 className="text-base font-semibold text-fg">{event.title}</h2>
       <p className="mt-1 text-sm text-muted">{when}</p>
-      {event.location && <p className="mt-1 text-sm text-muted">📍 {event.location}</p>}
+      {event.location && (
+        <p className="mt-1 flex items-center gap-1.5 text-sm text-muted">
+          <MapPin aria-hidden size={14} strokeWidth={1.75} className="shrink-0" />
+          {event.location}
+        </p>
+      )}
       {event.description && (
         <p className="mt-3 whitespace-pre-wrap text-sm text-fg">{event.description}</p>
       )}
@@ -842,7 +851,10 @@ function EventDetailDialog({
             rel="noreferrer"
             className="text-xs text-accent underline-offset-2 hover:underline"
           >
-            Open in Google Calendar ↗
+            <span className="inline-flex items-center gap-1">
+              Open in Google Calendar
+              <ArrowUpRight aria-hidden size={12} strokeWidth={2} />
+            </span>
           </a>
         ) : (
           <span />

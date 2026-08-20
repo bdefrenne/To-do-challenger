@@ -29,14 +29,13 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
  *  `outline` is the canvas ring color (see STATUS_CANVAS_BADGE). */
 export const STATUS_TONE: Record<
   TaskStatus,
-  { text: string; bg: string; border: string; dot: string; icon: string; outline: string }
+  { text: string; bg: string; border: string; dot: string; outline: string }
 > = {
   backlog: {
     text: "text-slate-500",
     bg: "bg-slate-100",
     border: "border-slate-200",
     dot: "bg-slate-300",
-    icon: "○",
     outline: "outline-slate-300",
   },
   todo: {
@@ -44,7 +43,6 @@ export const STATUS_TONE: Record<
     bg: "bg-slate-100",
     border: "border-slate-200",
     dot: "bg-slate-400",
-    icon: "◔",
     outline: "outline-slate-400",
   },
   analyzing: {
@@ -52,7 +50,6 @@ export const STATUS_TONE: Record<
     bg: "bg-cyan-50",
     border: "border-cyan-500/30",
     dot: "bg-cyan-500",
-    icon: "◑",
     outline: "outline-cyan-500",
   },
   analyzed: {
@@ -60,7 +57,6 @@ export const STATUS_TONE: Record<
     bg: "bg-cyan-50",
     border: "border-cyan-700/30",
     dot: "bg-cyan-700",
-    icon: "◕",
     outline: "outline-cyan-700",
   },
   building: {
@@ -68,7 +64,6 @@ export const STATUS_TONE: Record<
     bg: "bg-blue-50",
     border: "border-blue-600/30",
     dot: "bg-blue-600",
-    icon: "◐",
     outline: "outline-blue-600",
   },
   review: {
@@ -76,7 +71,6 @@ export const STATUS_TONE: Record<
     bg: "bg-violet-50",
     border: "border-violet-600/30",
     dot: "bg-violet-600",
-    icon: "◕",
     outline: "outline-violet-600",
   },
   done: {
@@ -84,7 +78,6 @@ export const STATUS_TONE: Record<
     bg: "bg-buff-soft",
     border: "border-buff/25",
     dot: "bg-buff",
-    icon: "●",
     outline: "outline-buff",
   },
 };

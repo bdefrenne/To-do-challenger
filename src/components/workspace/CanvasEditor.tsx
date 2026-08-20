@@ -17,6 +17,18 @@
  * so reloads and the canvas index keep working.
  */
 
+import {
+  Eraser,
+  Maximize,
+  Minus,
+  MousePointer2,
+  Pencil,
+  Plus,
+  Rows3,
+  SquareStack,
+  StickyNote,
+  Type as TypeIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { LiveObject, type Json } from "@liveblocks/client";
@@ -121,7 +133,11 @@ const TRAY_GAP = 120;
  *
  *  The full list stays as it is in `sections.ts`: it drives `PLACEMENT_ORDER`,
  *  `trayOfPlacement`, `PLACEMENT_BAR` and the project Boards view, all of which
- *  still want the bucket. Only the canvas stops rendering a lane for it. */
+ *  still want the bucket. Only the canvas stops rendering a lane for it.
+ *
+ *  TODAY isn't here because it isn't anywhere any more (TD2-202) — it was
+ *  removed from `SYSTEM_GROUPS` outright, and its leftover nodes are swept
+ *  below. */
 const CANVAS_SYSTEM_GROUPS = SYSTEM_GROUPS.filter((k) => k !== "doneThisWeek");
 
 /** Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
@@ -1078,6 +1094,15 @@ export function CanvasEditor({
         .map((n) => n.id),
     );
 
+    // TODAY, retired outright (TD2-202): its cards were moved to the top of THIS
+    // WEEK and the bucket deleted, so unlike DONE THIS WEEK there is nothing
+    // left of it anywhere. Matched on the id PREFIX rather than through
+    // `systemGroupOf`, which can't name a kind that no longer exists in
+    // `SystemGroup` — `today-<canvasId>` is the group and
+    // `today-<canvasId>-<boardId>` its lanes, so one prefix catches both.
+    const todayPrefix = `today-${canvasId}`;
+    removes.push(...nodes.filter((n) => n.id.startsWith(todayPrefix)).map((n) => n.id));
+
     // Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
     // hand-made (TD-137). The reconciler now creates `thisWeek-<canvasId>-…`
     // lanes for the same boards, so leaving these would double every lane in the
@@ -1250,8 +1275,8 @@ export function CanvasEditor({
 
   /**
    * Arrange the tray column: THIS WEEK, BACKLOG, LATER stacked downward, with
-   * INBOX beside THIS WEEK and TODAY hanging under INBOX — every one of them
-   * DERIVED from a single stored origin (TD2-171).
+   * INBOX beside THIS WEEK — every one of them DERIVED from a single stored
+   * origin (TD2-171).
    *
    * The origin is the head tray's own x/y. There is exactly one stored position
    * for the whole column, so no tray's box can ever claim the ground another
@@ -1260,11 +1285,12 @@ export function CanvasEditor({
    * derived from it.
    *
    * That's the fix for the overlap. It used to be THIS WEEK that owned a stored
-   * y, with TODAY hung ABOVE it (`week.y - today.height`): every card added to
-   * TODAY moved TODAY's top edge up instead of extending it down, and the moment
-   * a tray was dragged it carried `placed` and stopped being arranged at all —
-   * so it went on auto-fitting its height straight through its neighbour's
-   * frame. Two nodes claiming the same y, with nothing to resolve it.
+   * y, with the now-retired TODAY tray hung ABOVE it (`week.y - today.height`):
+   * every card added to TODAY moved TODAY's top edge up instead of extending it
+   * down, and the moment a tray was dragged it carried `placed` and stopped
+   * being arranged at all — so it went on auto-fitting its height straight
+   * through its neighbour's frame. Two nodes claiming the same y, with nothing
+   * to resolve it.
    *
    * The stacking has to be continuous rather than a one-time placement, because
    * `computeGroupLayout` keeps auto-fitting each group's box to its own content
@@ -1288,15 +1314,13 @@ export function CanvasEditor({
     if (anyDraggingIds.size) return;
     // THIS WEEK is the head — the row you actually work out of, and the top of
     // the timescale the column reads as (this week → backlog → later, pushing
-    // DOWN). TODAY isn't in this column at all any more (TD2-186): it belongs
-    // with triage, not with the horizons, so it hangs under INBOX below.
+    // DOWN).
     const head = nodes.find((n) => n.id === systemGroupId("thisWeek", canvasId));
     if (!head) return;
     const below = (["backlog", "later"] as const)
       .map((kind) => nodes.find((n) => n.id === systemGroupId(kind, canvasId)))
       .filter((n): n is CanvasNode => n !== undefined);
     const inbox = nodes.find((n) => n.id === systemGroupId("inbox", canvasId));
-    const today = nodes.find((n) => n.id === systemGroupId("today", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
     /** Put a derived tray at (x,y). Returns where it ended up so the next one
      *  down stacks off the truth rather than off a patch that hasn't landed. */
@@ -1333,21 +1357,7 @@ export function CanvasEditor({
     // that has grown still sits flush against the column instead of overlapping
     // it.
     const sideX = (w: number) => head.x - w - TRAY_GAP;
-    const placedInbox = inbox ? place(inbox, sideX(inbox.width), head.y) : null;
-    // TODAY hangs off the BOTTOM of INBOX, in that same side column: it's the
-    // last step of triage — what came in, and what of it is for today — rather
-    // than a horizon above the week. Stacked downward like every other derived
-    // tray, so INBOX growing pushes it down instead of the two overlapping.
-    // With no INBOX materialised yet it simply takes INBOX's row, so it's never
-    // left unplaced.
-    if (today)
-      place(
-        today,
-        sideX(today.width),
-        placedInbox
-          ? placedInbox.y + placedInbox.height + TRAY_GAP
-          : head.y,
-      );
+    if (inbox) place(inbox, sideX(inbox.width), head.y);
     if (patches.length) patchMany(patches);
   }, [nodesMap, nodes, canvasId, patchMany, anyDraggingIds]);
 
@@ -2747,8 +2757,8 @@ export function CanvasEditor({
     return slotCaretRect(g, members, dropSlotIndex, groupLayoutOf(g));
   }, [dropSlotIndex, groupDropTarget, nodes, draggingIds]);
 
-  // The outline around the machine-managed trays (INBOX / TODAY / THIS WEEK /
-  // BACKLOG / LATER). Those five travel as one rigid unit when you drag any of
+  // The outline around the machine-managed trays (INBOX / THIS WEEK / BACKLOG /
+  // LATER). Those four travel as one rigid unit when you drag any of
   // them (see `anchoredTrayGroupIds`), and nothing on screen said so — the
   // outline is that fact, drawn.
   //
@@ -2831,13 +2841,13 @@ export function CanvasEditor({
       {/* Toolbar */}
       <div className="absolute left-3 top-3 z-20 flex flex-col items-start gap-1">
         <div className="flex items-center gap-1 rounded-lg border border-border bg-surface p-1 shadow-sm">
-          <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">⌖</ToolBtn>
-          <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)">T</ToolBtn>
-          <ToolBtn active={tool === "sticky"} onClick={() => setTool("sticky")} title="Sticky note — team-visible, reviewable (N)">🗒</ToolBtn>
-          <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (S)">▤</ToolBtn>
-          <ToolBtn active={tool === "group"} onClick={() => setTool("group")} title="Section Group — container that stacks sections (G)">▣</ToolBtn>
-          <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)">✏️</ToolBtn>
-          <ToolBtn active={tool === "erase"} onClick={() => setTool("erase")} title="Erase strokes (E)">⌫</ToolBtn>
+          <ToolBtn active={tool === "select"} onClick={() => setTool("select")} title="Select (V)"><MousePointer2 size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "text"} onClick={() => setTool("text")} title="Text (T)"><TypeIcon size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "sticky"} onClick={() => setTool("sticky")} title="Sticky note — team-visible, reviewable (N)"><StickyNote size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "section"} onClick={() => setTool("section")} title="Section — outline of tasks (S)"><Rows3 size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "group"} onClick={() => setTool("group")} title="Section Group — container that stacks sections (G)"><SquareStack size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "draw"} onClick={() => setTool("draw")} title="Draw — freehand pen (P)"><Pencil size={15} strokeWidth={1.75} /></ToolBtn>
+          <ToolBtn active={tool === "erase"} onClick={() => setTool("erase")} title="Erase strokes (E)"><Eraser size={15} strokeWidth={1.75} /></ToolBtn>
         </div>
 
         {/* Pen controls — colour + width, shown only while the pencil is active. */}
@@ -2945,7 +2955,7 @@ export function CanvasEditor({
 
       {/* Zoom controls */}
       <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-lg border border-border bg-surface p-1 text-sm shadow-sm">
-        <ToolBtn onClick={() => zoomAtCenter(0.8)} title="Zoom out">−</ToolBtn>
+        <ToolBtn onClick={() => zoomAtCenter(0.8)} title="Zoom out"><Minus aria-hidden size={15} strokeWidth={1.75} /></ToolBtn>
         <button
           onClick={() => zoomToAtCenter(1)}
           className="min-w-[3rem] rounded px-2 py-1 text-center text-xs text-muted hover:bg-surface-2"
@@ -2953,12 +2963,12 @@ export function CanvasEditor({
         >
           {Math.round(viewport.scale * 100)}%
         </button>
-        <ToolBtn onClick={() => zoomAtCenter(1.25)} title="Zoom in">+</ToolBtn>
+        <ToolBtn onClick={() => zoomAtCenter(1.25)} title="Zoom in"><Plus aria-hidden size={15} strokeWidth={1.75} /></ToolBtn>
         <ToolBtn
           onClick={() => fitTo(selected)}
           title="Fit — frame the selection, or the whole canvas (F)"
         >
-          ⤢
+          <Maximize aria-hidden size={15} strokeWidth={1.75} />
         </ToolBtn>
       </div>
 

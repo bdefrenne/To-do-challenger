@@ -1,5 +1,6 @@
 "use client";
 
+import { Link2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Avatar } from "@/components/ui/Badge";
@@ -273,7 +274,8 @@ export function EntityFormModal({
             className="w-full resize-y rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] leading-relaxed text-fg outline-none focus:border-accent"
           />
           <span className="mt-1 block text-[11px] leading-relaxed text-faint">
-            🔗 Keep this in sync with{" "}
+            <Link2 aria-hidden size={12} strokeWidth={1.75} className="mr-1 inline align-[-2px]" />
+            Keep this in sync with{" "}
             <code className="font-mono text-muted">{SUMMARY_FILENAME}</code> in the
             git folder (reference it from CLAUDE.md). Edit one → update the other.
           </span>

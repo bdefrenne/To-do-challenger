@@ -1,5 +1,6 @@
 "use client";
 
+import { Link2 } from "lucide-react";
 import { SUMMARY_FILENAME, summaryPath } from "@/lib/repo-sync";
 import { Markdown } from "@/components/ui/Markdown";
 
@@ -32,7 +33,8 @@ export function EntityReadme({
       ) : null}
       {description ? <Markdown>{description}</Markdown> : null}
       <p className="mt-3 border-t border-border pt-2 text-[11px] leading-relaxed text-faint">
-        🔗 Kept in sync with{" "}
+        <Link2 aria-hidden size={12} strokeWidth={1.75} className="mr-1 inline align-[-2px]" />
+        Kept in sync with{" "}
         <code className="rounded bg-surface px-1 py-0.5 font-mono text-fg">
           {filePath}
         </code>{" "}

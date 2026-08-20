@@ -25,7 +25,6 @@ export type TaskStatus =
  * word itself.
  *
  *   inbox         untriaged — no pin, so it surfaces in its board's INBOX lane
- *   today         on today's shortlist — the daily counterpart to `thisWeek`
  *   thisWeek      scheduled for this week — the starred group's lane for its board
  *   backlog       triaged, not scheduled
  *   later         deliberately deferred
@@ -37,7 +36,6 @@ export type TaskStatus =
  */
 export type TaskPlacement =
   | "inbox"
-  | "today"
   | "thisWeek"
   | "backlog"
   | "later"
@@ -212,7 +210,7 @@ export interface Task {
    *  mirrors (and like Project/Board above): `null` is how a caller CLEARS it,
    *  which is distinct from omitting the key to leave it alone. */
   description?: string | null;
-  /** Comment count, shown as "💬 N" on the row. */
+  /** Comment count, shown next to a speech-bubble icon on the row. */
   commentCount?: number;
   /** ISO timestamp of last update — drives the "Updated" column. */
   updatedAt?: string;

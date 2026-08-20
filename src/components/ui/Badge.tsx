@@ -1,3 +1,4 @@
+import { Star, Gauge } from "lucide-react";
 import type { ReactNode } from "react";
 
 type Tone = "neutral" | "green" | "red" | "amber" | "blue" | "purple";
@@ -53,7 +54,11 @@ export function PointsChip({
       }`}
       title={`${label}: ${points}`}
     >
-      <span aria-hidden>{value ? "★" : "◆"}</span>
+      {value ? (
+        <Star aria-hidden size={11} strokeWidth={2} className="fill-current" />
+      ) : (
+        <Gauge aria-hidden size={11} strokeWidth={2} />
+      )}
       {withLabel ? <span>{label}</span> : null}
       <span className="nums">{points}</span>
     </span>

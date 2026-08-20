@@ -43,7 +43,6 @@ beyond the one rule below.
 | \`placement\` | means |
 | --- | --- |
 | \`inbox\` | untriaged — the default, and where anything unfiled shows up |
-| \`today\` | on today's shortlist — the daily counterpart to \`thisWeek\` |
 | \`thisWeek\` | to be done this week, or you're starting on it now |
 | \`backlog\` | triaged, but not scheduled |
 | \`later\` | deliberately deferred — what to pass when the user says "later" |
@@ -166,7 +165,7 @@ to is decided in one place (\`lib/workday.ts\`) and every read agrees with it.
 ## Ready for the day → the snapshot
 
 \`ready_for_day\` freezes what the todo looks like right now. That list is
-otherwise lost: TODAY is a mutable bucket, so by evening the morning's plan has
+otherwise lost: THIS WEEK is a mutable bucket, so by evening the morning's plan has
 been edited past recognition, and "was my list clear enough?" becomes
 unanswerable. Pressing it again overwrites — the last arrangement of the morning
 is the real commitment.

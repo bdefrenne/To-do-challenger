@@ -1,5 +1,6 @@
 "use client";
 
+import { Pencil } from "lucide-react";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -188,7 +189,10 @@ export default function NotesPage() {
                               href={`/canvas/${n.canvasId}`}
                               className="shrink-0 text-[11px] text-muted hover:text-accent hover:underline"
                             >
-                              ✎ canvas
+                              <span className="inline-flex items-center gap-1">
+                                <Pencil aria-hidden size={11} strokeWidth={1.75} />
+                                canvas
+                              </span>
                             </Link>
                           ) : null}
                           <span className={resolved ? "text-fg line-through" : "text-fg"}>

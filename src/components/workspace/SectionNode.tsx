@@ -19,6 +19,22 @@
  * (`node.content`) trails it inline, dimmed and regular weight.
  */
 
+import {
+  AlignJustify,
+  ArrowUpToLine,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsUpDown,
+  Clock,
+  Inbox,
+  LayoutGrid,
+  ListTodo,
+  Pencil,
+  Rows3,
+  Star,
+  type LucideIcon,
+} from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
@@ -35,6 +51,7 @@ import { resolveRowLock, type RowClaim, type RowLock } from "./useRowLock";
  *  worse outcome than one taken a beat early. */
 const TAKEOVER_WAIT_MS = 1500;
 import { useEventCallback } from "./useEventCallback";
+import { useDragSessionEnd } from "./useDragSessionEnd";
 import { HEIGHT_COMMIT_MS } from "./canvasWrites";
 import {
   isInboxNode,
@@ -61,14 +78,13 @@ export const MIN_SECTION_HEIGHT = 140;
 const SECTION_DND_MIME = "application/x-section-task";
 
 /** How each machine-managed tray labels itself in its header. */
-const TRAY_GLYPH: Record<SystemGroup, { icon: string; hint: string }> = {
-  inbox: { icon: "⇥", hint: "Inbox — untriaged, nobody has filed these yet" },
-  today: { icon: "☀", hint: "Today — on today's shortlist" },
-  thisWeek: { icon: "★", hint: "This week — what you mean to do this week" },
-  backlog: { icon: "☰", hint: "Backlog — triaged, not scheduled" },
-  later: { icon: "⏱", hint: "Later — deliberately deferred" },
+const TRAY_GLYPH: Record<SystemGroup, { icon: LucideIcon; hint: string }> = {
+  inbox: { icon: Inbox, hint: "Inbox — untriaged, nobody has filed these yet" },
+  thisWeek: { icon: Star, hint: "This week — what you mean to do this week" },
+  backlog: { icon: ListTodo, hint: "Backlog — triaged, not scheduled" },
+  later: { icon: Clock, hint: "Later — deliberately deferred" },
   doneThisWeek: {
-    icon: "✓",
+    icon: Check,
     hint: "Done this week — finished, delete again to archive",
   },
 };
@@ -231,6 +247,14 @@ export function SectionNode({
   const visibleUnits = useMemo(
     () => filterUnitsByAssignee(units, filterAssigneeId),
     [units, filterAssigneeId],
+  );
+  /** The cards this section draws at TOP level, in display order — what an insert
+   *  between two cards is positioned against. Taken from the rendered tree, so it
+   *  includes a subtask whose parent lives in another section (which renders as a
+   *  root here, see `useSectionUnits`). */
+  const rootIds = useMemo(
+    () => units.map((u) => u.taskId).filter((id): id is string => !!id),
+    [units],
   );
   // An INBOX lane: a tray showing its board's UNPINNED tasks, so that anything
   // created from the API, MCP or a board view is visible here instead of nowhere.
@@ -958,13 +982,18 @@ export function SectionNode({
         onPointerDown={onPointerDown}
         className="flex shrink-0 cursor-grab items-start gap-2 border-b border-border bg-surface-2 px-3 py-2 active:cursor-grabbing"
       >
-        <span
-          aria-hidden
-          className="text-faint"
-          title={systemKind ? TRAY_GLYPH[systemKind].hint : undefined}
-        >
-          {systemKind ? TRAY_GLYPH[systemKind].icon : "▤"}
-        </span>
+        {(() => {
+          const Glyph = systemKind ? TRAY_GLYPH[systemKind].icon : Rows3;
+          return (
+            <span
+              aria-hidden
+              className="text-faint"
+              title={systemKind ? TRAY_GLYPH[systemKind].hint : undefined}
+            >
+              <Glyph size={13} strokeWidth={1.75} />
+            </span>
+          );
+        })()}
         {/* Master marker — a STATE, not a control: a section is its board's
             master because it sits in the starred THIS WEEK group, so it's set by
             starring the group, not by clicking here. */}
@@ -973,7 +1002,7 @@ export function SectionNode({
             className="shrink-0 text-accent"
             title="Master section — this board's Send target, because it's in the THIS WEEK group"
           >
-            ★
+            <Star aria-hidden size={13} strokeWidth={2} className="fill-current" />
           </span>
         ) : null}
         {renaming ? (
@@ -1037,12 +1066,15 @@ export function SectionNode({
             style={{ backgroundColor: remoteEditor.color }}
             title={`${remoteEditor.name} is editing this section`}
           >
-            ✎ {remoteEditor.name}
+            <span className="inline-flex items-center gap-1">
+              <Pencil aria-hidden size={10} strokeWidth={2} />
+              {remoteEditor.name}
+            </span>
           </span>
         ) : null}
         {/* Send-to-master: shown on sections that have a master on the same
             board — `masterSection` is already null when THIS is the master.
-            Hover-revealed, like the canvas-index card's ✕. Never on a system
+            Hover-revealed, like the canvas-index card's close button. Never on a system
             tray: sending deletes the source section, and the reconciler would
             just rebuild it. */}
         {boardId && !systemKind && masterSection ? (
@@ -1055,7 +1087,10 @@ export function SectionNode({
             title={`Send all cards to the top of “${masterSection.name}” and delete this section`}
             className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-[11px] font-medium text-faint opacity-0 transition-colors hover:border-accent hover:text-accent group-hover/section:opacity-100"
           >
-            ↥ Send to {masterSection.name}
+            <span className="inline-flex items-center gap-1">
+              <ArrowUpToLine aria-hidden size={11} strokeWidth={2} />
+              Send to {masterSection.name}
+            </span>
           </button>
         ) : null}
         {/* Description height: text-mode-only. Caps descriptions at 6 rows or
@@ -1074,7 +1109,10 @@ export function SectionNode({
             }
             className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-[11px] font-medium text-faint hover:border-accent hover:text-accent"
           >
-            {descExpanded ? "↕ All" : "↕ 6"}
+            <span className="inline-flex items-center gap-1">
+              <ChevronsUpDown aria-hidden size={11} strokeWidth={2} />
+              {descExpanded ? "All" : "6"}
+            </span>
           </button>
         ) : null}
         {/* Bulk actions on every card in the section. Only when there ARE cards,
@@ -1107,7 +1145,7 @@ export function SectionNode({
                 remoteEditor ? `${remoteEditor.name} is in here too — Outline` : "Outline"
               }
             >
-              ≣
+              <AlignJustify aria-hidden size={14} strokeWidth={1.75} />
             </ViewToggleBtn>
             <ViewToggleBtn
               active={viewMode === "committed"}
@@ -1118,7 +1156,7 @@ export function SectionNode({
               }}
               title="Cards"
             >
-              ▦
+              <LayoutGrid aria-hidden size={14} strokeWidth={1.75} />
             </ViewToggleBtn>
           </div>
         ) : null}
@@ -1167,7 +1205,10 @@ export function SectionNode({
             onAddTask={(title) =>
               ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
             }
-            // Same create, but landing above the card whose gap was clicked.
+            // Same create, but landing above the card whose gap was clicked. The
+            // run goes with it: these are the rows this section actually draws at
+            // top level (`units`, not the assignee-filtered view — a hidden card is
+            // still in the order being restamped).
             onAddTaskAbove={(beforeId, title) =>
               ws.addSectionTask({
                 title,
@@ -1176,6 +1217,7 @@ export function SectionNode({
                 parentId: null,
                 siblingIds,
                 insertBefore: beforeId,
+                runIds: rootIds,
               })
             }
             // Subtasks are never pinned — they inherit their parent's placement,
@@ -1198,7 +1240,6 @@ export function SectionNode({
  *  canvas already draws in orange), then the rest of the ladder. */
 const MOVE_TO_ORDER: readonly TaskPlacement[] = [
   "thisWeek",
-  "today",
   "backlog",
   "later",
   "inbox",
@@ -1307,7 +1348,7 @@ function BulkMenu({
               className="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-fg hover:bg-surface-2"
             >
               <span>Move to…</span>
-              <span aria-hidden className="text-faint">›</span>
+              <ChevronRight aria-hidden size={12} strokeWidth={2} className="text-faint" />
             </button>
             {item("Archive done tasks", false, onArchiveDone, {
               disabled: doneCount === 0,
@@ -1320,6 +1361,7 @@ function BulkMenu({
           <>
             {destinations.map((to) => {
               const week = to === "thisWeek";
+              const Glyph = TRAY_GLYPH[to].icon;
               return (
                 <button
                   key={to}
@@ -1337,7 +1379,7 @@ function BulkMenu({
                   ].join(" ")}
                 >
                   <span aria-hidden className={week ? undefined : "text-faint"}>
-                    {TRAY_GLYPH[to].icon}
+                    <Glyph size={13} strokeWidth={week ? 2 : 1.75} />
                   </span>
                   <span>{PLACEMENT_TITLE[to]}</span>
                 </button>
@@ -1348,7 +1390,7 @@ function BulkMenu({
               onClick={() => setView("actions")}
               className="mt-0.5 flex w-full items-center gap-2 rounded border-t border-border px-2 py-1.5 pt-2 text-left text-xs text-faint hover:bg-surface-2"
             >
-              <span aria-hidden>‹</span>
+              <ChevronLeft aria-hidden size={12} strokeWidth={2} />
               <span>Back</span>
             </button>
           </>
@@ -1548,6 +1590,9 @@ function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
   // list it re-rendered every sibling on every dragover. Same shape as the kanban
   // card's own `dropPos`.
   const [hint, setHint] = useState<"before" | "after" | null>(null);
+  // The card clears its own hint on drop, but not on an Escape-cancelled drag —
+  // nothing fires on it then. Same session-end rule as the section's ring.
+  useDragSessionEnd(hint !== null, () => setHint(null));
   const id = unit.taskId;
   const t = unit.task;
   const done = t?.status === "done";
@@ -1848,6 +1893,9 @@ function CommittedList({
   // True while a section-task drag hovers the list's blank area (not a card) —
   // draws a dashed ring so it reads as "drop here to move into this section".
   const [overSection, setOverSection] = useState(false);
+  // ...and the ring goes out when the drag does. Dropping ON a card leaves the
+  // handlers below no chance to clear it themselves — see `useDragSessionEnd`.
+  useDragSessionEnd(overSection, () => setOverSection(false));
   // Which card the between-cards composer is currently open ABOVE (one at a time).
   const [insertAbove, setInsertAbove] = useState<string | null>(null);
 

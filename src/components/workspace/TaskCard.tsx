@@ -1,10 +1,12 @@
 "use client";
 
+import { GripVertical } from "lucide-react";
 import { useRef, useState, type DragEvent } from "react";
 import type { Task } from "@/lib/types";
 import { TaskCardBody, type TaskCardHandlers } from "./TaskCardBody";
 import { useWorkspace } from "./WorkspaceContext";
 import { useTaskCardShortcuts } from "./useTaskCardShortcuts";
+import { useDragSessionEnd } from "./useDragSessionEnd";
 import { IMPORTANCE_CARD } from "@/lib/importance";
 import { STATUS_CANVAS_BADGE, STATUS_TONE } from "@/lib/statuses";
 
@@ -54,6 +56,9 @@ export function TaskCard({
   const [dragging, setDragging] = useState(false);
   // Which edge a hovered drop would land on — the accent line the user aims by.
   const [dropPos, setDropPos] = useState<"before" | "after" | null>(null);
+  // The line goes out when the drag ends, however it ends — the card's own
+  // handlers miss an Escape-cancelled drag. See `useDragSessionEnd`.
+  useDragSessionEnd(dropPos !== null, () => setDropPos(null));
   const cardRef = useRef<HTMLDivElement>(null);
   const id = task.id;
   const done = task.status === "done";
@@ -171,7 +176,7 @@ export function TaskCard({
               title="Drag to move or reorder"
               className="mt-0.5 shrink-0 cursor-grab text-faint opacity-0 transition-opacity group-hover/card:opacity-100"
             >
-              ⠿
+              <GripVertical aria-hidden size={13} strokeWidth={1.75} />
             </span>
           ) : null}
           <TaskCardBody task={task} h={h} neutralDone={neutralDone} />

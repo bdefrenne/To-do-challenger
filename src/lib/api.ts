@@ -25,7 +25,6 @@ export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);
  *  `status`. See `TaskPlacement` in types.ts. */
 export const placementSchema = z.enum([
   "inbox",
-  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -289,6 +288,11 @@ export const updateTaskSchema = z
     placement: placementSchema,
     /** Deprecated boolean spelling of `placement`. */
     thisWeek: z.boolean(),
+  /** Which END of the destination group to land at: "top" (do it next) or
+   *  "bottom" (after everything already there). Resolved server-side against the
+   *  lane the placement names, so it means the same thing on the canvas, on the
+   *  Boards view and over MCP. An explicit `position` wins. */
+    end: z.enum(["top", "bottom"]),
     value: fibSchema.nullable(),
     difficulty: fibSchema.nullable(),
     importance: importanceSchema,
@@ -356,6 +360,11 @@ export const moveTaskSchema = z.object({
   placement: placementSchema.optional(),
   /** Deprecated boolean spelling of `placement`. */
   thisWeek: z.boolean().optional(),
+  /** Which END of the destination group to land at: "top" (do it next) or
+   *  "bottom" (after everything already there). Resolved server-side against the
+   *  lane the placement names, so it means the same thing on the canvas, on the
+   *  Boards view and over MCP. An explicit `position` wins. */
+  end: z.enum(["top", "bottom"]).optional(),
 });
 
 export const commentSchema = z.object({

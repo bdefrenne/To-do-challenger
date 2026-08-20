@@ -11,6 +11,7 @@
  * itself.
  */
 
+import { LayoutDashboard } from "lucide-react";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -56,8 +57,8 @@ export default function CanvasIndexPage() {
                 href={`/canvas/${c.id}`}
                 className="group relative block rounded-xl border border-border bg-surface p-4 transition-colors hover:border-border-strong"
               >
-                <div className="grid h-24 place-items-center rounded-lg bg-surface-2 text-2xl text-faint">
-                  ▦
+                <div className="grid h-24 place-items-center rounded-lg bg-surface-2 text-faint">
+                  <LayoutDashboard aria-hidden size={28} strokeWidth={1.5} />
                 </div>
                 <div className="mt-3 truncate text-sm font-medium text-fg">
                   {c.name}

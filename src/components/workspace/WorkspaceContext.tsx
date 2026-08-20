@@ -214,7 +214,7 @@ interface WorkspaceContextValue {
   /** Send a card to a group: THIS WEEK (end of the list), BACKLOG or LATER (top),
    *  DONE THIS WEEK, or INBOX (unpinned). The hover arrows' path — on canvas it
    *  moves the node, off canvas it files via `fileTask`. */
-  sendToPlacement: (id: string, to: TaskPlacement) => void;
+  sendToPlacement: (id: string, to: TaskPlacement, end?: "top" | "bottom") => void;
   /** The latest arrow-key send, for its undo toast (overwritten each time, not
    *  a queue — see `pendingSend`'s declaration for why). */
   pendingSend: { id: string; title: string; to: TaskPlacement; fromPin: string | null } | null;
@@ -238,13 +238,14 @@ interface WorkspaceContextValue {
   moveToBoard: (id: string, boardId: string, status?: TaskStatus) => void;
   /** File a task on a board AND in a placement bucket in one write — the
    *  project Boards view's drop. Unlike `sendToPlacement` this needs no mounted
-   *  canvas: the server resolves the bucket to a pin (`resolvePlacementSection`).
+   *  canvas: the server resolves the bucket to a pin (`resolvePlacementSection`),
+   *  and `opts.end` positions the card within it (`positionAtEnd`).
    *  Resolves once the write has landed and the refetch has run. */
   fileTask: (
     id: string,
     boardId: string,
     placement: TaskPlacement,
-    opts?: { status?: TaskStatus; at?: PlaceAt },
+    opts?: { status?: TaskStatus; at?: PlaceAt; end?: "top" | "bottom" },
   ) => Promise<void>;
   /** `fileTask` for a whole set of cards on ONE board — a column sweep, in one
    *  bulk batch rather than one request per card. Status is left alone. */
@@ -271,6 +272,13 @@ interface WorkspaceContextValue {
     /** Land the new card immediately ABOVE this sibling instead of at the end —
      *  what a composer opened in the gap between two cards passes. */
     insertBefore?: string | null;
+    /** The section's top-level cards AS RENDERED, in display order — the run an
+     *  insert is measured and restamped against. Required with `insertBefore`,
+     *  because "top level" is the SECTION's answer, not this context's: a subtask
+     *  whose parent sits in another section renders as a root here, and a run
+     *  derived from `parentId === null` would leave it out (so it would jump to
+     *  the end of a run everyone else got restamped into). */
+    runIds?: readonly string[];
   }) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
@@ -1199,7 +1207,13 @@ export function WorkspaceProvider({
         await serverCall();
       } catch (e) {
         console.error("[workspace] project mutation failed", e);
-        setNotice("Couldn’t save that — reloaded the latest.");
+        // A REFUSAL is not a failure: deleting a board or project that still
+        // holds tasks is rejected on purpose (TD2-196 — the row cascade is the
+        // one path that could end a task without it passing through the Trash),
+        // and the server writes that sentence for a person. Showing "couldn't
+        // save that" instead would read as a bug and hide what to do next.
+        const rule = e instanceof ApiError && e.status === 400 ? ruleMessage(e) : null;
+        setNotice(rule ?? "Couldn’t save that — reloaded the latest.");
       } finally {
         inflight.current--;
         if (inflight.current === 0) {
@@ -1774,53 +1788,68 @@ export function WorkspaceProvider({
   }
 
   /**
-   * Fling a card into one of the canvas's groups — the hover arrows' one path.
+   * Fling a card into one of the canvas's groups — the hover arrows' one path,
+   * on EVERY surface.
    *
-   * THIS WEEK appends (this week's list is a queue you work down, so new arrivals
-   * belong at the END); BACKLOG and LATER take the top, because what you just
-   * decided to defer is the thing you'll want to see first when you come back to
-   * the pile. INBOX is `laneFor` → null, i.e. simply unpinned.
+   * `end` is where in the destination it lands: "top" is "do this next", "bottom"
+   * is "behind what's already there". That's why THIS WEEK is worth two arrows.
    *
-   * Without a mounted canvas (the project Boards view, a board's kanban) the same
-   * arrows go through `fileTask`: the server resolves the bucket to a pin, so the
-   * gesture works off canvas — it just can't place the card WITHIN the lane the
-   * way the canvas does. The undo toast still works: a send is reversed by
-   * re-pinning the card to the pin it had, which needs no canvas either.
+   * The lane and the position are both resolved by the SERVER
+   * (`resolvePlacementSection` + `positionAtEnd`), not here — that's what makes
+   * the same keypress mean the same thing on the canvas, on the project Boards
+   * view, on a kanban and over MCP. This function used to branch on whether a
+   * canvas happened to be mounted and do its own position math in that branch,
+   * which is exactly how the two surfaces drifted apart: off canvas the arrows
+   * filed the card but couldn't say where in the lane it went.
    *
-   * No-op when the card is already there, or when it has no board (the buckets
-   * are per-board lanes, so there's nowhere to file it).
+   * A mounted canvas is still asked ONE question — `laneFor`/`sectionOf`, so the
+   * card jumps the instant you press the key rather than after the round trip,
+   * and so the undo toast knows the pin to put it back on. Its answer agrees with
+   * the server's by construction (same derived lane ids, same "an existing member
+   * wins" rule); if it ever didn't, the refetch settles it and the server wins.
+   *
+   * No-op when the card has no board — the buckets are per-board lanes, so
+   * there's nowhere to file it. Being in the destination already is NOT a no-op:
+   * sending a THIS WEEK card to the other end of THIS WEEK is the point.
    */
-  function sendToPlacement(id: string, to: TaskPlacement) {
-    const placement = placementRef.current;
+  function sendToPlacement(id: string, to: TaskPlacement, end: "top" | "bottom" = "top") {
     const task = taskMap[id];
     if (!task) return;
-    if (!placement) {
-      const boardId = task.boardId ?? null;
-      if (!boardId) return;
-      if (placementOf(id) === to) return; // already there — same guard as below
-      const fromPin = task.canvasSectionId ?? null;
-      void fileTask(id, boardId, to);
-      setPendingSend({ id, title: task.title, to, fromPin });
-      return;
-    }
     const boardId = task.boardId ?? null;
-    const lane = placement.laneFor(to, boardId);
-    if (to !== "inbox" && !lane) return; // no such group on this canvas
-    const fromPin = placement.sectionOf(id);
-    if (fromPin === lane) return;
-    const siblingIds = placement.membersOf(lane);
-    // "Top of the list" = insert before the first top-level card already there.
-    // With an empty lane there's nothing to sit before, so it appends either way.
-    const first = nodes
-      .filter((n) => n.parentId === null && n.id !== id && siblingIds.has(n.id))
-      .sort(compareTaskOrder)[0]?.id;
-    moveNodeIntoSection(id, lane, boardId, {
-      ...(to !== "thisWeek" && first
-        ? { targetId: first, pos: "before" as const }
-        : {}),
-      siblingIds,
-    });
-    setPendingSend({ id, title: task.title, to, fromPin });
+    if (!boardId) return;
+
+    const placement = placementRef.current;
+    // The canvas's answer when there is one; off canvas the pin we already hold
+    // is the best guess, and only the toast's undo reads it.
+    const lane = placement ? placement.laneFor(to, boardId) : null;
+    if (placement && to !== "inbox" && !lane) return; // no such group on this canvas
+    const fromPin = placement ? placement.sectionOf(id) : task.canvasSectionId ?? null;
+
+    if (placement) {
+      // Optimistic only. The position mirrors `positionAtEnd`'s rule (strictly
+      // before / strictly after the lane's members) so the card lands where the
+      // server is about to put it, and a lane of tied positions can't swallow it.
+      const members = placement.membersOf(lane);
+      const rendered = nodes.filter(
+        (n) => n.parentId === null && n.id !== id && members.has(n.id),
+      );
+      const position = rendered.length
+        ? end === "top"
+          ? Math.min(...rendered.map((n) => n.position)) - 1
+          : Math.max(...rendered.map((n) => n.position)) + 1
+        : 0;
+      setTaskMap((prev) =>
+        prev[id] ? { ...prev, [id]: { ...prev[id], canvasSectionId: lane } } : prev,
+      );
+      setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, position } : n)));
+    }
+
+    void fileTask(id, boardId, to, { end });
+    // Only a change of LANE gets the undo toast. Sending a card to the other end
+    // of the lane it's already in is a reorder — "Sent to THIS WEEK" would be a
+    // lie, and its undo (re-pin to the pin it already has) would do nothing.
+    const changedLane = placement ? fromPin !== lane : placementOf(id) !== to;
+    if (changedLane) setPendingSend({ id, title: task.title, to, fromPin });
   }
 
   // Put a sent card back where it came from — the send-undo toast's button.
@@ -2103,14 +2132,22 @@ export function WorkspaceProvider({
     id: string,
     boardId: string,
     placement: TaskPlacement,
-    opts?: { status?: TaskStatus; at?: PlaceAt },
+    opts?: { status?: TaskStatus; at?: PlaceAt; end?: "top" | "bottom" },
   ) {
     const node = nodes.find((n) => n.id === id);
     if (!node) return;
     const boardChanged = node.boardId !== boardId;
     setPendingPlacements((prev) => ({ ...prev, [id]: placement }));
     try {
-      await fileTaskWrite(id, boardId, boardChanged, placement, opts?.status, opts?.at);
+      await fileTaskWrite(
+        id,
+        boardId,
+        boardChanged,
+        placement,
+        opts?.status,
+        opts?.at,
+        opts?.end,
+      );
     } finally {
       // Clear it either way: on success the refetched pin says the same thing, and
       // on failure the card belongs back wherever the server still thinks it is.
@@ -2167,6 +2204,11 @@ export function WorkspaceProvider({
     placement: TaskPlacement,
     status?: TaskStatus,
     at?: PlaceAt,
+    /** Which end of the destination lane — the send-arrows. The server does the
+     *  position math (`positionAtEnd`), so this is one plain move on every
+     *  surface, with no rendered run to hand it. An `at` (a drop's exact index)
+     *  is the stricter answer and wins. */
+    end?: "top" | "bottom",
   ) {
     if (at) return fileTaskAtWrite(id, boardId, boardChanged, placement, status, at);
     await mutate(
@@ -2186,6 +2228,7 @@ export function WorkspaceProvider({
             boardId,
             ...(boardChanged ? { parentId: null } : {}),
             ...(status ? { status } : {}),
+            ...(end ? { end } : {}),
             placement,
           }),
         }),
@@ -2467,23 +2510,27 @@ export function WorkspaceProvider({
     parentId?: string | null;
     siblingIds?: Set<string>;
     insertBefore?: string | null;
+    runIds?: readonly string[];
   }) {
     const { title, canvasSectionId, boardId, siblingIds } = input;
     const parentId = input.parentId ?? null;
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
-    // This card's sibling group as RENDERED: same parent, same section, in the
-    // canonical order — the run both the append and the insert are measured
-    // against.
-    const run = nodes
-      .filter(
-        (n) =>
-          n.parentId === parentId &&
-          (siblingIds
-            ? siblingIds.has(n.id)
-            : (taskMap[n.id]?.canvasSectionId ?? null) === canvasSectionId),
-      )
-      .sort(compareTaskOrder);
+    // This card's sibling group. An insert uses the run the SECTION rendered
+    // (see `runIds`); an append can derive it — same parent, same section, in the
+    // canonical order — because all it needs is the largest key in the group.
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const run = input.runIds
+      ? input.runIds.map((id) => byId.get(id)).filter((n): n is TaskNode => !!n)
+      : nodes
+          .filter(
+            (n) =>
+              n.parentId === parentId &&
+              (siblingIds
+                ? siblingIds.has(n.id)
+                : (taskMap[n.id]?.canvasSectionId ?? null) === canvasSectionId),
+          )
+          .sort(compareTaskOrder);
     // Composed in the gap above a card? Then the whole run is RESTAMPED densely
     // with the new card spliced in — the same thing a drop does, and for the same
     // reason: a section mixes statuses, so its cards routinely share a position

@@ -8,6 +8,7 @@
  * truth and the editor snapshots back to Postgres.
  */
 
+import { ArrowLeft } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
@@ -120,7 +121,7 @@ export default function CanvasPage() {
           className="rounded-md px-2 py-1 text-sm text-muted transition-colors hover:bg-surface-2 hover:text-fg"
           title="Back to canvases"
         >
-          ←
+          <ArrowLeft aria-hidden size={15} strokeWidth={2} />
         </Link>
         <input
           value={name}

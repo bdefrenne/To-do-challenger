@@ -24,6 +24,12 @@
   jumped to the end of the group on the next refetch. Guarded here at both layers,
   along with the append default nothing else may lose.
 
+  TD2-200 — the send-arrows name an END of a lane ("top" = do it next, "bottom" =
+  behind the rest) and the server turns that into a position, so the keypress
+  means the same thing on the canvas, off it, and over MCP. Guarded here because
+  the rule only has to hold where it's hard: a lane's positions routinely TIE, and
+  the lane is scoped by board as well as by pin.
+
   Runs against DATABASE_URL, creates its own scratch tasks, cleans up after
   itself. The over-cap case issues MAX_BULK_OPS+ failing ops, so it takes a while.
 
@@ -45,7 +51,7 @@ import {
   listProjects,
 } from "../src/lib/db/service";
 import { MAX_BULK_OPS } from "../src/lib/bulk";
-import { createTaskSchema } from "../src/lib/api";
+import { createTaskSchema, moveTaskSchema, updateTaskSchema } from "../src/lib/api";
 import { compareTaskOrder } from "../src/lib/task-order";
 
 const AUTHOR = "check:bulk";
@@ -332,6 +338,93 @@ async function main() {
       JSON.stringify(await childOrder(parent)) ===
         JSON.stringify(["opened above it", "first line"]),
       JSON.stringify(await childOrder(parent)),
+    );
+  }
+
+  /* ---- TD2-200: which END of a lane a send-arrow lands at ------------- */
+  // The send-arrows name an END ("top" = do it next, "bottom" = behind the rest)
+  // and the SERVER turns that into a position — that's what makes the same
+  // keypress mean the same thing on the canvas, off it, and over MCP. The rule
+  // has to survive a lane whose positions TIE, which is the normal state of a
+  // lane: `position` is minted per (status, parent) and never renumbered, so a
+  // mixed-status lane routinely holds several cards claiming the same number.
+  console.log("\nTD2-200 — send-arrows land at an END of the lane");
+  {
+    // Three cards in one lane, all on position 0 — the tie that makes an
+    // interpolated midpoint useless (the midpoint of 0 and 0 IS 0).
+    const lane = "check-bulk-section-end";
+    const ids: string[] = [];
+    for (const n of ["tied a", "tied b", "tied c"]) {
+      const t = await createTask(
+        { title: `${TITLE} ${n}`, boardId: boardA.id, canvasSectionId: lane, position: 0 },
+        ME,
+        AUTHOR,
+      );
+      scratch.push(t.id);
+      ids.push(t.id);
+    }
+    const sent = await newTask(boardA.id, null);
+
+    await moveTask(sent, { canvasSectionId: lane, end: "top" }, ME, AUTHOR);
+    const top = await positionOf(sent);
+    check(
+      "end:'top' lands strictly before a lane of tied positions",
+      top !== undefined && top < 0,
+      `position=${top}`,
+    );
+    check("…and the pin came along", (await pinOf(sent)) === lane);
+
+    await moveTask(sent, { canvasSectionId: lane, end: "bottom" }, ME, AUTHOR);
+    const bottom = await positionOf(sent);
+    check(
+      "end:'bottom' on a card ALREADY in the lane re-ends it (→ after ↑)",
+      bottom !== undefined && bottom > 0,
+      `position=${bottom}`,
+    );
+    check(
+      "…and it doesn't count its own position, so it clears the lane it's in",
+      bottom !== undefined && bottom === 1,
+      `position=${bottom}`,
+    );
+
+    // An explicit position is the stricter answer — a drag knows its exact index.
+    await moveTask(sent, { canvasSectionId: lane, end: "top", position: 42 }, ME, AUTHOR);
+    check("an explicit position wins over an end", (await positionOf(sent)) === 42);
+
+    // The lane is per BOARD as well as per pin: another board's cards in a
+    // same-named section must not drag the ends around.
+    const stranger = await createTask(
+      { title: `${TITLE} other board`, boardId: boardB.id, canvasSectionId: lane, position: 900 },
+      ME,
+      AUTHOR,
+    );
+    scratch.push(stranger.id);
+    const again = await newTask(boardA.id, null);
+    await moveTask(again, { canvasSectionId: lane, end: "bottom" }, ME, AUTHOR);
+    const p = await positionOf(again);
+    check(
+      "the other board's cards aren't part of this lane's run",
+      p !== undefined && p < 900,
+      `position=${p}`,
+    );
+  }
+  {
+    // The TD2-188 lesson applied to this field: a zod schema that silently strips
+    // `end` fails nowhere else — the arrow would just file the card and leave its
+    // position wherever it was.
+    const parsed = moveTaskSchema.safeParse({ placement: "thisWeek", end: "top" });
+    check(
+      "the move request schema keeps `end`",
+      parsed.success && parsed.data.end === "top",
+      JSON.stringify(parsed.success ? parsed.data : parsed.error.issues),
+    );
+    const bad = moveTaskSchema.safeParse({ end: "middle" });
+    check("…and rejects an end that isn't an end", !bad.success);
+    const upd = updateTaskSchema.safeParse({ placement: "backlog", end: "bottom" });
+    check(
+      "the update request schema keeps `end` too (the MCP path)",
+      upd.success && upd.data.end === "bottom",
+      JSON.stringify(upd.success ? upd.data : upd.error.issues),
     );
   }
 

@@ -16,6 +16,7 @@
  * which the canvas card deliberately omits.
  */
 
+import { Check, Settings } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePeople } from "@/components/PeopleContext";
 import { PersonAvatar } from "@/components/PersonAvatar";
@@ -220,7 +221,7 @@ export function QuickAssign({
                 >
                   <PersonAvatar name={p.name} size={18} />
                   <span className="flex-1 truncate text-fg">{p.name}</span>
-                  {on ? <span className="text-accent">✓</span> : null}
+                  {on ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
                 </button>
               );
             })
@@ -235,7 +236,7 @@ export function QuickAssign({
             }}
             className="mt-1 flex w-full items-center gap-1.5 border-t border-border px-2 py-1.5 text-left text-xs font-medium text-accent hover:bg-surface-2"
           >
-            <span className="text-sm leading-none">⚙</span>
+            <Settings aria-hidden size={13} strokeWidth={1.75} />
             Edit Project Members
           </button>
         ) : null}

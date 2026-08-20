@@ -15,6 +15,7 @@
  * the in-flight statuses.
  */
 
+import { Check } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
@@ -162,7 +163,7 @@ export function QuickStatus({
               >
                 <span className={`h-2 w-2 shrink-0 rounded-full ${t.dot}`} aria-hidden />
                 <span className="flex-1 truncate text-fg">{STATUS_LABEL[s]}</span>
-                {current ? <span className="text-accent">✓</span> : null}
+                {current ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
               </button>
             );
           })}

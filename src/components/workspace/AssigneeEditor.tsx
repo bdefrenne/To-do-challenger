@@ -6,6 +6,7 @@
  * from TaskDetailModal so the canvas Section cards can share the exact picker.
  */
 
+import { Check, ChevronDown, Settings } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { usePeople } from "@/components/PeopleContext";
 import { PersonAvatar, AvatarStack } from "@/components/PersonAvatar";
@@ -74,7 +75,7 @@ export function AssigneeEditor({
         ) : (
           <span className="text-faint">Unassigned — click to assign</span>
         )}
-        <span className="ml-auto text-faint">▾</span>
+        <ChevronDown aria-hidden size={13} strokeWidth={2} className="ml-auto text-faint" />
       </button>
 
       {open ? (
@@ -94,7 +95,7 @@ export function AssigneeEditor({
                   >
                     <PersonAvatar name={p.name} size={20} />
                     <span className="flex-1 truncate text-fg">{p.name}</span>
-                    {on ? <span className="text-accent">✓</span> : null}
+                    {on ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
                   </button>
                 );
               })
@@ -109,7 +110,7 @@ export function AssigneeEditor({
               }}
               className="mt-1 flex w-full items-center gap-1.5 border-t border-border px-3 py-1.5 text-left text-xs font-medium text-accent hover:bg-surface-2"
             >
-              <span className="text-sm leading-none">⚙</span>
+              <Settings aria-hidden size={13} strokeWidth={1.75} />
               Edit Project Members
             </button>
           ) : null}

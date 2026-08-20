@@ -14,6 +14,7 @@
  * stay Normal, so the trigger only draws attention once a non-Normal value is set.
  */
 
+import { Check } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Importance } from "@/lib/types";
 import { IMPORTANCE_LABEL, IMPORTANCE_ORDER, IMPORTANCE_TONE } from "@/lib/importance";
@@ -163,7 +164,7 @@ export function QuickImportance({
                   {v > 0 ? `+${v}` : v}
                 </span>
                 <span className="flex-1 truncate text-fg">{IMPORTANCE_LABEL[v]}</span>
-                {current ? <span className="text-accent">✓</span> : null}
+                {current ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
               </button>
             );
           })}

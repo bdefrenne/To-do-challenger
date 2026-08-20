@@ -1,5 +1,6 @@
 "use client";
 
+import { AlignJustify, GripVertical, LayoutGrid } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import type { Board, Project, TaskPlacement } from "@/lib/types";
@@ -21,6 +22,7 @@ import { useViewMode } from "@/components/ui/ViewToggle";
 import { SeparatorHeader } from "./SeparatorHeader";
 import { OutlineEditor } from "./OutlineEditor";
 import { useOutlineDraft } from "./useOutlineDraft";
+import { useDragSessionEnd } from "./useDragSessionEnd";
 
 /** DnD payload type for dragging a whole board column (distinct from task
  *  cards, which use TASK_DND_MIME, so the two drag surfaces never collide). */
@@ -28,8 +30,8 @@ const BOARD_DND_MIME = "application/x-board-id";
 
 /**
  * A project's Boards view: the triage ladder read top to bottom as one big
- * collapsible SEPARATOR per placement bucket (INBOX · DONE THIS WEEK · TODAY ·
- * THIS WEEK · BACKLOG · LATER), and inside each, the project's boards left→right
+ * collapsible SEPARATOR per placement bucket (INBOX · DONE THIS WEEK · THIS
+ * WEEK · BACKLOG · LATER), and inside each, the project's boards left→right
  * as columns — the same columns, in the same order, as before.
  *
  * The two axes are deliberate: the separator says WHEN you mean to do a thing,
@@ -60,6 +62,9 @@ export function BoardsColumns({ project }: { project: Project }) {
 
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [overBoardId, setOverBoardId] = useState<string | null>(null);
+  // Paint only — `handleReorderDrop` still needs `dragBoardId`, and this fires
+  // in capture, ahead of it.
+  useDragSessionEnd(overBoardId !== null, () => setOverBoardId(null));
   // Only the "new board" modal opens from here — editing (and deleting) a board
   // lives in its own page's Board settings.
   const [creating, setCreating] = useState(false);
@@ -420,7 +425,10 @@ function BoardColumn({
   onReorderDrop: () => void;
 }) {
   const [cardOver, setCardOver] = useState(false);
-  // Cards ⇄ text, the same two views a canvas Section has (▦ / ≣). Per column and
+  // A card drop stops propagation, so this column's own `onDrop` never runs and
+  // the ring would stay lit for good (TD2-201). See `useDragSessionEnd`.
+  useDragSessionEnd(cardOver, () => setCardOver(false));
+  // Cards ⇄ text, the same two views a canvas Section has (cards / outline). Per column and
   // session-only: it's a way of working on a list right now, not a property of
   // the board.
   const [text, setText_] = useState(false);
@@ -570,7 +578,7 @@ function BoardColumn({
           title="Drag to reorder board"
           aria-label="Reorder board"
         >
-          ⠿
+          <GripVertical aria-hidden size={13} strokeWidth={1.75} />
         </span>
         <Avatar name={board.name} size={18} imageUrl={board.image} color={board.color} />
         <Link
@@ -583,10 +591,10 @@ function BoardColumn({
         {slim ? null : (
           <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5">
             <ViewBtn active={text} onClick={showText} title="Text">
-              ≣
+              <AlignJustify aria-hidden size={14} strokeWidth={1.75} />
             </ViewBtn>
             <ViewBtn active={!text} onClick={showCards} title="Cards">
-              ▦
+              <LayoutGrid aria-hidden size={14} strokeWidth={1.75} />
             </ViewBtn>
             {outline.saving ? (
               <span
@@ -645,7 +653,7 @@ function BoardColumn({
 }
 
 /** One of the two view buttons in a column header — same look as the canvas
- *  Section's, so the ▦/≣ pair reads identically on both surfaces. */
+ *  Section's, so the cards/outline pair reads identically on both surfaces. */
 function ViewBtn({
   active,
   onClick,

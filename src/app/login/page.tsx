@@ -1,5 +1,6 @@
 "use client";
 
+import { Check } from "lucide-react";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -38,8 +39,8 @@ export default function LoginPage() {
     <div className="grid min-h-screen place-items-center px-6">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex items-center gap-2.5">
-          <div className="grid h-9 w-9 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
-            ✓
+          <div className="grid h-9 w-9 place-items-center rounded-lg bg-accent text-white">
+            <Check aria-hidden size={20} strokeWidth={3} />
           </div>
           <div className="leading-tight">
             <div className="text-base font-semibold tracking-tight">To-do Challenger</div>

@@ -13,6 +13,7 @@
  * members follow).
  */
 
+import { X } from "lucide-react";
 import { useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { systemGroupOf, type SystemGroup } from "@/lib/sections";
@@ -40,7 +41,6 @@ export const NEW_GROUP_SIZE = { width: 460, height: 220 };
  *  GET here, since you never build one by hand. */
 const EMPTY_TRAY_HINT: Record<SystemGroup, string> = {
   inbox: "Nothing untriaged",
-  today: "Nothing on today's list — drop a card here, or file it from a board",
   thisWeek: "Nothing on this week's board — hover a card and press ↑",
   backlog: "Nothing in the backlog — hover a card and press →",
   later: "Nothing deferred — hover a card and press ↓",
@@ -208,7 +208,7 @@ export function SectionGroupNode({
             }}
             className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-xs font-medium text-faint opacity-0 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-600 group-hover/gh:opacity-100"
           >
-            ✕
+            <X aria-hidden size={13} strokeWidth={2} />
           </button>
         ) : null}
       </div>

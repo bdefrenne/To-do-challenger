@@ -1,5 +1,9 @@
 "use client";
 
+import {
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Board, Project, Task } from "@/lib/types";
 import { addDays, fromYmd, startOfWeek, ymd } from "@/lib/dates";
@@ -799,10 +803,14 @@ function Standup({
         <span className="text-[10px] text-faint group-hover:text-muted">
           {/* Two labels rather than a rotating caret: which way it's about to move
               is the only thing worth saying here. */}
-          <span className="group-open:hidden">
-            {writeUp.hasMore ? "Read it ▾" : "▾"}
+          <span className="inline-flex items-center gap-1 group-open:hidden">
+            {writeUp.hasMore ? "Read it" : null}
+            <ChevronDown aria-hidden size={11} strokeWidth={2} />
           </span>
-          <span className="hidden group-open:inline">Less ▴</span>
+          <span className="hidden items-center gap-1 group-open:inline-flex">
+            Less
+            <ChevronUp aria-hidden size={11} strokeWidth={2} />
+          </span>
         </span>
       </summary>
 

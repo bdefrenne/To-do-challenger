@@ -8,6 +8,30 @@ import type {
   TaskCommit,
   Importance,
 } from "@/lib/types";
+import {
+  ArrowLeftRight,
+  Ban,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  CornerDownRight,
+  Hammer,
+  MessageSquare,
+  Paperclip,
+  Pause,
+  Pencil,
+  Play,
+  RefreshCw,
+  Repeat,
+  RotateCcw,
+  Search,
+  Share2,
+  Sparkles,
+  Target,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Markdown } from "@/components/ui/Markdown";
 import { PointsChip } from "@/components/ui/Badge";
@@ -23,18 +47,18 @@ import { StatusSelect } from "./StatusSelect";
 import { AssigneeEditor } from "./AssigneeEditor";
 import { useWorkspace } from "./WorkspaceContext";
 
-const LOG_ICON: Record<TaskLogEntry["kind"], string> = {
-  created: "✦",
-  status: "↻",
-  moved: "⇄",
-  nested: "⤵",
-  started: "▶",
-  paused: "⏸",
-  done: "✓",
-  reopened: "↺",
-  comment: "💬",
-  attached: "📎",
-  updated: "✎",
+const LOG_ICON: Record<TaskLogEntry["kind"], LucideIcon> = {
+  created: Sparkles,
+  status: RefreshCw,
+  moved: ArrowLeftRight,
+  nested: CornerDownRight,
+  started: Play,
+  paused: Pause,
+  done: Check,
+  reopened: RotateCcw,
+  comment: MessageSquare,
+  attached: Paperclip,
+  updated: Pencil,
 };
 
 /** How each surface reads in the activity attribution line ("via …"). */
@@ -258,7 +282,7 @@ function TaskDetailLevel({
       .map((n) => ({
         id: `note-${n.id}`,
         at: n.createdAt,
-        icon: "🎯",
+        icon: Target as LucideIcon,
         color: "text-accent",
         message: n.note,
         who: undefined as string | undefined,
@@ -458,13 +482,15 @@ function TaskDetailLevel({
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
               <CopyButton
-                label="📤 Share"
+                label="Share"
+                icon={Share2}
                 title="Copy the task to share it: code, title, status, description + a link back here"
                 copied={copiedKey === "share"}
                 onClick={() => copyText("share", buildInfo())}
               />
               <CopyButton
-                label="🔍 Analyze"
+                label="Analyze"
+                icon={Search}
                 title="Think it through with me — don't build (locks the code)"
                 copied={copiedKey === "analyze"}
                 onClick={() =>
@@ -474,7 +500,8 @@ function TaskDetailLevel({
                 }
               />
               <CopyButton
-                label="🔍→🔨 Analyze → Build"
+                label="Analyze → Build"
+                icon={Search}
                 title="Investigate first, tell me what you suggest, then build once I say go (locks the code)"
                 copied={copiedKey === "both"}
                 onClick={() =>
@@ -486,7 +513,8 @@ function TaskDetailLevel({
                 }
               />
               <CopyButton
-                label="🔨 Build"
+                label="Build"
+                icon={Hammer}
                 title="Go ahead and build it now — no check-in before implementing (locks the code)"
                 copied={copiedKey === "work"}
                 onClick={() =>
@@ -500,7 +528,7 @@ function TaskDetailLevel({
                 className="rounded-md px-2 py-1 text-muted hover:bg-surface-2 hover:text-fg"
                 aria-label="Close"
               >
-                ✕
+                <X aria-hidden size={15} strokeWidth={2} />
               </button>
             </div>
           </div>
@@ -576,7 +604,14 @@ function TaskDetailLevel({
                       onClick={copyDesc}
                       className="rounded-md px-2 py-0.5 text-xs font-medium text-accent hover:bg-surface-2"
                     >
-                      {descCopied ? "✓ Copied" : "⧉ Copy"}
+                      <span className="inline-flex items-center gap-1">
+                        {descCopied ? (
+                          <Check aria-hidden size={12} strokeWidth={2.5} />
+                        ) : (
+                          <Copy aria-hidden size={12} strokeWidth={1.75} />
+                        )}
+                        {descCopied ? "Copied" : "Copy"}
+                      </span>
                     </button>
                   ) : null}
                 </div>
@@ -709,7 +744,7 @@ function TaskDetailLevel({
                       className="absolute right-1.5 top-1.5 hidden rounded-full bg-slate-900/70 px-1.5 py-0.5 text-[11px] leading-none text-white group-hover:block"
                       aria-label={`Remove ${featured.filename}`}
                     >
-                      ✕
+                      <X aria-hidden size={12} strokeWidth={2} />
                     </button>
                   </div>
 
@@ -812,9 +847,9 @@ function TaskDetailLevel({
                 {activity.map((e) => (
                   <li key={e.id} className="relative flex gap-3 py-1">
                     <span
-                      className={`z-10 grid h-[22px] w-[22px] shrink-0 place-items-center rounded-full border border-border bg-surface text-[11px] ${e.color}`}
+                      className={`z-10 grid h-[22px] w-[22px] shrink-0 place-items-center rounded-full border border-border bg-surface ${e.color}`}
                     >
-                      {e.icon}
+                      <e.icon aria-hidden size={12} strokeWidth={2} />
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="text-sm text-fg">{e.message}</div>
@@ -919,7 +954,10 @@ function TaskDetailLevel({
             ) : null}
             {task.recurrence && task.recurrence !== "none" ? (
               <Meta label="Repeats">
-                <span>↻ {RECURRENCE_LABEL[task.recurrence]}</span>
+                <span className="inline-flex items-center gap-1.5">
+                  <Repeat aria-hidden size={13} strokeWidth={1.75} />
+                  {RECURRENCE_LABEL[task.recurrence]}
+                </span>
               </Meta>
             ) : null}
             {task.dependsOn?.length ? (
@@ -932,7 +970,10 @@ function TaskDetailLevel({
                         className="truncate text-left text-accent hover:underline disabled:text-faint disabled:no-underline"
                         disabled={!taskMap[depId]}
                       >
-                        ⛔ {taskMap[depId]?.title ?? depId}
+                        <span className="flex min-w-0 items-center gap-1.5">
+                          <Ban aria-hidden size={13} strokeWidth={1.75} className="shrink-0" />
+                          <span className="truncate">{taskMap[depId]?.title ?? depId}</span>
+                        </span>
                       </button>
                     </li>
                   ))}
@@ -944,7 +985,7 @@ function TaskDetailLevel({
       </div>
     </div>
 
-    {/* Lightbox — full-size viewer with ←/→ navigation across the images. */}
+    {/* Lightbox — full-size viewer with left/right navigation across the images. */}
     {lightboxItem ? (
       <div
         className="fixed inset-0 flex items-center justify-center bg-slate-950/85 p-6 backdrop-blur-sm"
@@ -957,7 +998,7 @@ function TaskDetailLevel({
           className="absolute right-4 top-4 grid h-9 w-9 place-items-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
           aria-label="Close"
         >
-          ✕
+          <X aria-hidden size={18} strokeWidth={2} />
         </button>
 
         {attachments.length > 1 ? (
@@ -970,7 +1011,7 @@ function TaskDetailLevel({
             className="absolute left-4 top-1/2 grid h-11 w-11 -translate-y-1/2 place-items-center rounded-full bg-white/10 text-2xl text-white hover:bg-white/20"
             aria-label="Previous image"
           >
-            ‹
+            <ChevronLeft aria-hidden size={26} strokeWidth={2} />
           </button>
         ) : null}
 
@@ -1023,7 +1064,7 @@ function TaskDetailLevel({
             className="absolute right-4 top-1/2 grid h-11 w-11 -translate-y-1/2 place-items-center rounded-full bg-white/10 text-2xl text-white hover:bg-white/20"
             aria-label="Next image"
           >
-            ›
+            <ChevronRight aria-hidden size={26} strokeWidth={2} />
           </button>
         ) : null}
       </div>
@@ -1046,11 +1087,14 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
  *  reflows. Sized to match the other header buttons. */
 function CopyButton({
   label,
+  icon: Icon,
   title,
   copied,
   onClick,
 }: {
   label: string;
+  /** Leading glyph for the button. */
+  icon: LucideIcon;
   title: string;
   copied: boolean;
   onClick: () => void;
@@ -1069,7 +1113,17 @@ function CopyButton({
           : "border-accent/30 bg-accent-soft text-accent hover:bg-accent/15 disabled:opacity-70")
       }
     >
-      {copied ? "✓ Copied" : label}
+      {copied ? (
+        <>
+          <Check aria-hidden size={13} strokeWidth={2.25} />
+          Copied
+        </>
+      ) : (
+        <>
+          <Icon aria-hidden size={13} strokeWidth={1.75} />
+          {label}
+        </>
+      )}
     </button>
   );
 }

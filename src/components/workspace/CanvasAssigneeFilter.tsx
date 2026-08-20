@@ -8,6 +8,7 @@
  * the roster; the "Me" pill is a one-click shortcut for the common case.
  */
 
+import { Check, ChevronDown } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { usePeople } from "@/components/PeopleContext";
 import { PersonAvatar } from "@/components/PersonAvatar";
@@ -61,7 +62,7 @@ export function CanvasAssigneeFilter({
         ) : (
           "Everyone"
         )}
-        <span className="text-faint">▾</span>
+        <ChevronDown aria-hidden size={13} strokeWidth={2} className="text-faint" />
       </button>
 
       {me ? (
@@ -107,7 +108,7 @@ export function CanvasAssigneeFilter({
             ].join(" ")}
           >
             <span className="flex-1 text-fg">Everyone</span>
-            {value === null ? <span className="text-accent">✓</span> : null}
+            {value === null ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
           </button>
           {filtered.length === 0 ? (
             <p className="px-2 py-1.5 text-xs text-faint">No matches.</p>
@@ -127,7 +128,7 @@ export function CanvasAssigneeFilter({
               >
                 <PersonAvatar name={p.name} size={18} />
                 <span className="flex-1 truncate text-fg">{p.name}</span>
-                {value === p.id ? <span className="text-accent">✓</span> : null}
+                {value === p.id ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
               </button>
             ))
           )}

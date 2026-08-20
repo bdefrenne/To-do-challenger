@@ -1,5 +1,6 @@
 "use client";
 
+import { Check } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
@@ -56,7 +57,7 @@ export function StatusPill({
               >
                 <span className={`h-2 w-2 rounded-full ${t.dot}`} aria-hidden />
                 <span className="text-fg">{STATUS_LABEL[s]}</span>
-                {s === status ? <span className="ml-auto text-accent">✓</span> : null}
+                {s === status ? <span className="ml-auto text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
               </button>
             );
           })}

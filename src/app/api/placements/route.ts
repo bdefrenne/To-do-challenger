@@ -1,8 +1,8 @@
 /*
   /api/placements
     GET — the canvas flattened to `sectionId → placement`, so a board view can
-          say which bucket (INBOX / TODAY / THIS WEEK / BACKLOG / LATER / DONE
-          THIS WEEK) a task is filed in without mounting a canvas — plus each
+          say which bucket (INBOX / THIS WEEK / BACKLOG / LATER / DONE THIS
+          WEEK) a task is filed in without mounting a canvas — plus each
           bucket's name AS IT READS ON THE CANVAS, so a renamed group heads the
           same band on both surfaces.
 

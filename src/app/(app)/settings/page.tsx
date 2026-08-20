@@ -1,5 +1,9 @@
 "use client";
 
+import {
+  Check,
+  PartyPopper,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -400,7 +404,12 @@ function ProfileSection() {
             >
               {busy ? "Saving…" : "Save"}
             </button>
-            {saved ? <span className="text-xs text-buff">Saved ✓</span> : null}
+            {saved ? (
+              <span className="flex items-center gap-1 text-xs text-buff">
+                Saved
+                <Check aria-hidden size={12} strokeWidth={2.5} />
+              </span>
+            ) : null}
           </div>
 
           {/* Paste-URL alternative */}
@@ -506,8 +515,9 @@ function CalendarsSection() {
       </p>
 
       {flash.ok && (
-        <div className="mb-4 rounded-lg border border-buff/40 bg-buff-soft/50 px-3 py-2 text-xs text-buff">
-          Connected the {flash.ok} calendar. 🎉
+        <div className="mb-4 flex items-center gap-1.5 rounded-lg border border-buff/40 bg-buff-soft/50 px-3 py-2 text-xs text-buff">
+          <PartyPopper aria-hidden size={14} strokeWidth={1.75} className="shrink-0" />
+          Connected the {flash.ok} calendar.
         </div>
       )}
       {flash.err && (

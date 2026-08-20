@@ -1,5 +1,13 @@
 "use client";
 
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Circle,
+  Play,
+  X,
+} from "lucide-react";
 import { useState } from "react";
 import Link from "next/link";
 import { Card, CardHeader } from "@/components/ui/Card";
@@ -88,13 +96,20 @@ export function DailyFocus() {
               onClick={() => setShowDone((v) => !v)}
               className="text-[11px] font-medium uppercase tracking-wide text-faint hover:text-muted"
             >
-              {showDone ? "▾" : "▸"} Done today · {doneToday.length}
+              <span className="inline-flex items-center gap-1">
+                {showDone ? (
+                  <ChevronDown aria-hidden size={12} strokeWidth={2} />
+                ) : (
+                  <ChevronRight aria-hidden size={12} strokeWidth={2} />
+                )}
+                Done today · {doneToday.length}
+              </span>
             </button>
             {showDone ? (
               <ul className="mt-2 space-y-1">
                 {doneToday.map((n) => (
                   <li key={n.id} className="flex items-center gap-2 px-1 text-sm">
-                    <span className="text-buff">✓</span>
+                    <Check aria-hidden size={13} strokeWidth={2.5} className="text-buff" />
                     <button
                       onClick={() => openTask(n.id)}
                       className="text-faint hover:text-fg"
@@ -151,7 +166,7 @@ function FocusRow({
         aria-label="Mark done"
         className="grid h-[18px] w-[18px] shrink-0 place-items-center rounded-full border border-border-strong text-[10px] text-transparent transition-colors hover:border-buff hover:text-buff"
       >
-        ✓
+        <Check aria-hidden size={12} strokeWidth={3} />
       </button>
 
       {!running ? (
@@ -160,7 +175,7 @@ function FocusRow({
           title="Start this task"
           className="shrink-0 text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
         >
-          ▶
+          <Play aria-hidden size={13} strokeWidth={2} className="fill-current" />
         </button>
       ) : null}
 
@@ -169,7 +184,10 @@ function FocusRow({
           {value != null ? <PointsChip kind="value" points={value} /> : null}
           {difficulty != null ? <PointsChip kind="difficulty" points={difficulty} /> : null}
           <span className="truncate text-sm font-medium text-fg">{title}</span>
-          {running ? <span className="shrink-0 text-xs text-new">● in progress</span> : null}
+          {running ? <span className="flex shrink-0 items-center gap-1 text-xs text-new">
+              <Circle aria-hidden size={7} className="fill-current" />
+              in progress
+            </span> : null}
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
           {due ? (
@@ -190,7 +208,7 @@ function FocusRow({
         title="Send back to To Do"
         className="shrink-0 text-faint opacity-0 transition-opacity hover:text-nerf group-hover:opacity-100"
       >
-        ✕
+        <X aria-hidden size={13} strokeWidth={2} />
       </button>
     </li>
   );

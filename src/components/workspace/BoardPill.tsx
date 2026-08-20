@@ -1,5 +1,10 @@
 "use client";
 
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 /** A project and the boards a task could move to within it. */
@@ -101,7 +106,8 @@ export function BoardPill({
                   onClick={() => setProjectId(null)}
                   className="flex w-full items-center gap-1 px-3 py-1.5 text-left text-xs text-faint hover:text-fg"
                 >
-                  ‹ <span className="truncate font-medium">{activeGroup.projectName}</span>
+                  <ChevronLeft aria-hidden size={12} strokeWidth={2} />
+              <span className="truncate font-medium">{activeGroup.projectName}</span>
                 </button>
               ) : null}
               {activeGroup.boards.length === 0 ? (
@@ -117,7 +123,7 @@ export function BoardPill({
                   >
                     <span className="truncate text-fg">{b.name}</span>
                     {b.id === currentBoardId ? (
-                      <span className="ml-auto text-accent">✓</span>
+                      <span className="ml-auto text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span>
                     ) : null}
                   </button>
                 ))
@@ -139,7 +145,7 @@ export function BoardPill({
                     className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-surface-2"
                   >
                     <span className="truncate text-fg">{g.projectName}</span>
-                    <span className="ml-auto text-faint">›</span>
+                    <ChevronRight aria-hidden size={12} strokeWidth={2} className="ml-auto text-faint" />
                   </button>
                 ))
               )}

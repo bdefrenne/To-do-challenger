@@ -10,6 +10,7 @@
  * but they can be toggled off like anyone else.
  */
 
+import { Check } from "lucide-react";
 import { usePeople } from "@/components/PeopleContext";
 import { PersonAvatar } from "@/components/PersonAvatar";
 
@@ -50,7 +51,7 @@ export function ProjectMembersField({
               >
                 <PersonAvatar name={p.name} size={20} />
                 <span className="flex-1 truncate text-fg">{p.name}</span>
-                {on ? <span className="text-accent">✓</span> : null}
+                {on ? <span className="text-accent"><Check aria-hidden size={13} strokeWidth={2.5} /></span> : null}
               </button>
             );
           })

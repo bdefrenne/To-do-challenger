@@ -1,5 +1,8 @@
 "use client";
 
+import {
+  Pencil,
+} from "lucide-react";
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { type OutlineRow, descOwnerAt } from "@/lib/outline";
 import type { RowLock } from "./useRowLock";
@@ -406,7 +409,10 @@ export function OutlineEditor({
                   className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-white"
                   style={{ backgroundColor: lock.owner.color, opacity: lock.live ? 1 : 0.55 }}
                 >
-                  ✎ {lock.owner.name}
+                  <span className="inline-flex items-center gap-1">
+                    <Pencil aria-hidden size={10} strokeWidth={2} />
+                    {lock.owner.name}
+                  </span>
                 </span>
                 {/* Only on the row you have SELECTED, and only while they're
                     actively typing — a parked row needs no button, you just type. */}

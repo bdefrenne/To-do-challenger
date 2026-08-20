@@ -14,6 +14,25 @@ import { TaskDetailModal } from "./workspace/TaskDetailModal";
 import { ShortcutsHelp, openShortcutsHelp } from "./workspace/ShortcutsHelp";
 import { BoardModal } from "./workspace/BoardModal";
 import { ProjectModal } from "./workspace/ProjectModal";
+import {
+  Archive,
+  Calendar,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleDot,
+  Keyboard,
+  LayoutDashboard,
+  ListTodo,
+  LogOut,
+  PencilLine,
+  Plus,
+  Settings,
+  Sparkles,
+  Sunrise,
+  Trash2,
+  type LucideIcon,
+} from "lucide-react";
 import { PeopleProvider, usePeople } from "./PeopleContext";
 import { Avatar } from "./ui/Badge";
 import type { Project, TaskPlacement } from "@/lib/types";
@@ -30,15 +49,15 @@ export interface SessionUser {
   language: "en" | "fr";
 }
 
-const NAV = [
-  { href: "/", label: "All tasks", icon: "☰" },
-  { href: "/today", label: "Today", icon: "◎" },
-  { href: "/day", label: "Finish work", icon: "◑" },
-  { href: "/canvas", label: "Canvas", icon: "◳" },
-  { href: "/notes", label: "Notes", icon: "✎" },
-  { href: "/calendar", label: "Calendar", icon: "▦" },
-  { href: "/archived", label: "Archived", icon: "🗄" },
-  { href: "/trash", label: "Trash", icon: "🗑" },
+const NAV: { href: string; label: string; icon: LucideIcon }[] = [
+  { href: "/", label: "All tasks", icon: ListTodo },
+  { href: "/today", label: "Today", icon: Sunrise },
+  { href: "/day", label: "Finish work", icon: CircleDot },
+  { href: "/canvas", label: "Canvas", icon: LayoutDashboard },
+  { href: "/notes", label: "Notes", icon: PencilLine },
+  { href: "/calendar", label: "Calendar", icon: Calendar },
+  { href: "/archived", label: "Archived", icon: Archive },
+  { href: "/trash", label: "Trash", icon: Trash2 },
 ];
 
 const SIDEBAR_KEY = "sidebar:open";
@@ -189,7 +208,6 @@ function DeleteUndoToast() {
 
 const SEND_LABEL: Record<TaskPlacement, string> = {
   inbox: "Inbox",
-  today: "Today",
   thisWeek: "This week",
   backlog: "Backlog",
   later: "Later",
@@ -321,8 +339,8 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
   return (
     <aside className="sticky top-0 flex h-screen shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex items-center gap-2.5 px-5 py-5">
-        <div className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
-          ✓
+        <div className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-white">
+          <Check aria-hidden size={18} strokeWidth={3} />
         </div>
         <div className="min-w-0 flex-1 leading-tight">
           <div className="text-sm font-semibold tracking-tight">
@@ -355,11 +373,12 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
                   : "text-muted hover:bg-surface-2 hover:text-fg",
               ].join(" ")}
             >
-              <span
-                className={`text-base ${active ? "text-accent" : "text-faint"}`}
-              >
-                {item.icon}
-              </span>
+              <item.icon
+                aria-hidden
+                size={16}
+                strokeWidth={active ? 2.25 : 1.75}
+                className={active ? "text-accent" : "text-faint"}
+              />
               {item.label}
             </Link>
           );
@@ -385,7 +404,7 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
             <div className="truncate text-sm font-medium text-fg">{identity.name}</div>
             <div className="truncate text-[11px] text-faint">{identity.email}</div>
           </div>
-          <span className="text-faint">▾</span>
+          <ChevronDown aria-hidden size={14} strokeWidth={2} className="text-faint" />
         </button>
 
         {menuOpen ? (
@@ -402,7 +421,7 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
               className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-sm text-fg hover:bg-surface-2"
             >
               <span className="flex items-center gap-2">
-                <span className="text-faint">⌨</span>
+                <Keyboard aria-hidden size={14} strokeWidth={1.75} className="text-faint" />
                 Keyboard shortcuts
               </span>
               <kbd className="rounded bg-surface-3 px-1 text-[10px] font-semibold leading-none text-faint">
@@ -415,7 +434,7 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
               onClick={() => setMenuOpen(false)}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-fg hover:bg-surface-2"
             >
-              <span className="text-faint">✦</span>
+              <Sparkles aria-hidden size={14} strokeWidth={1.75} className="text-faint" />
               Settings
             </Link>
             <button
@@ -426,7 +445,7 @@ function Sidebar({ user, onClose }: { user: SessionUser; onClose: () => void }) 
               }}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-muted hover:bg-surface-2 hover:text-fg"
             >
-              <span className="text-faint">⏻</span>
+              <LogOut aria-hidden size={14} strokeWidth={1.75} className="text-faint" />
               Sign out
             </button>
           </div>
@@ -486,7 +505,11 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
           className="py-1.5 pl-1 pr-0.5 text-faint hover:text-fg"
           aria-label={open ? "Collapse project" : "Expand project"}
         >
-          {open ? "▾" : "▸"}
+          {open ? (
+            <ChevronDown aria-hidden size={13} strokeWidth={2} />
+          ) : (
+            <ChevronRight aria-hidden size={13} strokeWidth={2} />
+          )}
         </button>
         <Avatar name={project.name} size={16} imageUrl={project.image} color={project.color} />
         <Link
@@ -503,7 +526,7 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
           title="Project settings"
           className="px-1 text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
         >
-          ⚙
+          <Settings aria-hidden size={13} strokeWidth={1.75} />
         </button>
         <button
           onClick={() => {
@@ -513,7 +536,7 @@ function ProjectRow({ project, pathname }: { project: Project; pathname: string 
           title="New board"
           className="px-1 text-faint opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
         >
-          +
+          <Plus aria-hidden size={13} strokeWidth={2} />
         </button>
       </div>
 

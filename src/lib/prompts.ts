@@ -16,6 +16,11 @@
 
   Neither build handoff assumes an analysis or plan already exists — each writes
   whatever's missing as it goes, so any of them works on any task.
+
+  Every prompt opens with the task's title alone on the first line, then a blank
+  line, then the handoff itself (see `titleHeader`) — so whatever reads it, a
+  chat log or a session list, shows what the work is before anything else. The
+  body then cites the task by code alone; the header already said the title.
 */
 
 /** The two working languages a user can pick in their profile. */
@@ -24,6 +29,15 @@ export type Language = "en" | "fr";
 /** Appended to every prompt for non-French users so the AI works in English. */
 export function langSuffix(lang: Language | null | undefined): string {
   return lang === "fr" ? "" : "\n\nWork and talk in ENGLISH.";
+}
+
+/**
+ * The opening of every task-scoped prompt: the task title on its own line, then
+ * a blank line. Keeps the rule in one place — the clipboard handoffs below and
+ * the task-scoped MCP slash commands (`src/app/api/mcp/route.ts`) share it.
+ */
+export function titleHeader(title: string): string {
+  return `${title}\n\n`;
 }
 
 /** Shared preamble: load the real context before saying anything. */
@@ -40,7 +54,8 @@ function loadContext(): string {
 /** Analyze only: load context, think it through, record the analysis — no build. */
 export function analyzePrompt(code: string, title: string, lang?: Language | null): string {
   return (
-    `Analyze "${title}": I want to ANALYZE with you the task ${code} — "${title}" using the "todo" MCP. ` +
+    titleHeader(title) +
+    `I want to ANALYZE with you the task ${code} using the "todo" MCP. ` +
     `We'll brainstorm it, do not build it yet.\n\n` +
     `First, right now, set status to "analyzing" via update_task — we're starting ` +
     `on this together, so do this before anything else. ` +
@@ -65,7 +80,8 @@ export function analyzePrompt(code: string, title: string, lang?: Language | nul
  */
 export function analyzeThenWorkPrompt(code: string, title: string, lang?: Language | null): string {
   return (
-    `Analyze & Build "${title}": take task ${code} — "${title}" through to done using the "todo" MCP, ` +
+    titleHeader(title) +
+    `Take task ${code} through to done using the "todo" MCP, ` +
     `but INVESTIGATE FIRST and tell me what you suggest before you implement ` +
     `anything.\n\n` +
     `First, right now, set status to "analyzing" via update_task — we're starting ` +
@@ -95,7 +111,8 @@ export function analyzeThenWorkPrompt(code: string, title: string, lang?: Langua
 /** Build now: no check-in before implementing (still confirms before done). */
 export function workPrompt(code: string, title: string, lang?: Language | null): string {
   return (
-    `Build "${title}": build task ${code} — "${title}" using the "todo" MCP. ` +
+    titleHeader(title) +
+    `Build task ${code} using the "todo" MCP. ` +
     `You can go ahead directly — no need to check with me before implementing ` +
     `it.\n\n` +
     `First, right now, set status to "building" via update_task — we're starting ` +

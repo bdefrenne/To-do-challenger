@@ -30,8 +30,8 @@ export function BoardModal({
   const router = useRouter();
   const pathname = usePathname();
 
-  // Deleting a board takes its tasks with it, so the confirm spells out how
-  // many are on the line.
+  // A board that still holds tasks can't be deleted (see onDelete below), so
+  // this count is what the delete button is disabled ON, and what the hint names.
   const taskCount =
     mode === "edit" && board
       ? Object.values(taskMap).filter((t) => t.boardId === board.id).length
@@ -45,19 +45,15 @@ export function BoardModal({
       descriptionHint="explain the board so code-less AIs understand it"
       initial={board ?? {}}
       onClose={onClose}
+      // Same rule as a project (and enforced server-side in `deleteBoard`): a
+      // board that still holds tasks can't be deleted. Deleting the row would
+      // cascade its tasks out of Postgres — the one exit that skips the Trash —
+      // so the tasks leave first, through a door that has an undo.
       onDelete={
         mode === "edit" && board
           ? async () => {
-              if (
-                !confirm(
-                  `Delete board “${board.name}”${
-                    taskCount > 0
-                      ? ` and its ${taskCount} task${taskCount === 1 ? "" : "s"}`
-                      : ""
-                  }? This can't be undone.`,
-                )
-              )
-                return;
+              if (taskCount > 0) return;
+              if (!confirm(`Delete board “${board.name}”? This can't be undone.`)) return;
               await deleteBoard(board.id);
               if (pathname === `/boards/${board.id}`)
                 router.push(projectId ? `/projects/${projectId}` : "/");
@@ -65,11 +61,13 @@ export function BoardModal({
             }
           : undefined
       }
+      deleteDisabled={taskCount > 0}
       deleteHint={
         taskCount > 0
-          ? `Permanently delete this board and its ${taskCount} task${
+          ? `Move or delete this board's ${taskCount} task${
               taskCount === 1 ? "" : "s"
-            }.`
+            } before deleting it — deleting a board would destroy them outright, ` +
+            `without the Trash.`
           : "Permanently delete this board."
       }
       onSave={async (v, pic) => {

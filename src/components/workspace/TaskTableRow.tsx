@@ -1,5 +1,6 @@
 "use client";
 
+import { Check, ChevronDown, ChevronRight, Flag, GripVertical, MessageSquare } from "lucide-react";
 import { useRef, useState, type DragEvent } from "react";
 import type { Task, TaskStatus, Importance } from "@/lib/types";
 import type { DropPos, TaskNode } from "./WorkspaceContext";
@@ -138,7 +139,7 @@ export function TaskTableRow({
           title="Drag to reorder or nest"
           aria-hidden
         >
-          ⠿
+          <GripVertical aria-hidden size={13} strokeWidth={1.75} />
         </span>
         {hasChildren ? (
           <button
@@ -146,7 +147,11 @@ export function TaskTableRow({
             className="w-3 shrink-0 text-faint hover:text-fg"
             aria-label={expanded ? "Collapse" : "Expand"}
           >
-            {expanded ? "▾" : "▸"}
+            {expanded ? (
+              <ChevronDown aria-hidden size={13} strokeWidth={2} />
+            ) : (
+              <ChevronRight aria-hidden size={13} strokeWidth={2} />
+            )}
           </button>
         ) : (
           <span className="w-3 shrink-0" />
@@ -162,7 +167,7 @@ export function TaskTableRow({
               : "border-border-strong text-transparent hover:border-buff hover:text-buff",
           ].join(" ")}
         >
-          ✓
+          <Check aria-hidden size={12} strokeWidth={3} />
         </button>
 
         {/* Board — shown inline before the title; click to move (its own menu). */}
@@ -181,8 +186,12 @@ export function TaskTableRow({
             {task.title}
           </span>
           {task.commentCount ? (
-            <span className="shrink-0 text-xs text-faint" title={`${task.commentCount} comments`}>
-              💬 {task.commentCount}
+            <span
+              className="flex shrink-0 items-center gap-1 text-xs text-faint"
+              title={`${task.commentCount} comments`}
+            >
+              <MessageSquare aria-hidden size={12} strokeWidth={1.75} />
+              {task.commentCount}
             </span>
           ) : null}
         </button>
@@ -217,7 +226,7 @@ export function TaskTableRow({
                       : "text-faint opacity-0 hover:text-fg group-hover:opacity-100"
                   }`}
                 >
-                  ⚑
+                  <Flag aria-hidden size={12} strokeWidth={1.75} />
                 </button>
               );
             }}

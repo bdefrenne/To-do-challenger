@@ -19,7 +19,7 @@ import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
  *   • List (default) — every task across all of the project's boards,
  *     grouped by status, each row tagged with its board.
  *   • Boards — the triage ladder as collapsible separators (INBOX · DONE THIS
- *     WEEK · TODAY · THIS WEEK · BACKLOG · LATER), each holding one column per
+ *     WEEK · THIS WEEK · BACKLOG · LATER), each holding one column per
  *     board; drag a column handle to reorder the boards (and the sidebar).
  *   • Done — what actually got finished, as collapsible weeks and days, each day
  *     holding one column per person cut across by a band per board.
