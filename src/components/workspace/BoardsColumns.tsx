@@ -56,6 +56,7 @@ export function BoardsColumns({ project }: { project: Project }) {
     registerPlacementMap,
     addTask,
     fileTasks,
+    archiveTasks,
     reorderBoards,
   } = useWorkspace();
   const boards = useMemo(() => project.boards ?? [], [project.boards]);
@@ -165,18 +166,19 @@ export function BoardsColumns({ project }: { project: Project }) {
   }, [nodes, nodeById, boards, placementByNode]);
 
   /**
-   * What "Clear Done" sweeps out of each column: the DONE cards in it, at ANY
-   * depth — a done subtask sitting under an open parent is done work cluttering a
-   * live band exactly as a done root card is, and it renders in this column too.
+   * What a column's sweep acts on: the DONE cards in it, at ANY depth — a done
+   * subtask sitting under an open parent is done work cluttering a live band
+   * exactly as a done root card is, and it renders in this column too.
    *
-   * Two cards are deliberately left out:
+   * Every band gets a set, the tray included — there the sweep archives rather
+   * than clears (see the render), so the tray is no longer a dead end.
    *
-   *   • A done card whose parent is ALSO being swept. It has no pin of its own —
-   *     it renders here by inheriting its parent's placement — so it follows the
-   *     parent into the tray for free. Pinning it as well would convert an
-   *     inherited placement into a hand-made one, and the next time the parent
-   *     moves, the child would stay behind.
-   *   • Everything in DONE THIS WEEK, which is the destination — see the render.
+   * One card is deliberately left out: a done card whose parent is ALSO being
+   * swept. It has no pin of its own — it renders here by inheriting its parent's
+   * placement — so it follows the parent for free, into the tray or into the
+   * archive (`archiveTask` cascades over the subtree). Naming it as well would
+   * convert an inherited placement into a hand-made one, and the next time the
+   * parent moves, the child would stay behind.
    */
   const doneByPlacement = useMemo(() => {
     const boardIds = new Set(boards.map((b) => b.id));
@@ -318,14 +320,18 @@ export function BoardsColumns({ project }: { project: Project }) {
                     // containing nothing but "Add task". Still a drop target —
                     // an empty band you can't drop into is worse than an ugly one.
                     slim={count === 0}
-                    // The tray is where Clear Done sends things, so it doesn't
-                    // offer to clear itself.
-                    doneIds={
+                    doneIds={doneByPlacement.get(placement)?.get(board.id) ?? []}
+                    // The tray can't clear itself INTO itself — it's where the
+                    // other bands send things — so there the same button is the
+                    // next step instead: out of the week and into the Archived
+                    // view. Every other band still parks first, so finished work
+                    // always leaves in two deliberate moves.
+                    sweep={placement === "doneThisWeek" ? "archive" : "clear"}
+                    onSweep={(ids) =>
                       placement === "doneThisWeek"
-                        ? []
-                        : (doneByPlacement.get(placement)?.get(board.id) ?? [])
+                        ? archiveTasks(ids)
+                        : void fileTasks(ids, "doneThisWeek")
                     }
-                    onClearDone={(ids) => void fileTasks(ids, "doneThisWeek")}
                     doneTrayLabel={placementTitle(titles, "doneThisWeek")}
                     childrenInColumn={childrenInColumn}
                     label={placementTitle(titles, placement)}
@@ -375,7 +381,8 @@ function BoardColumn({
   roots,
   slim,
   doneIds,
-  onClearDone,
+  sweep,
+  onSweep,
   doneTrayLabel,
   childrenInColumn,
   label,
@@ -395,11 +402,13 @@ function BoardColumn({
   roots: TaskNode[];
   /** Render as a one-line chip rather than a column — the whole band is empty. */
   slim: boolean;
-  /** The done cards this column would sweep, at any depth — empty in the tray
-   *  itself, and empty when there's nothing done here, which is what hides the
-   *  button. */
+  /** The done cards this column would sweep, at any depth. Empty when there's
+   *  nothing done here, which is what hides the button. */
   doneIds: string[];
-  onClearDone: (ids: string[]) => void;
+  /** What the sweep DOES here: park this column's done cards in the tray, or —
+   *  in the tray itself, which has nowhere left to park — archive them. */
+  sweep: "clear" | "archive";
+  onSweep: (ids: string[]) => void;
   /** What the tray is CALLED, for the confirm — it can be renamed on the canvas,
    *  and a dialog naming a band the user can't find is worse than no dialog. */
   doneTrayLabel: string;
@@ -608,7 +617,12 @@ function BoardColumn({
           <button
             onClick={() => {
               const n = doneIds.length;
+              // Archiving asks for no confirmation and gets none: it lands in the
+              // undo toast, which is a better answer than a dialog — you see what
+              // went, and ⌘Z brings the whole batch back. Clearing keeps its
+              // dialog, since nothing catches THAT afterwards.
               if (
+                sweep === "clear" &&
                 !confirm(
                   `Clear ${n} done task${n === 1 ? "" : "s"} out of ${label} · ${board.name}?\n\n` +
                     `${n === 1 ? "It moves" : "They move"} to ${doneTrayLabel}. ` +
@@ -617,12 +631,16 @@ function BoardColumn({
                 )
               )
                 return;
-              onClearDone(doneIds);
+              onSweep(doneIds);
             }}
-            title={`Move this column's ${doneIds.length} done card${doneIds.length === 1 ? "" : "s"} to ${doneTrayLabel}`}
+            title={
+              sweep === "archive"
+                ? `Archive this column's ${doneIds.length} done card${doneIds.length === 1 ? "" : "s"} — ${doneIds.length === 1 ? "it moves" : "they move"} to the Archived view, and can be restored`
+                : `Move this column's ${doneIds.length} done card${doneIds.length === 1 ? "" : "s"} to ${doneTrayLabel}`
+            }
             className="ml-auto shrink-0 rounded-md border border-border px-2 py-0.5 text-xs font-medium text-muted transition-colors hover:bg-surface hover:text-fg"
           >
-            Clear Done ({doneIds.length})
+            {sweep === "archive" ? "Archive Done" : "Clear Done"} ({doneIds.length})
           </button>
         ) : null}
       </div>

@@ -207,6 +207,10 @@ interface WorkspaceContextValue {
   /** Archive every done task in scope (a board, a project, or all when omitted).
    *  Returns how many were archived. */
   archiveAllDone: (scope?: { boardId?: string; projectId?: string }) => Promise<number>;
+  /** Archive a NAMED set of done tasks — a column's sweep, rather than a scope.
+   *  Goes through the same undo window as a DELETE press on a done card (which
+   *  is exactly what this is, in bulk), so one Undo takes the whole batch back. */
+  archiveTasks: (ids: string[]) => void;
   moveNode: (dragId: string, targetId: string, pos: DropPos) => void;
   /** Re-pin a dragged card (and re-home its subtree's board). `targetPin` is what
    *  to write: a Section node id, or **null** to unpin — which is how a card
@@ -803,6 +807,13 @@ export function WorkspaceProvider({
         node: TaskNode | undefined;
         timer: ReturnType<typeof setTimeout>;
         mode: "delete" | "archive";
+        /** A DESCENDANT of another entry, held only so it leaves the view with
+         *  its root and comes back with it. `archiveTask` already cascades over
+         *  the subtree server-side, so this entry fires no request of its own —
+         *  and mustn't, since an archive of a child that isn't done is refused
+         *  outright ("Only done tasks can be archived"). Kept out of the toast
+         *  too, which counts what you pressed, not what came with it. */
+        cascaded?: boolean;
       }
     >
   >(new Map());
@@ -1498,6 +1509,8 @@ export function WorkspaceProvider({
       clearTimeout(entry.timer);
       pendingDeleteRef.current.delete(id);
       setPendingDeletes((s) => s.filter((d) => d.id !== id));
+      // Its root's archive takes it with it — see `cascaded`.
+      if (entry.cascaded) return;
       mutate(null, () =>
         entry.mode === "archive"
           ? api(`/api/tasks/${id}/archive`, {
@@ -1577,13 +1590,29 @@ export function WorkspaceProvider({
         return;
       }
     }
+    const mode: "delete" | "archive" = action === "delete" ? "delete" : "archive";
+    queueRemoval(id, mode);
+  }
+
+  /**
+   * Take a task out of view and arm its undo window — the shared tail of every
+   * removal, whether a DELETE press decided it (`deleteTask`) or a column sweep
+   * did (`archiveTasks`). The snapshot it keeps is what `undoDelete` puts back,
+   * and the timer is what eventually fires the DELETE or the archive.
+   */
+  function queueRemoval(
+    id: string,
+    mode: "delete" | "archive",
+    opts: { cascaded?: boolean } = {},
+  ) {
+    const task = taskMapRef.current[id];
+    if (!task || pendingDeleteRef.current.has(id)) return;
     // Any edit still sitting in the batch would PATCH a row that's gone: the
     // delete commits in UNDO_WINDOW_MS, the edit debounce runs for EDIT_FLUSH_MS.
     // Flushing rather than dropping keeps the value the undo snapshot carries.
     // Through the ref, not `flushEdits` itself — reading the memoized callback
     // from this plain function is what makes the React Compiler give up on it.
     if (pendingEditsRef.current.size) void flushEditsRef.current();
-    const mode: "delete" | "archive" = action === "delete" ? "delete" : "archive";
     const node = nodesRef.current.find((n) => n.id === id);
     setTaskMap((prev) => {
       if (!prev[id]) return prev;
@@ -1593,8 +1622,46 @@ export function WorkspaceProvider({
     });
     setNodes((prev) => prev.filter((n) => n.id !== id));
     const timer = setTimeout(() => commitDelete(id), UNDO_WINDOW_MS);
-    pendingDeleteRef.current.set(id, { task, node, timer, mode });
+    pendingDeleteRef.current.set(id, { task, node, timer, mode, ...opts });
+    // A cascaded child is along for the ride: it leaves and comes back with its
+    // root, but the toast counts what was pressed, not what came with it.
+    if (opts.cascaded) return;
     setPendingDeletes((s) => [...s.filter((d) => d.id !== id), { id, title: task.title, mode }]);
+  }
+
+  /**
+   * Archive a named set of done tasks — a column's sweep of the DONE THIS WEEK
+   * tray, where a scope (`archiveAllDone`) is too blunt and would take in bands
+   * you weren't looking at.
+   *
+   * The same operation as a DELETE press on one of these cards: `deletionOf`
+   * answers "archive" for anything done that's already in the tray, so this is
+   * that press N times over, undo window and all — one Undo takes the batch back,
+   * since `undoDelete()` with no id means "put back what I just removed".
+   *
+   * `ids` are subtree ROOTS (that's what the callers hand up, and what
+   * `archiveTask` cascades from). Their descendants come out of view alongside
+   * them: a card whose parent has gone from `nodes` renders as a top-level card
+   * rather than not at all, so leaving them would show the swept subtasks popping
+   * back up as roots until the next refetch.
+   */
+  function archiveTasks(ids: string[]) {
+    for (const id of ids) {
+      if (taskMapRef.current[id]?.status !== "done") continue;
+      queueRemoval(id, "archive");
+      // Breadth-first over the subtree, off the same node list `byPlacement`
+      // reads — no depth cap needed, `seen` is what stops a corrupt parent cycle.
+      const seen = new Set([id]);
+      for (const front = [id]; front.length; ) {
+        const parentId = front.shift()!;
+        for (const child of nodesRef.current)
+          if (child.parentId === parentId && !seen.has(child.id)) {
+            seen.add(child.id);
+            front.push(child.id);
+            queueRemoval(child.id, "archive", { cascaded: true });
+          }
+      }
+    }
   }
 
   /** Cancel pending deletes and restore the tasks. With no id, undoes EVERY task
@@ -1633,8 +1700,10 @@ export function WorkspaceProvider({
   // inside the undo window doesn't silently drop the delete.
   useEffect(
     () => () => {
-      for (const [id, { timer, mode }] of pendingDeleteRef.current) {
+      for (const [id, { timer, mode, cascaded }] of pendingDeleteRef.current) {
         clearTimeout(timer);
+        // Its root's archive cascades to it — see `cascaded`.
+        if (cascaded) continue;
         const req =
           mode === "archive"
             ? api(`/api/tasks/${id}/archive`, {
@@ -3225,6 +3294,7 @@ export function WorkspaceProvider({
         },
         bulk,
         archiveAllDone,
+        archiveTasks,
         subscribeLocalChange,
         applyRemotePatch,
         refreshFromRemote,
