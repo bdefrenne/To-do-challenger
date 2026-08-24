@@ -36,6 +36,7 @@ import {
   countTasks,
   activityDigest,
   workDayReview,
+  boardReview,
   markDayReady,
   finishWork,
   logPastWork,
@@ -84,7 +85,7 @@ import {
 import { listUsers, getUserById, type PublicUser } from "@/lib/db/users";
 import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
-import { WORKFLOW, DAY_CLOSE } from "@/lib/workflow";
+import { WORKFLOW, DAY_CLOSE, BOARD_CLEANUP } from "@/lib/workflow";
 import { langSuffix, titleHeader } from "@/lib/prompts";
 import { capped, type CapOpts } from "@/lib/mcp-response";
 
@@ -937,6 +938,134 @@ const handler = createMcpHandler(
     );
 
     /* ----------------------------------------------------------------- */
+    /* BOARD REVIEW — the cleanup pass. Evidence for reconciling what the */
+    /* board claims against what the repo shows (`BOARD_CLEANUP`).        */
+    /* ----------------------------------------------------------------- */
+
+    server.tool(
+      "board_review",
+      "Everything a CLEANUP pass needs about one project (or board) in one read: what's on-going, what changed in the window, what's been sitting still, and deterministic hygiene flags. Nothing to do with the `review` status or `review` notes — this is the whole board's in-flight state.\n" +
+        "\n" +
+        "This returns EVIDENCE, NEVER CONCLUSIONS. It cannot know whether work is done — only the repo knows that, so you must read the code before proposing anything. `flags` are OBSERVATIONS: `buildingNoCommits` might be stalled work, work on a branch, or work needing no commit at all. Treat every flag as a question to answer against the code, and walk the `BOARD_CLEANUP` contract in your server instructions (or the `todo://cleanup` resource).\n" +
+        "\n" +
+        "On-going means: statuses analyzing/analyzed/building/review, PLUS anything in THIS WEEK that isn't done, PLUS INBOX (untriaged), PLUS tasks that are done but still sitting outside DONE THIS WEEK. Each task's `why` says which of those put it here. Scope is REQUIRED (`projectId` or `boardId`) — an unscoped review would read the whole board; `list_projects` has the ids and each project's `gitFolder`.\n" +
+        "\n" +
+        "Tasks come back WORST-FIRST (flag severity, then longest-sitting), which is the order to work them in and what makes a truncated read safe. `onlyFlagged: true` is the way to narrow one. Staleness is measured over ALL history in WORKING days (weekends excluded), so a Monday pass still finds a task last touched three Fridays ago; the window only decides what counts as \"what changed\". `thresholds` ships the day counts the flags used, so you can explain the number. Read `caveats` before drawing any conclusion — chiefly: a log entry records THAT a field changed, not what it changed from, and title/description edits aren't logged at all (that's the `silentEdit` flag). `writeUps` are the last week's standups — what was said about the work in the user's own words. `has` gives the LENGTH of analysis/plan/summary, not the text: `get_task` the handful you'll actually act on. `elsewhere` is on-going work in other projects, refs only.",
+      {
+        projectId: z
+          .string()
+          .max(120)
+          .optional()
+          .describe("which project's board (see list_projects)"),
+        boardId: z
+          .string()
+          .max(120)
+          .optional()
+          .describe(
+            "narrow to one board. Trays are still resolved project-wide (placement lives on the project's canvas), then candidates are filtered to this board.",
+          ),
+        from: z
+          .string()
+          .max(40)
+          .optional()
+          .describe(
+            'start of the EVIDENCE window, YYYY-MM-DD or ISO (default: the current working day). Not a filter on which tasks match — staleness always spans all history.',
+          ),
+        to: z.string().max(40).optional().describe("end of the window (inclusive)"),
+        tz: z
+          .string()
+          .max(60)
+          .optional()
+          .describe('IANA zone the days mean, e.g. "Europe/Brussels"'),
+        status: z
+          .array(statusEnum)
+          .optional()
+          .describe(
+            "override what counts as on-going (default: analyzing, analyzed, building, review)",
+          ),
+        includeThisWeek: z
+          .boolean()
+          .optional()
+          .describe(
+            "also include anything filed in THIS WEEK that isn't done, whatever its status (default true)",
+          ),
+        includeInbox: z
+          .boolean()
+          .optional()
+          .describe("also include untriaged INBOX tasks (default true)"),
+        includeUnswept: z
+          .boolean()
+          .optional()
+          .describe(
+            "also include tasks that are done but still outside DONE THIS WEEK (default true)",
+          ),
+        onlyFlagged: z
+          .boolean()
+          .optional()
+          .describe(
+            "only tasks carrying at least one flag — THE way to narrow a truncated read",
+          ),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      async ({ projectId, boardId, ...rest }) => {
+        // A helpful answer rather than a thrown error: the caller almost always
+        // just needs the ids, and `list_projects` is a second round-trip.
+        if (!projectId && !boardId) {
+          const projects = await listProjects(currentUser());
+          return text({
+            error:
+              "board_review needs a projectId or boardId — an unscoped review would read the whole board.",
+            projects: projects.map((p) => ({
+              id: p.id,
+              name: p.name,
+              gitFolder: p.gitFolder,
+              boards: (p.boards ?? []).map((b) => ({
+                id: b.id,
+                name: b.name,
+                gitFolder: b.gitFolder,
+              })),
+            })),
+          });
+        }
+        const review = await boardReview(currentUser(), {
+          ...(projectId ? { projectId } : {}),
+          ...(boardId ? { boardId } : {}),
+          ...rest,
+        });
+        return text(
+          {
+            ...review,
+            tasks: review.tasks.map((r) => ({
+              ...r,
+              // Compact, plus the one timestamp a cleanup needs: `updatedAt` is
+              // what goes back as `expectedUpdatedAt` on every write, since the
+              // user may be moving cards while the agent talks.
+              task: {
+                ...projectTask(r.task, "compact"),
+                ...(r.task.updatedAt ? { updatedAt: r.task.updatedAt } : {}),
+              },
+            })),
+          },
+          {
+            items: "tasks",
+            total: review.total,
+            narrow: [
+              "onlyFlagged",
+              "boardId",
+              "status",
+              "limit",
+              "includeInbox",
+              "includeUnswept",
+              "includeThisWeek",
+              "from",
+              "to",
+            ],
+          },
+        );
+      },
+    );
+
+    /* ----------------------------------------------------------------- */
     /* PROJECTS & BOARDS — so the AI can see + shape the hierarchy and    */
     /* file tasks onto the right board (deletes omitted on purpose).      */
     /* ----------------------------------------------------------------- */
@@ -1418,6 +1547,18 @@ const handler = createMcpHandler(
     );
 
     server.registerResource(
+      "cleanup",
+      "todo://cleanup",
+      {
+        title: "How to clean up the board",
+        description:
+          "The board-cleanup contract — how to reconcile what the board claims against what the repo shows. Read it before acting on a `board_review`.",
+        mimeType: "text/markdown",
+      },
+      async (uri) => md(uri.href, BOARD_CLEANUP),
+    );
+
+    server.registerResource(
       "task",
       new ResourceTemplate("todo://task/{id}", {
         // Let clients browse the current task ids as addressable resources.
@@ -1702,11 +1843,91 @@ const handler = createMcpHandler(
         );
       },
     );
+    server.registerPrompt(
+      "clean_up_todo",
+      {
+        title: "Clean up the todo",
+        description:
+          "Reconcile what the board claims against what the code shows, then propose.",
+        argsSchema: { projectId: z.string(), boardId: z.string().optional() },
+      },
+      async ({ projectId, boardId }) => {
+        const review = await boardReview(currentUser(), {
+          ...(projectId ? { projectId } : {}),
+          ...(boardId ? { boardId } : {}),
+        });
+        const line = (r: (typeof review.tasks)[number]) => ({
+          ref: r.task.code,
+          id: r.task.id,
+          title: r.task.title,
+          status: r.task.status,
+          placement: r.placement,
+          why: r.why,
+          daysInStatus: r.daysInStatus,
+          daysSinceActivity: r.daysSinceActivity,
+          has: r.has,
+          commitCount: r.commitCount,
+          updatedAt: r.task.updatedAt,
+          events: r.events,
+          logs: r.logs,
+          notes: r.notes.map((n) => ({ type: n.type, note: n.note })),
+          commits: r.commits.map((c) => ({ sha: c.sha, subject: c.subject })),
+          flags: r.flags,
+        });
+        return await promptMsg(
+          `Let's clean up the todo for **${review.scope.projectName ?? projectId}**` +
+            `${review.scope.boardName ? ` → ${review.scope.boardName}` : ""}. ` +
+            `Here's the board's state, worst-first:\n\n` +
+            `${JSON.stringify(
+              {
+                scope: review.scope,
+                window: { from: review.from, to: review.to },
+                thresholds: review.thresholds,
+                caveats: review.caveats,
+                writeUps: review.writeUps,
+                total: review.total,
+                tasks: review.tasks.map(line),
+                elsewhere: review.elsewhere,
+              },
+              null,
+              2,
+            )}\n\n` +
+            `Now run the **Cleaning up the board** flow from the \`BOARD_CLEANUP\` ` +
+            `contract in your server instructions (or the \`todo://cleanup\` ` +
+            `resource), in order:\n\n` +
+            `1. Read the \`caveats\` and \`flags\` first, and work the tasks in the ` +
+            `order given — they're sorted by how much they need attention.\n` +
+            `2. For each one, **read the code**: \`git log\` since it entered its ` +
+            `current status, the diff, the actual files it's about. ` +
+            `\`get_task\` for the full brief (\`has\` only gives you field ` +
+            `lengths) and \`get_attachment\` on every image before you conclude ` +
+            `anything. Never infer where code lives from another task's plan or ` +
+            `summary.\n` +
+            `3. If this project's code isn't on this machine ` +
+            `(\`scope.gitFolder\` is ${review.scope.gitFolder ? `\`${review.scope.gitFolder}\`` : "**null** — nobody recorded it"}), ` +
+            `say so and stick to board hygiene. Never claim what the code does ` +
+            `from a board read.\n` +
+            `4. Give me **one table**: ref · title · status/placement · days idle ` +
+            `· what the board claims · what the code shows · what you propose ` +
+            `(complete / to review / back to building / re-file / split / write ` +
+            `the plan / write the summary / link commits / no change / ask me) · ` +
+            `the evidence for it (a file, a commit, "nothing since the 18th").\n` +
+            `5. Then ask me. One at a time for anything that completes or closes ` +
+            `a task — each through \`complete_task\` with its own \`summary\`. ` +
+            `Batch the filing moves as a single question.\n` +
+            `6. Apply only what I approve, passing \`expectedUpdatedAt\` on every ` +
+            `\`update_task\`. Don't resolve my \`review\` notes.\n` +
+            `7. Tell me what you deliberately left alone, and why. If the board ` +
+            `is already honest, say so — don't invent a tidy-up to justify the pass.`,
+        );
+      },
+    );
+
   },
   {
-    // The two canonical contracts, delivered to every client on connect: one
-    // task's journey, then one day's record.
-    instructions: `${WORKFLOW}\n\n${DAY_CLOSE}`,
+    // The three canonical contracts, delivered to every client on connect: one
+    // task's journey, then one day's record, then the board's state.
+    instructions: `${WORKFLOW}\n\n${DAY_CLOSE}\n\n${BOARD_CLEANUP}`,
   },
   {
     basePath: "/api",

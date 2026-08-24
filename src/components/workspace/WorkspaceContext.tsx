@@ -377,8 +377,11 @@ interface WorkspaceContextValue {
   /** Reload task data in response to a PEER's broadcast (debounced; never
    *  re-emits, so broadcasts don't ping-pong between clients). */
   refreshFromRemote: () => void;
-  /** Transient user-facing message (e.g. a concurrent-edit conflict). */
-  notice: string | null;
+  /** Transient user-facing message (e.g. a concurrent-edit conflict), plus the
+   *  diagnostics behind it when there are any: which task, which fields, which
+   *  request, what the server said. The toast makes `detail` openable and
+   *  copyable so a failed save is reportable without the console (TD2-203). */
+  notice: WorkspaceNotice | null;
   clearNotice: () => void;
   /** A completion the subtask rule refused, awaiting an answer: finish the whole
    *  branch, or leave it. Null when there's nothing pending. Unlike `notice` this
@@ -482,12 +485,18 @@ interface TaskDTO extends Task {
 }
 
 /** Fetch error that preserves the status code + parsed body so callers can
- *  react to specific cases (e.g. a 409 conflict carrying the fresh task). */
+ *  react to specific cases (e.g. a 409 conflict carrying the fresh task).
+ *
+ *  It also carries WHICH request failed (`request`). That's here rather than at
+ *  the ~25 write call sites because every one of them goes through `api()`: a
+ *  failed save can name the task, the fields and the endpoint without any
+ *  mutation path having to describe itself (TD2-203). */
 class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
     public body: unknown,
+    public request?: { method: string; path: string; body?: string },
   ) {
     super(message);
   }
@@ -515,9 +524,63 @@ async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
       body && typeof body === "object" && "error" in body
         ? String((body as { error: unknown }).error)
         : raw || res.statusText;
-    throw new ApiError(res.status, `${res.status}: ${detail}`, body);
+    throw new ApiError(res.status, `${res.status}: ${detail}`, body, {
+      method: (init?.method ?? "GET").toUpperCase(),
+      path,
+      body: typeof init?.body === "string" ? init.body : undefined,
+    });
   }
   return (res.status === 204 ? null : await res.json()) as T;
+}
+
+/** One failing write, as a notice can describe it to a person (TD2-203). */
+export interface NoticeItem {
+  /** The task the write was for, when the request names one. */
+  taskId?: string;
+  /** Its shareable ref (TD2-205) and title, resolved from what the app holds. */
+  taskRef?: string;
+  taskTitle?: string;
+  /** The fields that were being written — what is actually at risk. */
+  fields?: string[];
+  method?: string;
+  path?: string;
+  status?: number;
+  /** The server's own sentence, or the transport failure's message. */
+  error?: string;
+}
+
+/** The full story behind a notice: what failed, on which task(s), and why.
+ *  Null on a notice that is only a sentence (a rule the server explained). */
+export interface NoticeDetail {
+  kind: "conflict" | "retry" | "rejected" | "bulk" | "failed";
+  items: NoticeItem[];
+  /** When it happened — a paste into a bug report needs this. */
+  at: string;
+  /** Anything else worth pasting (a raw response body, a count). */
+  extra?: string;
+}
+
+export interface WorkspaceNotice {
+  message: string;
+  detail: NoticeDetail | null;
+}
+
+/** Task id out of `/api/tasks/<id>` (and its sub-routes), or null. */
+function taskIdFromPath(path: string): string | null {
+  return /^\/api\/tasks\/([^/?]+)/.exec(path)?.[1] ?? null;
+}
+
+/** The field names a JSON request body was setting, for "what didn't save". */
+function fieldsFromBody(raw?: string): string[] | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const keys = Object.keys(parsed);
+    return keys.length ? keys : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -596,8 +659,9 @@ export function WorkspaceProvider({
   const [projects, setProjects] = useState<Project[]>([]);
   // Stack of open task-detail modals (bottom → top). Empty = nothing open.
   const [openTaskIds, setOpenTaskIds] = useState<string[]>([]);
-  // Transient, user-facing message (e.g. a write was rejected as a conflict).
-  const [notice, setNotice] = useState<string | null>(null);
+  // Transient, user-facing message (e.g. a write was rejected as a conflict),
+  // with the diagnostics behind it — see `showNotice` / `WorkspaceNotice`.
+  const [notice, setNotice] = useState<WorkspaceNotice | null>(null);
   // A completion the subtask rule refused, waiting on an answer (see
   // `openSubtasksRule` and the CompleteBranchPrompt toast in AppShell).
   const [pendingComplete, setPendingComplete] =
@@ -649,6 +713,54 @@ export function WorkspaceProvider({
   // Latest taskMap for the (possibly delayed) flush's expected-updatedAt token.
   const taskMapRef = useRef<Record<string, Task>>({});
   useEffect(() => void (taskMapRef.current = taskMap), [taskMap]);
+  /** taskId → the tail of that task's in-flight PATCH chain (see `patchTask`).
+   *  Entries are removed as soon as a task's last write settles. */
+  const patchQueueRef = useRef<Map<string, Promise<void>>>(new Map());
+
+  /* ---- Notices (TD2-203) ----
+     One sentence for the person, plus the detail behind it so a failed save is
+     reportable. `showNotice` is the only writer; `describeError` turns whatever
+     `api()` threw into an item that NAMES the task, so no mutation path has to
+     carry diagnostics of its own. */
+
+  const showNotice = useCallback((message: string, detail: NoticeDetail | null = null) => {
+    setNotice({ message, detail });
+  }, []);
+  const clearNotice = useCallback(() => setNotice(null), []);
+
+  /** Describe one failed request: what it was, which task it was for (named
+   *  from `taskMap`, so the panel says the title rather than a uuid), which
+   *  fields were in flight, and what came back. */
+  const describeError = useCallback((e: unknown, extra?: Partial<NoticeItem>): NoticeItem => {
+    const err = e instanceof ApiError ? e : null;
+    const path = err?.request?.path ?? extra?.path;
+    const taskId = extra?.taskId ?? (path ? taskIdFromPath(path) : null) ?? undefined;
+    const task = taskId ? taskMapRef.current[taskId] : undefined;
+    return {
+      taskId,
+      taskRef: task?.ref ?? undefined,
+      taskTitle: task?.title ?? undefined,
+      fields: fieldsFromBody(err?.request?.body),
+      method: err?.request?.method,
+      path,
+      status: err?.status,
+      // The server's sentence when there is one; otherwise whatever threw
+      // (a network failure has no status and no body, and saying so is the
+      // single most useful line in the report).
+      error: (err ? ruleMessage(err) || err.message : null) ?? String(e),
+      ...extra,
+    };
+  }, []);
+
+  /** The detail for a single failed write. */
+  const errorDetail = useCallback(
+    (kind: NoticeDetail["kind"], e: unknown, extra?: Partial<NoticeItem>): NoticeDetail => ({
+      kind,
+      items: [describeError(e, extra)],
+      at: new Date().toISOString(),
+    }),
+    [describeError],
+  );
 
   // Latest nodes list, so a delete can snapshot the removed node for undo.
   const nodesRef = useRef<TaskNode[]>([]);
@@ -1129,13 +1241,16 @@ export function WorkspaceProvider({
         const rule =
           e instanceof ApiError && e.status === 400 ? openSubtasksRule(e) : null;
         if (rule) setPendingComplete(rule);
-        else
-          setNotice(
-            e instanceof ApiError && e.status === 409
+        else {
+          const conflict = e instanceof ApiError && e.status === 409;
+          const ruleText = (e instanceof ApiError && e.status === 400 && ruleMessage(e)) || null;
+          showNotice(
+            conflict
               ? "This task changed elsewhere — reloaded with the latest version."
-              : (e instanceof ApiError && e.status === 400 && ruleMessage(e)) ||
-                "Couldn’t save that — reloaded the latest.",
+              : ruleText || "Couldn’t save that — reloaded the latest.",
+            errorDetail(conflict ? "conflict" : ruleText ? "rejected" : "failed", e),
           );
+        }
       } finally {
         inflight.current--;
         // Only the last op in a burst reconciles (fewer fetches); the guard in
@@ -1150,7 +1265,7 @@ export function WorkspaceProvider({
         }
       }
     },
-    [fetchAll, refreshVersion, emitLocalChange],
+    [fetchAll, refreshVersion, emitLocalChange, showNotice, errorDetail],
   );
 
   /**
@@ -1191,12 +1306,35 @@ export function WorkspaceProvider({
     const failed = results.filter((r) => !r.ok);
     if (failed.length) {
       console.error("[workspace] bulk ops failed", failed);
-      setNotice(
+      showNotice(
         `${failed.length} of ${results.length} change${results.length === 1 ? "" : "s"} didn’t save — reloaded the latest.`,
+        {
+          kind: "bulk",
+          at: new Date().toISOString(),
+          // Each op reports its own verdict, so the panel can list exactly which
+          // ones the server refused rather than only how many.
+          items: failed.map((r, i) => {
+            const rec = r as unknown as Record<string, unknown>;
+            const taskId = typeof rec.id === "string" ? rec.id : undefined;
+            const task = taskId ? taskMapRef.current[taskId] : undefined;
+            return {
+              taskId,
+              taskRef: task?.ref ?? undefined,
+              taskTitle: task?.title ?? undefined,
+              method: "POST",
+              path: "/api/tasks/bulk",
+              error:
+                typeof rec.error === "string"
+                  ? rec.error
+                  : `operation ${i + 1} was refused`,
+            };
+          }),
+          extra: `${failed.length} of ${results.length} operations failed`,
+        },
       );
     }
     return results;
-  }, []);
+  }, [showNotice]);
 
   /** Like `mutate`, but for project/board changes — reconciles the sidebar. */
   const mutateProjects = useCallback(
@@ -1213,7 +1351,10 @@ export function WorkspaceProvider({
         // and the server writes that sentence for a person. Showing "couldn't
         // save that" instead would read as a bug and hide what to do next.
         const rule = e instanceof ApiError && e.status === 400 ? ruleMessage(e) : null;
-        setNotice(rule ?? "Couldn’t save that — reloaded the latest.");
+        showNotice(
+          rule ?? "Couldn’t save that — reloaded the latest.",
+          errorDetail(rule ? "rejected" : "failed", e),
+        );
       } finally {
         inflight.current--;
         if (inflight.current === 0) {
@@ -1223,7 +1364,7 @@ export function WorkspaceProvider({
         }
       }
     },
-    [fetchProjects, fetchAll, refreshVersion, emitLocalChange],
+    [fetchProjects, fetchAll, refreshVersion, emitLocalChange, showNotice, errorDetail],
   );
 
   /* ---- Status changes ---- */
@@ -1247,6 +1388,35 @@ export function WorkspaceProvider({
    * the conflict check ours alone. (Server side: /api/tasks/[id]/route.ts.)
    */
   function patchTask(id: string, patch: TaskEdit) {
+    // SERIALIZED PER TASK. The token below can only be right if the previous
+    // write to this task has already answered with the `updatedAt` it created —
+    // otherwise two edits fired back to back both quote the pre-first version
+    // and the second 409s against OUR OWN first write. That was TD2-205: the
+    // assignee picker deliberately stays open for multi-assign, so toggling
+    // twice sent the second PATCH while the first was still in flight and the
+    // edit was thrown away as a "changed elsewhere" conflict. Chaining is per
+    // id, so unrelated tasks (a bulk flush across a section) still go in
+    // parallel — only same-task writes wait, which is the order the person
+    // clicking them already expects.
+    const prev = patchQueueRef.current.get(id);
+    const run = (prev ?? Promise.resolve()).then(() => sendPatch(id, patch));
+    // Swallowed copy: a rejected tail must not reject the NEXT write's chain
+    // (nor surface as an unhandled rejection). The caller still gets `run`.
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    patchQueueRef.current.set(id, tail);
+    void tail.then(() => {
+      // Prune once this is the last write for the task, so the map doesn't grow
+      // one entry per task edited for the life of the session.
+      if (patchQueueRef.current.get(id) === tail) patchQueueRef.current.delete(id);
+    });
+    return run;
+  }
+
+  /** The actual PATCH — always called through `patchTask`, which serializes it. */
+  function sendPatch(id: string, patch: TaskEdit) {
     // Read the token from the ref, not the render's taskMap — a batched flush can
     // fire seconds later and must send the LATEST updatedAt to avoid a false 409.
     const token = taskMapRef.current[id]?.updatedAt;
@@ -1263,9 +1433,16 @@ export function WorkspaceProvider({
       // reuse this now-stale token and 409 against its OWN prior write. Bump it
       // the moment each response lands so the next guarded write in the same
       // burst sees the fresh value.
-      if (res?.task?.updatedAt) {
+      //
+      // Written to the REF as well as to state: the ref is what the token above
+      // is read from, and its `taskMap` sync runs in an effect after commit —
+      // too late for a write issued in the same tick as this response.
+      const fresh = res?.task?.updatedAt;
+      if (fresh) {
+        const cur = taskMapRef.current[id];
+        if (cur) taskMapRef.current = { ...taskMapRef.current, [id]: { ...cur, updatedAt: fresh } };
         setTaskMap((prev) =>
-          prev[id] ? { ...prev, [id]: { ...prev[id], updatedAt: res.task!.updatedAt } } : prev,
+          prev[id] ? { ...prev, [id]: { ...prev[id], updatedAt: fresh } } : prev,
         );
       }
       return res;
@@ -1492,10 +1669,25 @@ export function WorkspaceProvider({
       );
       let conflicted = false;
       let retrying = false;
+      // One item per failed edit, so the toast can say WHICH card and WHICH
+      // field didn't save (TD2-203) — a flush covers many tasks at once, and
+      // "couldn't save your edit" on its own names none of them.
+      const failures: NoticeItem[] = [];
       results.forEach((res, i) => {
         if (res.status === "fulfilled") return;
         const [id, patch] = edits[i];
         console.error("[workspace] edit flush failed", res.reason);
+        failures.push(
+          describeError(res.reason, {
+            taskId: id,
+            method: "PATCH",
+            path: `/api/tasks/${id}`,
+            // The buffered patch, not the request body: that's what was at
+            // stake for this task even when the request never left — a network
+            // failure has no request body to read the fields off.
+            fields: Object.keys(patch),
+          }),
+        );
         if (res.reason instanceof ApiError && res.reason.status === 409) {
           // Another writer won. Dropping our buffered text is the point of the
           // guard — but the overlay has to go too, or the reload below would
@@ -1521,9 +1713,22 @@ export function WorkspaceProvider({
           EDIT_FLUSH_MS,
         );
       }
-      if (conflicted)
-        setNotice("This task changed elsewhere — reloaded with the latest version.");
-      else if (retrying) setNotice("Couldn’t save your edit — retrying.");
+      if (conflicted || retrying) {
+        const detail: NoticeDetail = {
+          kind: conflicted ? "conflict" : "retry",
+          items: failures,
+          at: new Date().toISOString(),
+          extra: retrying
+            ? `Retrying in ${Math.round(EDIT_FLUSH_MS / 1000)}s — the text is still buffered.`
+            : undefined,
+        };
+        showNotice(
+          conflicted
+            ? "This task changed elsewhere — reloaded with the latest version."
+            : "Couldn’t save your edit — retrying.",
+          detail,
+        );
+      }
     } finally {
       inflight.current--;
       await fetchAll(); // overlay reconciles: confirmed patches drop out
@@ -1531,7 +1736,7 @@ export function WorkspaceProvider({
       emitLocalChange(); // peers refetch the now-persisted state
     }
     // patchTask is a stable hoisted declaration reading refs — no dep needed.
-  }, [fetchAll, refreshVersion, emitLocalChange]);
+  }, [fetchAll, refreshVersion, emitLocalChange, showNotice, describeError]);
 
   useEffect(() => void (flushEditsRef.current = flushEdits), [flushEdits]);
 
@@ -2807,7 +3012,7 @@ export function WorkspaceProvider({
         ...prev,
         [canvasId]: (prev[canvasId] ?? []).filter((n) => n.id !== tempId),
       }));
-      setNotice("Couldn’t add that note.");
+      showNotice("Couldn’t add that note.", errorDetail("failed", e));
     }
     emitLocalChange({ kind: "notesRefetch", canvasId });
   }
@@ -2858,7 +3063,7 @@ export function WorkspaceProvider({
     } catch (e) {
       console.error("[workspace] delete canvas note failed", e);
       setCanvasNotes((prev) => ({ ...prev, [canvasId]: prevForCanvas }));
-      setNotice("Couldn’t delete that note.");
+      showNotice("Couldn’t delete that note.", errorDetail("failed", e));
     }
     emitLocalChange({ kind: "notesRefetch", canvasId });
   }
@@ -3024,7 +3229,7 @@ export function WorkspaceProvider({
         applyRemotePatch,
         refreshFromRemote,
         notice,
-        clearNotice: () => setNotice(null),
+        clearNotice,
         pendingComplete,
         completeBranch,
         clearPendingComplete: () => setPendingComplete(null),

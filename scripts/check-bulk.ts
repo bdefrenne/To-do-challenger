@@ -24,6 +24,14 @@
   jumped to the end of the group on the next refetch. Guarded here at both layers,
   along with the append default nothing else may lose.
 
+  TD2-205 — a content write can carry `expectedUpdatedAt`, the version the caller
+  last saw, and is refused with a ConflictError if the row moved on. Two edits in
+  a row have to be possible: the token a write HANDS BACK must be accepted by the
+  next one, or the second click of any pair (toggling an assignee twice) reads as
+  someone else's edit and is thrown away. Guarded here because the comparison
+  crosses JS/Postgres timestamp precision — an exact `=` against a row created by
+  `now()` never matches, which is why the update truncates to milliseconds.
+
   TD2-200 — the send-arrows name an END of a lane ("top" = do it next, "bottom" =
   behind the rest) and the server turns that into a position, so the keypress
   means the same thing on the canvas, off it, and over MCP. Guarded here because
@@ -45,6 +53,7 @@ import { tasks, users } from "../src/lib/db/schema";
 import {
   createTask,
   moveTask,
+  updateTask,
   deleteTask,
   purgeTask,
   bulkApply,
@@ -464,6 +473,46 @@ async function main() {
       `a=${rowA?.position} b=${rowB?.position}`,
     );
   }
+  /* ---- TD2-205: the conflict token round-trips ----------------------- */
+  {
+    console.log("\nTD2-205 — expectedUpdatedAt round-trip");
+    const id = await newTask(boardA.id, null);
+
+    // The version a freshly-created row reports. Postgres `now()` stores
+    // microseconds; the DTO is millisecond ISO — so this is already the lossy
+    // form every client holds, and the guard has to accept it.
+    const created = await updateTask(id, {}, ME, AUTHOR);
+    const first = created?.updatedAt;
+    check("a write returns the version it created", typeof first === "string", String(first));
+
+    // The second edit quotes the FIRST one's answer — the double-toggle case.
+    let secondOk = true;
+    let second: string | undefined;
+    try {
+      const res = await updateTask(id, { assigneeIds: [ME] }, ME, AUTHOR, first);
+      second = res?.updatedAt;
+    } catch (e) {
+      secondOk = false;
+      second = `threw ${(e as Error).constructor.name}`;
+    }
+    check(
+      "a second write quoting the previous answer is ACCEPTED",
+      secondOk && typeof second === "string",
+      String(second),
+    );
+    check("…and it hands back a new version", secondOk && second !== first, String(second));
+
+    // The guard still bites: the STALE token (what the client would send if it
+    // never learned the new version — the bug) must be refused.
+    let refused = false;
+    try {
+      await updateTask(id, { assigneeIds: [] }, ME, AUTHOR, first);
+    } catch {
+      refused = true;
+    }
+    check("a stale token is still refused", refused);
+  }
+
   {
     // Over the cap, the tail is dropped with no results entry — a caller that
     // trusts `results.length` cannot tell. This is what the client chunks around.

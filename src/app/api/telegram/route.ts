@@ -44,6 +44,22 @@ export const runtime = "nodejs";
 // On Vercel Pro this can go up to 300.
 export const maxDuration = 60;
 
+/*
+  /cleanup — a one-word way in to the board-review pass, which would otherwise
+  take a paragraph to ask for on a phone. It's a seeded USER message, not a
+  separate code path: the brain still runs the whole turn through the MCP, so
+  the same guard rails (and the same Confirm tap for anything destructive) apply.
+  There is no repo on this surface, hence the explicit no-code-claims clause —
+  it repeats the BOARD_CLEANUP contract rather than trusting it to be recalled.
+*/
+const CLEANUP_ASK =
+  "Clean up my todo. Call board_review for my main project and tell me what " +
+  "needs attention, worst first. You have NO access to the code from here, so " +
+  "stick to board hygiene — what's gone stale, what's missing a plan or a " +
+  "summary, what's filed in the wrong place, what blockers are open — and say " +
+  "explicitly that you haven't checked any of it against the code. Keep it to " +
+  "the top few, one line each, and ask me what I want to do.";
+
 const CONFIRM = "td:confirm";
 const CANCEL = "td:cancel";
 
@@ -118,7 +134,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
   if (text === "/help") {
     await sendMessage(
       chatId,
-      "Ask me about your to-dos — e.g. _what's on today?_, _add a task to call the bank_, or _mark the onboarding task done_. /unlink disconnects this chat.",
+      "Ask me about your to-dos — e.g. _what's on today?_, _add a task to call the bank_, or _mark the onboarding task done_. /cleanup reviews what's on-going and what's gone stale. /unlink disconnects this chat.",
     );
     return;
   }
@@ -145,7 +161,10 @@ async function handleMessage(message: TgMessage): Promise<void> {
     void editMessageText(chatId, statusId, phrase);
   };
 
-  const thread: ThreadTurn[] = [...link.thread, { role: "user", content: text }];
+  // /cleanup stands in for the paragraph it would otherwise take to ask.
+  const ask = text === "/cleanup" ? CLEANUP_ASK : text;
+
+  const thread: ThreadTurn[] = [...link.thread, { role: "user", content: ask }];
 
   try {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -153,7 +172,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
       runBrain({
         mcpToken: link.mcpToken,
         thread: link.thread,
-        userMessage: text,
+        userMessage: ask,
         onStatus,
       }),
       new Promise<typeof TIMED_OUT>((resolve) => {

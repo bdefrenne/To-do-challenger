@@ -217,3 +217,58 @@ Past that, late work is credited to the current day and *labelled* as clearing
 older work — never back-filled into a standup that has already been presented.
 \`finish_work\` refuses a sealed day for that reason.
 `;
+
+/*
+  The third contract, and the only one that looks outward at the code.
+
+  WORKFLOW is one task's journey. DAY_CLOSE is one day's record. This is the
+  BOARD's state — the ritual that reconciles what the board claims against what
+  the repo actually shows, whenever the two have drifted apart.
+
+  Delivered the same three ways as the others: the MCP `instructions`, the
+  `todo://cleanup` resource, and the `clean_up_todo` prompt.
+*/
+export const BOARD_CLEANUP = `# Cleaning up the board
+
+\`board_review\` returns **evidence, never conclusions**: what's in flight, what
+moved in the window, what's been sitting still, whether each task has an
+analysis / plan / summary, what commits are linked, and which notes are still
+open. It cannot know whether the work is done. **Only the repo knows that.**
+
+So a cleanup is a **reconciliation**, the same move as the Finish step, over
+three sources in this order: (1) what the board claims, (2) what the code shows —
+\`git log\`, the diff, the actual files — and (3) what the user decides.
+
+**Every flag is a question, not a finding.** \`buildingNoCommits\` might mean
+stalled work, or work on a branch, or work that needs no commit at all. Open the
+code and find out. Never propose an action from a flag alone, and never repeat a
+flag back as though it were a conclusion.
+
+**Read the code directly.** Another task's \`plan\` or \`summary\` is not a map of
+where code lives — that rule holds here more than anywhere, because a cleanup
+touches many tasks at once and the temptation to skim is proportional.
+
+**\`scope.gitFolder\` says where this project's code lives**, and it may be null
+because nobody recorded it. If the code isn't on this machine, say so plainly and
+confine yourself to board hygiene — placement, a missing plan or summary, how
+long something has sat. Never claim what the code does from a board read.
+\`elsewhere\` is on-going work in other projects, refs only: mention it so it
+isn't invisible, offer to review it, don't reason about it.
+
+**One table, then one decision at a time.** Present what you found as a single
+table — ref · title · status/placement · days idle · what the board claims · what
+the code shows · what you propose · the evidence for it. Then batch the *asking*
+and never the deciding: anything that completes or closes a task goes through
+\`complete_task\` with its own \`summary\` and its own confirmation. Filing moves
+(placement, re-ending) may go through \`bulk_apply\` once the user has said yes to
+the batch.
+
+**Pass \`expectedUpdatedAt\`** from the review on every \`update_task\`. A review
+is a snapshot, and the user edits the board too — sometimes while you're talking.
+
+**Never resolve a \`review\` note.** Those are the user's own visual checks; they
+get surfaced, and they get checked off by hand.
+
+**A cleanup that finds nothing to change is a good outcome.** Say the board is
+honest. Never invent progress, or a tidying move, to justify having run the pass.
+`;

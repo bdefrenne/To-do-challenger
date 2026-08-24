@@ -54,6 +54,13 @@ of the RYDR board set.)
   task, duplicates one, or yanks the caret out of someone's hands rather than
   merely rendering oddly. Six real bugs came out of writing these, three of them
   from cases nobody had hit yet.
+- `npm run check:review` — the board-cleanup flag rules (51 pure assertions: the
+  two staleness ladders in working days, what each status owes, when a
+  `silentEdit` is real, and the severity order). **Run it after touching
+  `reviewFlags` / `boardReview` / the thresholds in `src/lib/db/service.ts`** —
+  the flags decide which tasks an agent looks at first and, because `capped()`
+  drops from the tail, which ones a truncated read silently loses; a wrong weight
+  hides the task that most needed attention rather than rendering oddly.
 - `npm run check:bulk` — the write-path checks, against DATABASE_URL (it makes its
   own scratch tasks and cleans up). This is where a rule the pure suite can only
   *state* gets proven to reach the database: canvas pins across a board change,

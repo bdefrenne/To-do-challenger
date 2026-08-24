@@ -169,6 +169,46 @@ things actually turned out, filling in each decision's `outcome` / `note`.
 Both live as dedicated pages: a **Decisions page** and a **Notes page**, each a
 cross-task, filterable table.
 
+### 8. Cleanup — reconcile the whole board, not one task
+
+Steps 5–7 all reconcile *something they already know about*: one task, one day,
+one decision. Nothing asks the opposite question — **has the board drifted from
+the code?** A task sitting in Building for six days with no plan and no linked
+commits is invisible to the finish step (nobody asked to finish it), to the
+standup (it didn't move), and to the retro (no decision was logged).
+
+`board_review` is that question, and it is deliberately **attribution-blind**: a
+task rotting for five days is a fact regardless of whose it is. It gathers what's
+on-going (statuses Analyzing→Review, plus THIS WEEK, plus INBOX, plus done-but-
+unswept), what moved in the window, how long each has sat, whether the working
+fields exist, what commits are linked, which notes are still open — and a set of
+deterministic hygiene **flags** over all of it.
+
+The split matters more here than anywhere: **the tool supplies evidence, the
+agent supplies judgement.** Every flag is a *question* — `buildingNoCommits`
+might be stalled work, work on a branch, or work needing no commit at all — so
+the agent opens the repo to answer it, proposes, and the human decides. If the
+tool ever emitted a recommendation, agents would apply it without reading the
+code, and the pass would invert into an automated way to *falsify* the board.
+
+Same shape as the day close-out, for the same reason: batch the asking, never the
+deciding. Anything that completes a task goes through `complete_task` with its
+own summary and its own confirmation; filing moves can go as one batch once the
+human has said yes. The operative contract is `BOARD_CLEANUP` in
+`src/lib/workflow.ts` (delivered as the MCP instructions, the `todo://cleanup`
+resource, and the `clean_up_todo` prompt), and the flag rules are pinned by
+`npm run check:review`.
+
+Two honest limits are stated in the payload rather than hidden. `task_logs` says
+*that* a field changed, never what it changed from, and title/description edits
+aren't logged at all — so a task whose `updatedAt` moved with nothing to show for
+it is reported as a `silentEdit` rather than as untouched. And a task has no repo
+field: where its code lives comes from its board's (else its project's)
+`gitFolder`, which may simply be unset, in which case the pass is confined to
+board hygiene and must say so.
+
+---
+
 ---
 
 ## Process spine (as shipped — supersedes the "derived phase" idea above)
@@ -177,6 +217,9 @@ There is **one axis**: `status`. It *is* the process — no separate derived
 phase.
 
     Backlog → To Do → Analyzing → Analyzed → Building → Review → Done
+
+Nothing in that spine notices a task that simply *stops*, which is what the
+cleanup pass (step 8) exists to catch.
 
 The code locks (`GH-20*` → `GH-20`) the moment a task enters **Analyzing** (the
 first handoff), by any path — the picker, an AI `update_task`, or a Copy-prompt.
@@ -188,9 +231,13 @@ itself stops at Building.
 ## What each actor touches
 
 - **Human**: creates the task, clicks Copy prompt (locks it), decides when to
-  start work and when to finish, says "finish this ticket".
+  start work and when to finish, says "finish this ticket", and — on a cleanup —
+  decides what actually happens to each task the pass turned up.
 - **AI**: gathers context, logs decisions as they happen, sets the lifecycle
   timestamps, writes `analysisSummary` / `plan` / `summary`, references the ref
-  in commits.
+  in commits, and on a cleanup reads the code to answer each flag before
+  proposing anything.
 - **System**: mints + locks codes (atomic, idempotent), derives the phase,
-  keeps the activity log, runs the retro query.
+  keeps the activity log, runs the retro query, and computes the cleanup's
+  staleness/hygiene flags — deterministically, so every surface agrees and the
+  ordering of a truncated read is never arbitrary.

@@ -9,7 +9,11 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { WorkspaceProvider, useWorkspace } from "./workspace/WorkspaceContext";
+import {
+  WorkspaceProvider,
+  useWorkspace,
+  type NoticeDetail,
+} from "./workspace/WorkspaceContext";
 import { TaskDetailModal } from "./workspace/TaskDetailModal";
 import { ShortcutsHelp, openShortcutsHelp } from "./workspace/ShortcutsHelp";
 import { BoardModal } from "./workspace/BoardModal";
@@ -21,6 +25,8 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
+  Copy,
+  X,
   Keyboard,
   LayoutDashboard,
   ListTodo,
@@ -145,26 +151,179 @@ function GlobalProjectSettings() {
   );
 }
 
+/** How a notice's detail reads once pasted into a bug report — plain text, in
+ *  the order someone reading it needs: what the app said, when and where, then
+ *  one block per failed write (TD2-203). */
+function formatNoticeReport(message: string, detail: NoticeDetail): string {
+  const lines = [
+    "To-do Challenger — save error",
+    `Message: ${message}`,
+    `Kind: ${detail.kind}`,
+    `Time: ${detail.at}`,
+  ];
+  if (typeof window !== "undefined") {
+    lines.push(`Page: ${window.location.href}`);
+    lines.push(`Browser: ${navigator.userAgent}`);
+  }
+  if (detail.extra) lines.push(`Note: ${detail.extra}`);
+  detail.items.forEach((it, i) => {
+    lines.push("");
+    const name = it.taskTitle
+      ? `“${it.taskTitle}”${it.taskRef ? ` (${it.taskRef})` : ""}`
+      : (it.taskRef ?? "(no task in this request)");
+    lines.push(`${i + 1}) Task: ${name}`);
+    if (it.taskId) lines.push(`   Task id: ${it.taskId}`);
+    if (it.fields?.length) lines.push(`   Fields: ${it.fields.join(", ")}`);
+    if (it.method || it.path)
+      lines.push(
+        `   Request: ${it.method ?? "?"} ${it.path ?? "?"}${it.status ? ` → ${it.status}` : ""}`,
+      );
+    if (it.error) lines.push(`   Error: ${it.error}`);
+  });
+  return lines.join("\n");
+}
+
+/** Put text on the clipboard. `navigator.clipboard` needs a secure context and
+ *  isn't there in every browser this runs in, so fall back to the old selection
+ *  trick rather than failing silently on the one action the toast exists for. */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the textarea path */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Transient toast for workspace notices (e.g. a concurrent-edit conflict).
- *  Auto-dismisses after a few seconds; click to dismiss sooner. */
+ *
+ *  A notice that carries `detail` is CLICKABLE (TD2-203): it opens into the full
+ *  story — which card failed, which fields, which request, what the server said
+ *  — with a Copy button that puts the lot on the clipboard. Before that, a
+ *  failed save was a sentence that vanished in 4s and left nothing to report
+ *  with but the browser console.
+ *
+ *  Auto-dismiss follows the same logic: 4s for a bare sentence, longer when
+ *  there's something to read, and never while it's open. */
 function Notice() {
   const { notice, clearNotice } = useWorkspace();
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const detail = notice?.detail ?? null;
+
+  // A new notice replaces the old one in place, so the panel must not stay open
+  // showing the previous failure's detail. Adjusted during render rather than in
+  // an effect: the reset has to be visible in the SAME paint as the new message,
+  // or the panel shows one failure's detail under another's headline.
+  const [shown, setShown] = useState(notice);
+  if (shown !== notice) {
+    setShown(notice);
+    setOpen(false);
+    setCopied(false);
+  }
+
   useEffect(() => {
-    if (!notice) return;
-    const t = setTimeout(clearNotice, 4000);
+    if (!notice || open) return;
+    const t = setTimeout(clearNotice, detail ? 10000 : 4000);
     return () => clearTimeout(t);
-  }, [notice, clearNotice]);
+  }, [notice, detail, open, clearNotice]);
 
   if (!notice) return null;
+  const { message } = notice;
+
   return (
     <div className="pointer-events-none fixed inset-x-0 bottom-6 z-[300] flex justify-center px-4">
-      <button
-        onClick={clearNotice}
+      <div
         role="status"
-        className="pointer-events-auto max-w-md rounded-lg border border-border bg-surface px-4 py-2.5 text-sm text-fg shadow-lg transition-colors hover:bg-surface-2"
+        className="pointer-events-auto w-full max-w-md overflow-hidden rounded-lg border border-border bg-surface text-sm text-fg shadow-lg"
       >
-        {notice}
-      </button>
+        <div className="flex items-start gap-2 px-4 py-2.5">
+          <button
+            onClick={() => (detail ? setOpen((o) => !o) : clearNotice())}
+            className="min-w-0 flex-1 text-left"
+            aria-expanded={detail ? open : undefined}
+          >
+            <span>{message}</span>
+            {detail && (
+              <span className="mt-0.5 flex items-center gap-1 text-xs text-faint">
+                {open ? (
+                  <ChevronDown className="h-3 w-3 shrink-0" />
+                ) : (
+                  <ChevronRight className="h-3 w-3 shrink-0" />
+                )}
+                {open ? "Hide details" : "Show details"}
+                {detail.items.length > 1 && ` (${detail.items.length})`}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={clearNotice}
+            title="Dismiss"
+            aria-label="Dismiss"
+            className="shrink-0 rounded p-0.5 text-faint transition-colors hover:bg-surface-2 hover:text-fg"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        {detail && open && (
+          <div className="max-h-72 overflow-y-auto border-t border-border bg-surface-2 px-4 py-3">
+            <div className="flex items-center justify-between gap-2 pb-2">
+              <span className="text-xs text-faint">{new Date(detail.at).toLocaleString()}</span>
+              <button
+                onClick={async () => {
+                  const ok = await copyText(formatNoticeReport(message, detail));
+                  setCopied(ok);
+                }}
+                className="flex shrink-0 items-center gap-1.5 rounded border border-border bg-surface px-2 py-0.5 text-xs font-medium text-accent transition-colors hover:border-accent"
+              >
+                {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+                {copied ? "Copied" : "Copy details"}
+              </button>
+            </div>
+            {detail.extra && <p className="pb-2 text-xs text-faint">{detail.extra}</p>}
+            <ul className="space-y-2.5">
+              {detail.items.map((it, i) => (
+                <li key={i} className="space-y-0.5 text-xs">
+                  <p className="font-medium text-fg">
+                    {it.taskTitle ?? it.taskRef ?? "This change"}
+                    {it.taskTitle && it.taskRef && (
+                      <span className="ml-1.5 font-normal text-faint">{it.taskRef}</span>
+                    )}
+                  </p>
+                  {!!it.fields?.length && (
+                    <p className="text-faint">
+                      Didn’t save: <span className="text-fg">{it.fields.join(", ")}</span>
+                    </p>
+                  )}
+                  {(it.method || it.path) && (
+                    <p className="break-all font-mono text-[11px] text-faint">
+                      {it.method} {it.path}
+                      {it.status ? ` → ${it.status}` : ""}
+                    </p>
+                  )}
+                  {it.error && <p className="break-words text-faint">{it.error}</p>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

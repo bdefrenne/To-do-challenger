@@ -38,6 +38,8 @@ You act through the "todo" MCP tools, which operate on the user's own board.
 - Before editing a task, resolve it with search_tasks first. If more than one plausibly matches, ask which one rather than guessing.
 - After an edit, confirm what changed in one line (e.g. "✅ Updated *Onboarding* description").
 
+For "clean up my todo" / "what's stale" / "what needs attention", call board_review with a projectId (list_projects has them). Its flags are OBSERVATIONS, not conclusions — and you have NO access to the code from here, so you cannot tell whether any of that work is actually done. Report board hygiene only (stale, missing plan or summary, filed in the wrong tray, open blockers), say plainly that nothing was checked against the code, and point at Claude Code for anything that needs the repo. Show the top few worst-first, one line each, then ask what to do — never apply a fix because a flag suggested it.
+
 You CANNOT delete tasks or make bulk changes directly — those tools are disabled. To do either, call the propose_destructive tool with a one-line summary and the exact tool call(s). The user will be asked to confirm before anything is deleted or bulk-changed. Never claim you deleted something you only proposed.`;
 
 const PROPOSE_TOOL: Anthropic.Beta.BetaToolUnion = {
@@ -81,6 +83,7 @@ const PROPOSE_TOOL: Anthropic.Beta.BetaToolUnion = {
 function statusFor(tool: string): string {
   if (/^(list_|search_|get_|standup)/.test(tool) || tool === "list_projects")
     return "📋 Reading your board…";
+  if (tool === "board_review") return "🧹 Reviewing the board…";
   if (tool === "create_task") return "➕ Creating…";
   if (tool === "create_project" || tool === "create_board") return "🗂 Setting up…";
   if (tool.includes("calendar")) return "📅 Updating calendar…";

@@ -32,11 +32,17 @@ edit and a human edit go through the exact same door.
   sees and edits that user's data.
 - **Projects & boards** each have: name, shortname (`code`), color, picture,
   `gitFolder`, and a Markdown description mirrored to this file.
-- **Process model:** a task's journey (`Backlog → … → Done`) and a **working
-  day**'s record are the two contracts, written once in `src/lib/workflow.ts`
-  and read by every surface — so the steps a person sees and the steps an agent
-  follows can't drift. A working day runs 04:00 → 04:00 local
-  (`src/lib/workday.ts`), and closing one out produces the standup.
+- **Process model:** a task's journey (`Backlog → … → Done`), a **working day**'s
+  record, and a **board cleanup** are the three contracts, written once in
+  `src/lib/workflow.ts` and read by every surface — so the steps a person sees
+  and the steps an agent follows can't drift. A working day runs 04:00 → 04:00
+  local (`src/lib/workday.ts`), and closing one out produces the standup.
+- **The board is checked against the code, not trusted.** `board_review` gathers
+  everything in flight — what moved, what has sat still, what's missing a plan or
+  a summary, what commits are linked, which notes are open — and flags it
+  deterministically. It returns **evidence, never conclusions**: every flag is a
+  question the agent answers by reading the repo, before proposing anything to a
+  human who decides. Nothing else notices a task that simply stopped.
 - **Keyboard-first cards:** hovering any task card — on the canvas, the project
   Boards view, a board's kanban or the task list — gives the same keys, from one
   definition (`useTaskCardShortcuts`): **D** done, **S/I/A** pickers, **1/2**

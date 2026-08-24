@@ -10,6 +10,7 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { Avatar } from "@/components/ui/Badge";
 import { AvatarCropper } from "@/components/ui/AvatarCropper";
 import { usePeople } from "@/components/PeopleContext";
+import { TODO_SETUP_GUIDE } from "@/lib/todoSetupGuide";
 
 interface TokenInfo {
   id: string;
@@ -156,8 +157,66 @@ export default function SettingsPage() {
             </ul>
           )}
         </section>
+
+        <RepoSetupSection />
       </div>
     </div>
+  );
+}
+
+/* -------------------------------------------------------------------- */
+/* Repo setup — the instructions you hand to a coding agent              */
+/* -------------------------------------------------------------------- */
+
+function RepoSetupSection() {
+  const [copied, setCopied] = useState(false);
+  const [shown, setShown] = useState(false);
+
+  async function copy() {
+    await navigator.clipboard.writeText(TODO_SETUP_GUIDE);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  return (
+    <section className="rounded-xl border border-border bg-surface p-5">
+      <h2 className="mb-1 text-sm font-semibold">
+        Make your coding agent work from this board
+      </h2>
+      <p className="mb-4 text-xs text-muted">
+        Copy the instructions below, paste them to your coding agent (Claude Code)
+        in the repo you want set up, and say “follow this”. It connects the todo
+        server, writes the rule into that repo’s <code>CLAUDE.md</code>, and from
+        then on creates a task before it changes anything. It will ask you for a
+        token — create one above.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={copy}
+          className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+        >
+          {copied ? (
+            <span className="flex items-center gap-1.5">
+              <Check className="h-4 w-4" /> Copied
+            </span>
+          ) : (
+            "Copy instructions"
+          )}
+        </button>
+        <button
+          onClick={() => setShown((v) => !v)}
+          className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg"
+        >
+          {shown ? "Hide instructions" : "Show instructions"}
+        </button>
+      </div>
+
+      {shown && (
+        <pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[11px] leading-relaxed text-muted">
+          {TODO_SETUP_GUIDE}
+        </pre>
+      )}
+    </section>
   );
 }
 

@@ -1336,6 +1336,45 @@ export async function listTaskIds(
   return rows.map((r) => r.id);
 }
 
+/**
+ * Whether each task HAS the three working fields, and how long they are —
+ * without shipping their text.
+ *
+ * `LIST_TASK_COLUMNS` leaves those fields in Postgres because they are ~2/3 of
+ * a board payload by volume (PLAT-403), which means a list read cannot tell
+ * whether a task has a plan at all. A cleanup pass needs exactly that fact and
+ * nothing more, so it asks for `length()`: ~40 bytes a task where selecting the
+ * three fields costs ~3 KB. Do NOT "simplify" this to
+ * `includeWorkingFields: true` — that re-creates the egress regression.
+ */
+export async function workingFieldSizes(
+  taskIds: string[],
+): Promise<Map<string, WorkingFieldSizes>> {
+  if (!taskIds.length) return new Map();
+  const rows = await db
+    .select({
+      id: tasks.id,
+      analysis: sql<number>`length(coalesce(${tasks.analysisSummary}, ''))::int`,
+      plan: sql<number>`length(coalesce(${tasks.plan}, ''))::int`,
+      summary: sql<number>`length(coalesce(${tasks.summary}, ''))::int`,
+    })
+    .from(tasks)
+    .where(and(inArray(tasks.id, taskIds), isNull(tasks.deletedAt)));
+  return new Map(
+    rows.map((r) => [
+      r.id,
+      { analysis: r.analysis, plan: r.plan, summary: r.summary },
+    ]),
+  );
+}
+
+/** Character counts of the three revisable fields — presence without the text. */
+export interface WorkingFieldSizes {
+  analysis: number;
+  plan: number;
+  summary: number;
+}
+
 /** Query a user's tasks by any combination of filters (flat list).
  *  Self-documenting alias over listTasksFlat — the search entry point. */
 export async function searchTasks(
@@ -1435,6 +1474,79 @@ export async function getTask(
     commits: commitRows.map(rowToCommit),
   };
 }
+
+/**
+ * The prose activity on a SET of tasks inside a window — the only windowed
+ * reader of `task_logs`.
+ *
+ * `getTask` reads one task's whole timeline; `activityDigest` reads
+ * `task_status_events` (structured transitions, credited); `taskWhere`'s `actor`
+ * filter uses this table only as an EXISTS, and so returns tasks rather than
+ * rows. None of them answers "what was WRITTEN on these tasks today", which is
+ * the question a cleanup pass asks — and that question includes the kinds no
+ * status event records: `updated` (a working field was written), `comment`,
+ * `attached`, `nested`.
+ *
+ * CAVEAT callers must pass on: a log row records THAT a field changed, not what
+ * it changed from (see `describeBulkPatch`), and title/description edits are
+ * deliberately not logged at all. So a task whose `updatedAt` moved with no row
+ * here was edited as prose — a fact worth reporting, not a gap.
+ */
+export async function listTaskActivity(
+  _userId: string,
+  opts: {
+    taskIds: string[];
+    from?: string;
+    to?: string;
+    kinds?: TaskLogEntry["kind"][];
+    actor?: string;
+    tz?: string;
+    /** Hard row cap — callers trim per task afterwards. */
+    limit?: number;
+  },
+): Promise<TaskActivityEntry[]> {
+  if (!opts.taskIds.length) return [];
+  const w = dateWindow(opts.from, opts.to, opts.tz ?? APP_TIMEZONE);
+  const rows = await db
+    .select({
+      id: taskLogs.id,
+      taskId: taskLogs.taskId,
+      at: taskLogs.at,
+      kind: taskLogs.kind,
+      message: taskLogs.message,
+      author: taskLogs.author,
+      actorId: taskLogs.actorId,
+      source: taskLogs.source,
+    })
+    .from(taskLogs)
+    // This builds its own WHERE on a table joined to `tasks`, so it applies the
+    // soft-delete fence itself: `taskWhere` doesn't reach here.
+    .innerJoin(tasks, eq(tasks.id, taskLogs.taskId))
+    .where(
+      and(
+        isNull(tasks.deletedAt),
+        inArray(taskLogs.taskId, opts.taskIds),
+        ...inWindow(taskLogs.at, w),
+        ...(opts.kinds?.length ? [inArray(taskLogs.kind, opts.kinds)] : []),
+        ...(opts.actor ? [eq(taskLogs.actorId, opts.actor)] : []),
+      ),
+    )
+    .orderBy(desc(taskLogs.at))
+    .limit(opts.limit ?? 600);
+  return rows.map((l) => ({
+    id: l.id,
+    taskId: l.taskId,
+    at: iso(l.at)!,
+    kind: l.kind,
+    message: l.message,
+    author: l.author ?? undefined,
+    actorId: l.actorId ?? undefined,
+    source: l.source ?? undefined,
+  }));
+}
+
+/** A log entry that says which task it belongs to — a multi-task read has to. */
+export type TaskActivityEntry = TaskLogEntry & { taskId: string };
 
 /** Cheap change-cursor for a user's board: moves on any create/update/
  *  move/complete/delete/comment (every mutation bumps updatedAt; deletes
@@ -3389,6 +3501,10 @@ export async function addCanvasNote(
 
 export interface NoteFilter {
   taskId?: string;
+  /** Several tasks at once — how a multi-task read (a board review) fences its
+   *  notes server-side instead of pulling every note and filtering in memory.
+   *  An EMPTY array means "no tasks", and returns nothing. */
+  taskIds?: string[];
   canvasId?: string;
   type?: NoteType;
   from?: string;
@@ -3412,6 +3528,10 @@ export async function listNotes(
     const taskId = await resolveTaskId(filter.taskId, _userId);
     if (!taskId) return [];
     conds.push(eq(taskNotes.taskId, taskId));
+  }
+  if (filter?.taskIds) {
+    if (!filter.taskIds.length) return [];
+    conds.push(inArray(taskNotes.taskId, filter.taskIds));
   }
   if (filter?.canvasId) conds.push(eq(taskNotes.canvasId, filter.canvasId));
   if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
@@ -3539,6 +3659,57 @@ export async function linkCommit(
     return existing ? rowToCommit(existing) : null;
   }
   return rowToCommit(row);
+}
+
+/**
+ * Commits linked to a SET of tasks, newest first.
+ *
+ * The window is over when each commit was LINKED, which is what
+ * `task_commits.created_at` records — the commit's own authored date isn't
+ * stored, so this can't pretend to answer "committed on the 4th".
+ * Self-applied delete fence, same reason as `listTaskActivity`.
+ */
+export async function listTaskCommits(
+  _userId: string,
+  opts: {
+    taskIds: string[];
+    from?: string;
+    to?: string;
+    tz?: string;
+    limit?: number;
+  },
+): Promise<TaskCommit[]> {
+  if (!opts.taskIds.length) return [];
+  const w = dateWindow(opts.from, opts.to, opts.tz ?? APP_TIMEZONE);
+  const rows = await db
+    .select(getTableColumns(taskCommits))
+    .from(taskCommits)
+    .innerJoin(tasks, eq(tasks.id, taskCommits.taskId))
+    .where(
+      and(
+        isNull(tasks.deletedAt),
+        inArray(taskCommits.taskId, opts.taskIds),
+        ...inWindow(taskCommits.createdAt, w),
+      ),
+    )
+    .orderBy(desc(taskCommits.createdAt))
+    .limit(opts.limit ?? 300);
+  return rows.map(rowToCommit);
+}
+
+/** taskId → how many commits are linked to it, ALL TIME. One grouped query.
+ *  "Building for six days with nothing linked" is a lifetime fact, not a
+ *  windowed one, so it can't come from `listTaskCommits`. */
+export async function commitCountsByTask(
+  taskIds: string[],
+): Promise<Map<string, number>> {
+  if (!taskIds.length) return new Map();
+  const rows = await db
+    .select({ taskId: taskCommits.taskId, n: sql<number>`count(*)::int` })
+    .from(taskCommits)
+    .where(inArray(taskCommits.taskId, taskIds))
+    .groupBy(taskCommits.taskId);
+  return new Map(rows.map((r) => [r.taskId, r.n]));
 }
 
 /* -------------------------------------------------------------------- */
@@ -4270,26 +4441,37 @@ async function upsertWorkDay(
   return getWorkDay(userId, projectId, day);
 }
 
-/** The tasks currently filed in a placement bucket for one project, resolved the
- *  same way the canvas resolves them (own pin, else inherited from the parent,
- *  else INBOX). */
+/**
+ * "Which tray is this task in", resolved the way the canvas resolves it — own
+ * pin, else inherited from the parent, else INBOX.
+ *
+ * Built once over a known task set rather than called per task: placement is
+ * inherited up the parent chain, so answering for one task needs every task that
+ * could be a parent. `pool` must therefore contain them — including done ones
+ * when the caller asks about done tasks.
+ */
+async function placementResolver(
+  projectId: string,
+  pool: TaskDTO[],
+): Promise<(taskId: string) => TaskPlacement> {
+  const map = await listPlacementSections(projectId);
+  const byId = new Map(pool.map((t) => [t.id, t]));
+  const taskMap: Record<string, Task> = Object.fromEntries(
+    pool.map((t) => [t.id, t as Task]),
+  );
+  const parentOf = (id: string) => byId.get(id)?.parentId ?? null;
+  return (taskId) => placementOfTask(taskId, taskMap, parentOf, map);
+}
+
+/** The tasks currently filed in a placement bucket for one project. */
 async function tasksInPlacement(
   userId: string,
   projectId: string,
   bucket: TaskPlacement,
 ): Promise<TaskDTO[]> {
-  const [all, map] = await Promise.all([
-    listTasksFlat(userId, { projectId, includeDone: false }),
-    listPlacementSections(projectId),
-  ]);
-  const byId = new Map(all.map((t) => [t.id, t]));
-  const taskMap: Record<string, Task> = Object.fromEntries(
-    all.map((t) => [t.id, t as Task]),
-  );
-  const parentOf = (id: string) => byId.get(id)?.parentId ?? null;
-  return all.filter(
-    (t) => placementOfTask(t.id, taskMap, parentOf, map) === bucket,
-  );
+  const all = await listTasksFlat(userId, { projectId, includeDone: false });
+  const placementOf = await placementResolver(projectId, all);
+  return all.filter((t) => placementOf(t.id) === bucket);
 }
 
 /**
@@ -4518,6 +4700,684 @@ export async function logPastWork(
       input.author ?? "You",
     ),
   );
+}
+
+/* -------------------------------------------------------------------- */
+/* Board review — the evidence a cleanup pass reconciles against the code */
+/* -------------------------------------------------------------------- */
+
+/*
+   `activityDigest` answers "what work is credited to me in this window".
+   `workDayReview` answers "how did one day go". Neither is keyed on what is
+   currently IN FLIGHT, and neither surfaces rot: a task sitting in `building`
+   for six days with no plan and no commits is invisible to both.
+
+   This is that third question, and it is deliberately attribution-blind — a
+   task rotting for five days is a fact regardless of whose it is.
+
+   It returns EVIDENCE, never conclusions. Only the repo knows whether the work
+   is done, so the judgement belongs to whoever can read the code. If this ever
+   grows a `suggestedAction`, agents will apply it without opening the code and
+   the whole thing inverts into an automated way to falsify the board.
+
+   MCP-only by design, for now: this adds no column and no writable state, so
+   the "thread every field through every surface" rule doesn't apply (it's about
+   fields). Half the capability — verify against the code — has no browser
+   equivalent, so a web panel would render half a feature. Every bit of logic
+   therefore lives HERE, which makes a later `/api/board-review` a ~25-line
+   route modelled on `/api/standup`.
+*/
+
+/**
+ * What "on-going" means by default: past the first handoff, code locked, and
+ * where work actually rots. `todo`/`backlog` are excluded — an untouched
+ * backlog item isn't stale, it's a backlog item. Callers may override.
+ */
+export const ONGOING_STATUSES: TaskStatus[] = [
+  "analyzing",
+  "analyzed",
+  "building",
+  "review",
+];
+
+/**
+ * Working days a task may sit in a status before the review says so.
+ *
+ * Two ladders, because sitting in `building` and sitting in `analyzed` mean
+ * opposite things: one is work that stopped, the other is work waiting on
+ * someone's decision. Shipped back in the payload so an agent can explain the
+ * number, and so the reader argues with the threshold rather than with the tool.
+ */
+export const STALE_AFTER_DAYS: Record<TaskStatus, number> = {
+  analyzing: 3,
+  building: 3,
+  analyzed: 7,
+  review: 7,
+  todo: 14,
+  backlog: 30,
+  done: 7,
+};
+
+/**
+ * Working days between two working days, weekends excluded — so work last
+ * touched on Friday reads as one day idle on Monday, not three. Exclusive of
+ * `fromDay`, inclusive of `toDay`, so the same day is 0.
+ */
+export function workingDaysBetween(fromDay: string, toDay: string): number {
+  if (fromDay >= toDay) return 0;
+  const cur = new Date(`${fromDay}T00:00:00Z`);
+  const end = new Date(`${toDay}T00:00:00Z`);
+  let n = 0;
+  // Bounded so a bad timestamp can't spin: a year of weekdays is far past any
+  // threshold, and anything beyond it is stale by all of them.
+  while (cur < end && n < 400) {
+    cur.setUTCDate(cur.getUTCDate() + 1);
+    const dow = cur.getUTCDay();
+    if (dow !== 0 && dow !== 6) n++;
+  }
+  return n;
+}
+
+/** One deterministic observation about a task. NEVER a recommendation. */
+export type ReviewFlag =
+  | { flag: "staleInStatus"; days: number; threshold: number }
+  | { flag: "noActivityEver" }
+  | { flag: "silentEdit"; updatedAt: string }
+  | { flag: "movedInWindow" }
+  | { flag: "buildingNoPlan" }
+  | { flag: "buildingNoCommits" }
+  | { flag: "analyzingNoAnalysis" }
+  | { flag: "reviewNoSummary" }
+  | { flag: "doneNotSwept" }
+  | { flag: "workingNotThisWeek" }
+  | { flag: "untriaged" }
+  | { flag: "openBlocker"; noteIds: string[] }
+  | { flag: "openQuestion"; noteIds: string[] }
+  | { flag: "openReview"; noteIds: string[] }
+  | { flag: "unassigned" };
+
+export type ReviewFlagName = ReviewFlag["flag"];
+
+/**
+ * How loudly each flag argues for attention.
+ *
+ * Worst-first ordering is what makes truncation safe: `capped()` drops rows from
+ * the TAIL, so a payload sorted by need loses its least interesting tasks rather
+ * than an arbitrary slice. `movedInWindow` weighs nothing on purpose — it's
+ * context, not a problem.
+ */
+const FLAG_WEIGHT: Record<ReviewFlagName, number> = {
+  openBlocker: 100,
+  staleInStatus: 60,
+  noActivityEver: 50,
+  buildingNoPlan: 40,
+  reviewNoSummary: 40,
+  analyzingNoAnalysis: 30,
+  buildingNoCommits: 25,
+  openQuestion: 25,
+  doneNotSwept: 20,
+  silentEdit: 15,
+  workingNotThisWeek: 12,
+  untriaged: 10,
+  unassigned: 8,
+  openReview: 5,
+  movedInWindow: 0,
+};
+
+/** Everything `reviewFlags` is allowed to look at — assembled by `boardReview`,
+ *  but kept separate so the rules stay pure and testable. */
+export interface ReviewFacts {
+  status: TaskStatus;
+  placement: TaskPlacement;
+  /** Working days in the current status. */
+  daysInStatus: number;
+  /** Working days since anything at all was recorded against it. */
+  daysSinceActivity: number;
+  /** False when the task has no activity log beyond its own row. */
+  hasEverLogged: boolean;
+  updatedAt?: string;
+  /** `updatedAt` falls inside the evidence window. */
+  updatedInWindow: boolean;
+  /** How much the window turned up, by kind. */
+  inWindow: { events: number; logs: number; notes: number; commits: number };
+  has: WorkingFieldSizes;
+  /** Commits linked all time. */
+  commitCount: number;
+  /** Open (unresolved) notes, whatever their age. */
+  openNotes: { id: string; type?: NoteType | null }[];
+  assigned: boolean;
+  thresholds: Record<TaskStatus, number>;
+}
+
+/**
+ * The hygiene rules, as a pure function.
+ *
+ * Pure so every caller gets identical answers — a future REST route, a "needs
+ * attention" panel, a check script — and so the rules are testable without a
+ * database. Each rule states a FACT; what to do about it needs the code.
+ */
+export function reviewFlags(f: ReviewFacts): ReviewFlag[] {
+  const flags: ReviewFlag[] = [];
+  const ongoing = ONGOING_STATUSES.includes(f.status);
+  const threshold = f.thresholds[f.status];
+  if (threshold != null && f.daysInStatus >= threshold)
+    flags.push({ flag: "staleInStatus", days: f.daysInStatus, threshold });
+  if (!f.hasEverLogged) flags.push({ flag: "noActivityEver" });
+  if (f.inWindow.events > 0) flags.push({ flag: "movedInWindow" });
+  // `updatedAt` moved and nothing in the window explains it. Title and
+  // description edits are deliberately unlogged, so this is the honest way to
+  // say "someone rewrote the prose" instead of showing a task with no evidence
+  // and letting it read as untouched.
+  const evidence =
+    f.inWindow.events + f.inWindow.logs + f.inWindow.notes + f.inWindow.commits;
+  if (f.updatedInWindow && evidence === 0 && f.updatedAt)
+    flags.push({ flag: "silentEdit", updatedAt: f.updatedAt });
+  if (f.status === "analyzing" && f.has.analysis === 0)
+    flags.push({ flag: "analyzingNoAnalysis" });
+  if (f.status === "building") {
+    if (f.has.plan === 0) flags.push({ flag: "buildingNoPlan" });
+    if (f.commitCount === 0) flags.push({ flag: "buildingNoCommits" });
+  }
+  if (f.status === "review" && f.has.summary === 0)
+    flags.push({ flag: "reviewNoSummary" });
+  if (f.status === "done" && f.placement !== "doneThisWeek")
+    flags.push({ flag: "doneNotSwept" });
+  if (ongoing && f.placement !== "thisWeek")
+    flags.push({ flag: "workingNotThisWeek" });
+  if (f.placement === "inbox" && f.status !== "done")
+    flags.push({ flag: "untriaged" });
+  if (ongoing && !f.assigned) flags.push({ flag: "unassigned" });
+  const ofType = (t: NoteType) =>
+    f.openNotes.filter((n) => n.type === t).map((n) => n.id);
+  const blockers = ofType("blocker");
+  if (blockers.length) flags.push({ flag: "openBlocker", noteIds: blockers });
+  const questions = ofType("question");
+  if (questions.length) flags.push({ flag: "openQuestion", noteIds: questions });
+  // Ben's own visual-review list. Surfaced so it isn't forgotten; never resolved
+  // on the agent's initiative (see the cleanup contract).
+  const reviews = ofType("review");
+  if (reviews.length) flags.push({ flag: "openReview", noteIds: reviews });
+  return flags.sort((a, b) => FLAG_WEIGHT[b.flag] - FLAG_WEIGHT[a.flag]);
+}
+
+/** A task's total claim on attention — what decides the payload's order. */
+export const reviewSeverity = (flags: ReviewFlag[]): number =>
+  flags.reduce((n, f) => n + FLAG_WEIGHT[f.flag], 0);
+
+/* Per-task evidence caps, applied HERE rather than left to `capped()`: trimming
+   a task's log is a small loss, dropping the task entirely is a blind spot.
+
+   Sized against the measured cost — ~2 KB a task once compacted, so a default
+   page of 20 lands near 65 KB and stays under the 90 KB response budget with
+   room for the caveats and write-ups. Raise these and the default `limit` has
+   to come down with them, or every read truncates. */
+const REVIEW_MAX_EVENTS = 8;
+const REVIEW_MAX_LOGS = 5;
+const REVIEW_MAX_NOTES = 4;
+const REVIEW_MAX_MESSAGE = 160;
+/** A note is evidence, not a document — enough to recognise it and go read it. */
+const REVIEW_MAX_NOTE_TEXT = 280;
+/** Candidates whose evidence is fetched before flags decide the real order. A
+ *  project with more than this in flight has a bigger problem than tidiness. */
+const REVIEW_MAX_CANDIDATES = 250;
+/** Tasks returned by default — measured against the response budget, not
+ *  guessed: at ~2 KB a task this is the most that survives a read intact, and a
+ *  page that gets truncated teaches the caller nothing it didn't already know. */
+const REVIEW_PAGE = 20;
+
+export interface BoardReviewTask {
+  task: TaskDTO;
+  /** Why it's in this review: its status, its tray, or done-but-unswept. */
+  why: ("status" | "thisWeek" | "inbox" | "unswept")[];
+  placement: TaskPlacement;
+  daysInStatus: number;
+  /** Newest of (log · status event · linked commit · note · updatedAt), lifetime. */
+  lastActivityAt: string;
+  daysSinceActivity: number;
+  /** Whether the working fields exist and how long they are — not their text. */
+  has: WorkingFieldSizes;
+  commitCount: number;
+  events: {
+    from: TaskStatus | null;
+    to: TaskStatus;
+    at: string;
+    actorId: string | null;
+    creditedTo: string | null;
+  }[];
+  logs: {
+    at: string;
+    kind: string;
+    message: string;
+    source?: string;
+    actorId?: string;
+  }[];
+  notes: Note[];
+  commits: TaskCommit[];
+  /** What the caps cut, so a trimmed row never reads as a complete one. */
+  omitted?: { events?: number; logs?: number; notes?: number };
+  flags: ReviewFlag[];
+}
+
+export interface BoardReview {
+  from: string;
+  to: string;
+  tz: string;
+  scope: {
+    projectId: string;
+    projectName: string | null;
+    boardId?: string;
+    boardName?: string | null;
+    /** Where this scope's code lives, when someone recorded it. */
+    gitFolder: string | null;
+  };
+  thresholds: Record<TaskStatus, number>;
+  /** What this evidence CANNOT tell you — same posture as the digest's
+   *  `attribution`: name the missing data rather than papering over it. */
+  caveats: string[];
+  /** The recent day write-ups: what was said about the work in the person's own
+   *  words, which no field-level log can reconstruct. */
+  writeUps: DayWriteUp[];
+  total: number;
+  tasks: BoardReviewTask[];
+  /** On-going work OUTSIDE this scope — refs only, deliberately no evidence:
+   *  hiding it would produce a tidy lie, and giving it evidence would invite
+   *  conclusions about code the caller can't see.
+   *
+   *  Grouped by BOARD, not project: a board-scoped review would otherwise hide
+   *  the same project's other boards completely — out of `tasks` by the board
+   *  filter, and out of here by sharing the projectId. */
+  elsewhere: {
+    projectId: string;
+    projectName: string | null;
+    boardId: string | null;
+    boardName: string | null;
+    count: number;
+    tasks: {
+      code?: string;
+      title: string;
+      status: TaskStatus;
+      daysInStatus: number;
+    }[];
+  }[];
+}
+
+/** Bucket rows by their task id, dropping any that carry none. */
+function byTask<T extends { taskId: string | null }>(rows: T[]): Map<string, T[]> {
+  const out = new Map<string, T[]>();
+  for (const r of rows) {
+    if (!r.taskId) continue;
+    const list = out.get(r.taskId);
+    if (list) list.push(r);
+    else out.set(r.taskId, [r]);
+  }
+  return out;
+}
+
+/**
+ * Everything a cleanup pass needs about one project (or one board) in one read.
+ *
+ * Seven round-trips and none of them per-task. Scoped deliberately: without a
+ * project, resolving placement would mean loading every non-done task on the
+ * whole board, so an unscoped call is refused rather than quietly expensive.
+ *
+ * Staleness is measured over ALL history, not the window — a Monday cleanup must
+ * still find a task last touched three Fridays ago. The window only decides what
+ * counts as "what changed", which is a different question.
+ */
+export async function boardReview(
+  userId: string,
+  opts: {
+    projectId?: string;
+    boardId?: string;
+    from?: string;
+    to?: string;
+    tz?: string;
+    status?: TaskStatus[];
+    includeThisWeek?: boolean;
+    includeInbox?: boolean;
+    includeUnswept?: boolean;
+    onlyFlagged?: boolean;
+    limit?: number;
+  },
+): Promise<BoardReview> {
+  const tz = opts.tz ?? APP_TIMEZONE;
+  const to = opts.to ?? currentWorkingDay(tz);
+  const from = opts.from ?? to;
+  const w = dateWindow(from, to, tz);
+  const today = currentWorkingDay(tz);
+
+  /* Scope. Placement lives on the PROJECT's canvas, so a board-scoped review
+     still resolves trays project-wide and narrows the candidates afterwards. */
+  let projectId = opts.projectId;
+  let board: BoardRow | undefined;
+  if (opts.boardId) {
+    board = (
+      await db.select().from(boards).where(eq(boards.id, opts.boardId)).limit(1)
+    )[0];
+    if (!board) throw new ValidationError("That board doesn't exist.");
+    projectId = board.projectId;
+  }
+  if (!projectId)
+    throw new ValidationError(
+      "A board review needs a projectId or a boardId — an unscoped one would read the whole board.",
+    );
+  const project = (
+    await db.select().from(projects).where(eq(projects.id, projectId)).limit(1)
+  )[0];
+
+  const includeThisWeek = opts.includeThisWeek ?? true;
+  const includeInbox = opts.includeInbox ?? true;
+  const includeUnswept = opts.includeUnswept ?? true;
+  const ongoing = new Set<TaskStatus>(
+    opts.status?.length ? opts.status : ONGOING_STATUSES,
+  );
+
+  /* A done task in the wrong tray is exactly the mess a sweep clears, and it
+     doesn't stop being one because it finished before the window opened. */
+  const sweepFrom = w.start
+    ? workingDayOf(new Date(w.start.getTime() - 30 * 86_400_000), tz)
+    : undefined;
+
+  const [openTasks, doneTasks] = await Promise.all([
+    listTasksFlat(userId, { projectId, includeDone: false }),
+    includeUnswept
+      ? listTasksFlat(userId, {
+          projectId,
+          status: ["done"],
+          includeDone: true,
+          ...(sweepFrom ? { completedFrom: sweepFrom } : {}),
+          sort: "recent",
+          limit: 200,
+        })
+      : Promise.resolve([] as TaskDTO[]),
+  ]);
+  /* The resolver needs every task that could be a PARENT, done ones included —
+     placement is inherited up the chain. */
+  const placementOf = await placementResolver(projectId, [
+    ...openTasks,
+    ...doneTasks,
+  ]);
+
+  const onBoard = (t: TaskDTO) => !board || t.boardId === board.id;
+  const candidates: {
+    task: TaskDTO;
+    why: BoardReviewTask["why"];
+    placement: TaskPlacement;
+  }[] = [];
+  for (const t of openTasks) {
+    if (!onBoard(t)) continue;
+    const placement = placementOf(t.id);
+    const why: BoardReviewTask["why"] = [];
+    if (ongoing.has(t.status)) why.push("status");
+    if (includeThisWeek && placement === "thisWeek") why.push("thisWeek");
+    if (includeInbox && placement === "inbox") why.push("inbox");
+    if (why.length) candidates.push({ task: t, why, placement });
+  }
+  for (const t of doneTasks) {
+    if (!onBoard(t)) continue;
+    const placement = placementOf(t.id);
+    if (placement !== "doneThisWeek")
+      candidates.push({ task: t, why: ["unswept"], placement });
+  }
+
+  const total = candidates.length;
+  /* Pre-sorted oldest-in-status first, so if the candidate cap bites it keeps
+     what is most likely rotting. The real ordering waits for the flags. */
+  candidates.sort((a, b) => a.task.statusSince.localeCompare(b.task.statusSince));
+  const pool = candidates.slice(0, REVIEW_MAX_CANDIDATES);
+  const ids = pool.map((c) => c.task.id);
+
+  /* The last week of write-ups: "what changed" in the person's own words, which
+     no field-level log reconstructs. */
+  const writeUpFrom = workingDayOf(
+    new Date(workingDayStart(to, tz).getTime() - 6 * 86_400_000),
+    tz,
+  );
+
+  const [
+    eventRows,
+    logs,
+    windowCommits,
+    commitCounts,
+    lifetimeLogs,
+    sizes,
+    windowNotes,
+    openNotes,
+    writeUps,
+    otherOngoing,
+    projectRows,
+    boardRows,
+  ] = await Promise.all([
+    ids.length
+      ? db
+          .select()
+          .from(taskStatusEvents)
+          .where(
+            and(
+              inArray(taskStatusEvents.taskId, ids),
+              ...effectiveWindow(w, tz),
+            ),
+          )
+          .orderBy(desc(taskStatusEvents.at))
+      : Promise.resolve([] as TaskStatusEventRow[]),
+    listTaskActivity(userId, { taskIds: ids, from, to, tz, limit: 800 }),
+    listTaskCommits(userId, { taskIds: ids, from, to, tz }),
+    commitCountsByTask(ids),
+    // Lifetime log count + newest entry, in one grouped query: "nothing has ever
+    // been recorded here" and "last touched" are both lifetime facts.
+    ids.length
+      ? db
+          .select({
+            taskId: taskLogs.taskId,
+            n: sql<number>`count(*)::int`,
+            last: sql<string | null>`max(${taskLogs.at})`,
+          })
+          .from(taskLogs)
+          .where(inArray(taskLogs.taskId, ids))
+          .groupBy(taskLogs.taskId)
+      : Promise.resolve([] as { taskId: string; n: number; last: string | null }[]),
+    workingFieldSizes(ids),
+    listNotes(userId, { taskIds: ids, from, to, includeResolved: true }),
+    listNotes(userId, { taskIds: ids }),
+    listDayWriteUps({ projectId, fromDay: writeUpFrom, toDay: to }),
+    listTasksFlat(userId, {
+      status: [...ongoing],
+      includeDone: false,
+      sort: "recent",
+      limit: 200,
+    }),
+    db.select({ id: projects.id, name: projects.name }).from(projects),
+    db.select({ id: boards.id, name: boards.name }).from(boards),
+  ]);
+
+  const eventsBy = byTask(eventRows);
+  const logsBy = byTask(logs);
+  const commitsBy = byTask(windowCommits);
+  const windowNotesBy = byTask(windowNotes);
+  const openNotesBy = byTask(openNotes);
+  const lifetimeBy = new Map(lifetimeLogs.map((r) => [r.taskId, r]));
+
+  const rows: BoardReviewTask[] = pool.map(({ task, why, placement }) => {
+    const evs = eventsBy.get(task.id) ?? [];
+    const lgs = logsBy.get(task.id) ?? [];
+    const cms = commitsBy.get(task.id) ?? [];
+    const nts = windowNotesBy.get(task.id) ?? [];
+    const open = openNotesBy.get(task.id) ?? [];
+    const life = lifetimeBy.get(task.id);
+
+    /* Lifetime last-activity: the newest of the row's own watermark, when it
+       entered its status, and its last log entry. `updatedAt` alone is noisy —
+       a note edit or a linked commit bumps it — but it is the only thing that
+       moves for an unlogged prose edit, so it belongs in the max. */
+    const lastActivityAt = [
+      task.updatedAt,
+      task.statusSince,
+      life?.last ? iso(new Date(life.last))! : undefined,
+    ]
+      .filter((s): s is string => !!s)
+      .sort()
+      .at(-1)!;
+
+    const has = sizes.get(task.id) ?? { analysis: 0, plan: 0, summary: 0 };
+    const facts: ReviewFacts = {
+      status: task.status,
+      placement,
+      daysInStatus: workingDaysBetween(
+        workingDayOf(new Date(task.statusSince), tz),
+        today,
+      ),
+      daysSinceActivity: workingDaysBetween(
+        workingDayOf(new Date(lastActivityAt), tz),
+        today,
+      ),
+      hasEverLogged: (life?.n ?? 0) > 0,
+      updatedAt: task.updatedAt,
+      updatedInWindow: !!(
+        task.updatedAt &&
+        (!w.start || new Date(task.updatedAt) >= w.start) &&
+        (!w.end || new Date(task.updatedAt) < w.end)
+      ),
+      inWindow: {
+        events: evs.length,
+        logs: lgs.length,
+        notes: nts.length,
+        commits: cms.length,
+      },
+      has,
+      commitCount: commitCounts.get(task.id) ?? 0,
+      openNotes: open.map((n) => ({ id: n.id, type: n.type })),
+      assigned: (task.assigneeIds ?? []).length > 0,
+      thresholds: STALE_AFTER_DAYS,
+    };
+
+    const omitted = {
+      ...(evs.length > REVIEW_MAX_EVENTS
+        ? { events: evs.length - REVIEW_MAX_EVENTS }
+        : {}),
+      ...(lgs.length > REVIEW_MAX_LOGS ? { logs: lgs.length - REVIEW_MAX_LOGS } : {}),
+      ...(nts.length > REVIEW_MAX_NOTES
+        ? { notes: nts.length - REVIEW_MAX_NOTES }
+        : {}),
+    };
+
+    return {
+      task,
+      why,
+      placement,
+      daysInStatus: facts.daysInStatus,
+      lastActivityAt,
+      daysSinceActivity: facts.daysSinceActivity,
+      has,
+      commitCount: facts.commitCount,
+      events: evs.slice(0, REVIEW_MAX_EVENTS).map((e) => ({
+        from: e.fromStatus,
+        to: e.toStatus,
+        at: iso(e.at)!,
+        actorId: e.actorId,
+        creditedTo: e.creditedTo,
+      })),
+      logs: lgs.slice(0, REVIEW_MAX_LOGS).map((l) => ({
+        at: l.at,
+        kind: l.kind,
+        message:
+          l.message.length > REVIEW_MAX_MESSAGE
+            ? `${l.message.slice(0, REVIEW_MAX_MESSAGE)}…`
+            : l.message,
+        ...(l.source ? { source: l.source } : {}),
+        ...(l.actorId ? { actorId: l.actorId } : {}),
+      })),
+      notes: nts.slice(0, REVIEW_MAX_NOTES).map((n) => ({
+        ...n,
+        note:
+          n.note.length > REVIEW_MAX_NOTE_TEXT
+            ? `${n.note.slice(0, REVIEW_MAX_NOTE_TEXT)}…`
+            : n.note,
+      })),
+      commits: cms,
+      ...(Object.keys(omitted).length ? { omitted } : {}),
+      flags: reviewFlags(facts),
+    };
+  });
+
+  /* Worst-first, then longest-sitting. This ordering is load-bearing: it's what
+     makes a truncated payload lose its least interesting rows. */
+  rows.sort(
+    (a, b) =>
+      reviewSeverity(b.flags) - reviewSeverity(a.flags) ||
+      b.daysInStatus - a.daysInStatus,
+  );
+  const kept = (opts.onlyFlagged ? rows.filter((r) => r.flags.length) : rows).slice(
+    0,
+    opts.limit ?? REVIEW_PAGE,
+  );
+
+  /* On-going work outside the scope — a count and refs, nothing more. Keyed by
+     board so a board-scoped review still SEES its siblings, which the board
+     filter has just removed from `tasks`. */
+  const projectNames = new Map(projectRows.map((p) => [p.id, p.name]));
+  const boardNames = new Map(boardRows.map((b) => [b.id, b.name]));
+  const elsewhereBy = new Map<string, BoardReview["elsewhere"][number]>();
+  for (const t of otherOngoing) {
+    const pid = t.projectId ?? "";
+    if (!pid) continue;
+    const bid = t.boardId ?? null;
+    const inScope = pid === projectId && (!board || bid === board.id);
+    if (inScope) continue;
+    const key = `${pid}:${bid ?? ""}`;
+    let entry = elsewhereBy.get(key);
+    if (!entry) {
+      entry = {
+        projectId: pid,
+        projectName: projectNames.get(pid) ?? null,
+        boardId: bid,
+        boardName: bid ? (boardNames.get(bid) ?? null) : null,
+        count: 0,
+        tasks: [],
+      };
+      elsewhereBy.set(key, entry);
+    }
+    entry.count++;
+    if (entry.tasks.length < 8)
+      entry.tasks.push({
+        ...(t.code ? { code: t.code } : {}),
+        title: t.title,
+        status: t.status,
+        daysInStatus: workingDaysBetween(
+          workingDayOf(new Date(t.statusSince), tz),
+          today,
+        ),
+      });
+  }
+
+  const caveats = [
+    "Flags are OBSERVATIONS, not conclusions. Each one is a question to answer against the code, never an action to apply.",
+    "A log entry records THAT a field changed, not what it changed from — and title/description edits are not logged at all. A task whose updatedAt moved with nothing in `logs` was edited as prose: that's the `silentEdit` flag.",
+    "`commits` are commits someone LINKED with link_commit, windowed on when they were linked. An empty list is not proof no code was written.",
+    "There is no repo field on a task: `scope.gitFolder` comes from the board, else the project. Null means nobody recorded where this code lives.",
+    "The working fields are reported as lengths, not text. get_task the handful you're going to act on.",
+  ];
+  if (total > pool.length)
+    caveats.push(
+      `${total} tasks matched but only the ${pool.length} longest-sitting were examined — narrow with boardId or status.`,
+    );
+
+  return {
+    from,
+    to,
+    tz,
+    scope: {
+      projectId,
+      projectName: project?.name ?? null,
+      ...(board ? { boardId: board.id, boardName: board.name } : {}),
+      gitFolder: board?.gitFolder ?? project?.gitFolder ?? null,
+    },
+    thresholds: STALE_AFTER_DAYS,
+    caveats,
+    writeUps,
+    total,
+    tasks: kept,
+    elsewhere: [...elsewhereBy.values()].sort((a, b) => b.count - a.count),
+  };
 }
 
 /* `standup()` is gone: it wrapped `activityDigest` in a flat `finished` list,
