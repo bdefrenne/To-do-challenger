@@ -21,7 +21,6 @@ import {
   index,
   uniqueIndex,
   primaryKey,
-  check,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -657,81 +656,6 @@ export const taskAttachments = pgTable(
   (t) => [index("task_attachments_task_idx").on(t.taskId)],
 );
 
-/* ---- Notes ----
-   One log for everything worth remembering — from a human or the AI. `type`
-   says what kind: a `decision` (a choice made, optionally with a "Why"), or a
-   standup-worthy callout (`progress` / `milestone` / `blocker` / `question` /
-   `fyi`), or a `review` (something to visually double-check later). `tags` are
-   free-form labels (e.g. a decision's old category like "technical").
-   Deliberately NOT graded — no retro/outcome. Transient notes can be checked
-   off via `resolvedAt`.
-
-   Polymorphic anchor (TD-55): a note attaches to a `taskId`, a `canvasId`
-   (a sticky dropped at `x`/`y` on a team whiteboard), or both — a sticky can
-   also reference the task it's about. Not mutually exclusive; the CHECK below
-   just requires at least one. `actorId` mirrors `taskLogs`/`taskStatusEvents`'
-   attribution FK (the free-text `author` stays as a display fallback for
-   surfaces with no signed-in actor). `updatedAt` lets a note's own edit (drag,
-   resolve) trip the global change cursor without relying on bumping its
-   parent task/canvas. */
-export const noteType = pgEnum("note_type", [
-  "decision",
-  "progress",
-  "milestone",
-  "blocker",
-  "question",
-  "fyi",
-  "review",
-]);
-
-export const taskNotes = pgTable(
-  "task_notes",
-  {
-    id: text("id")
-      .primaryKey()
-      .default(sql`gen_random_uuid()`),
-    taskId: text("task_id").references(() => tasks.id, {
-      onDelete: "cascade",
-    }),
-    canvasId: text("canvas_id").references(() => canvases.id, {
-      onDelete: "cascade",
-    }),
-    /** Canvas-space position — set only when `canvasId` is (a sticky note). */
-    x: doublePrecision("x"),
-    y: doublePrecision("y"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    /** Who actually wrote it, when known — see the doc comment above. */
-    actorId: text("actor_id").references(() => users.id, {
-      onDelete: "set null",
-    }),
-    type: noteType("type"),
-    note: text("note").notNull(),
-    tags: text("tags").array().notNull().default(sql`'{}'::text[]`),
-    author: text("author"),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-    updatedAt: timestamp("updated_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-    // When set, the note has been "checked off" — resolved and dropped from the
-    // live Notes view + standup. Transient notes (review/blocker/question) use
-    // this; permanent ones (decision/milestone) just leave it null.
-    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
-  },
-  (t) => [
-    index("task_notes_task_idx").on(t.taskId),
-    index("task_notes_canvas_idx").on(t.canvasId),
-    index("task_notes_user_idx").on(t.userId),
-    check(
-      "task_notes_anchor_check",
-      sql`${t.taskId} is not null or ${t.canvasId} is not null`,
-    ),
-  ],
-);
-
 /* ---- Commits ----
    Git commits linked back to a task (recorded by the AI via link_commit) so a
    task page can list the commits that shipped it. Closes the loop the commit
@@ -981,8 +905,6 @@ export type TelegramLinkCodeRow = typeof telegramLinkCodes.$inferSelect;
 export type NewTelegramLinkCodeRow = typeof telegramLinkCodes.$inferInsert;
 export type GoogleConnectionRow = typeof googleConnections.$inferSelect;
 export type NewGoogleConnectionRow = typeof googleConnections.$inferInsert;
-export type TaskNoteRow = typeof taskNotes.$inferSelect;
-export type NewTaskNoteRow = typeof taskNotes.$inferInsert;
 export type TaskCommitRow = typeof taskCommits.$inferSelect;
 export type NewTaskCommitRow = typeof taskCommits.$inferInsert;
 export type CanvasRow = typeof canvases.$inferSelect;

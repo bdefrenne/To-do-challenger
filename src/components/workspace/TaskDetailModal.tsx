@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import type {
   Task,
   TaskLogEntry,
-  Note,
   TaskCommit,
   Importance,
 } from "@/lib/types";
@@ -28,7 +27,6 @@ import {
   Search,
   Share2,
   Sparkles,
-  Target,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -119,7 +117,6 @@ function TaskDetailLevel({
     addSubtask,
     taskMap,
     logs,
-    notes,
     commits,
     nodeById,
     setStatus,
@@ -249,10 +246,8 @@ function TaskDetailLevel({
   const comments = allEntries
     .filter((e) => e.kind === "comment")
     .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
-  // The Activity timeline unifies two sources: auto-generated log entries and
-  // recorded decisions (kept in task_notes) — the decision text shows inline,
-  // interleaved chronologically. Each item precomputes its icon/color so the
-  // render loop stays source-agnostic.
+  // The Activity timeline: the auto-generated log entries, newest first. Each
+  // item precomputes its icon/color so the render loop stays source-agnostic.
   const activity = [
     ...allEntries
       .filter((e) => e.kind !== "comment")
@@ -277,18 +272,6 @@ function TaskDetailLevel({
           avatarName: person?.name ?? e.author ?? undefined,
         };
       }),
-    ...(notes[taskId] ?? [])
-      .filter((n) => n.type === "decision")
-      .map((n) => ({
-        id: `note-${n.id}`,
-        at: n.createdAt,
-        icon: Target as LucideIcon,
-        color: "text-accent",
-        message: n.note,
-        who: undefined as string | undefined,
-        via: undefined as string | undefined,
-        avatarName: undefined as string | undefined,
-      })),
   ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
   const kids = childrenOf(taskId);
   const done = node.status === "done";
@@ -711,12 +694,8 @@ function TaskDetailLevel({
               </div>
             </div>
 
-            {/* workflow — summaries, notes (incl. decisions), commits */}
-            <WorkflowSection
-              task={task}
-              notes={notes[taskId] ?? []}
-              commits={commits[taskId] ?? []}
-            />
+            {/* workflow — summaries + commits */}
+            <WorkflowSection task={task} commits={commits[taskId] ?? []} />
 
             {/* attachments — hidden entirely when there are none */}
             {featured ? (
@@ -1128,19 +1107,14 @@ function CopyButton({
   );
 }
 
-/** Workflow block: revisable summaries + notes (incl. decisions) + commits.
- *  Notes are written by AIs only; the only edit here is checking off a note
- *  (resolving a transient one, e.g. a `review` item). */
+/** Workflow block: the revisable summaries + linked commits. */
 function WorkflowSection({
   task,
-  notes,
   commits,
 }: {
   task: Task;
-  notes: Note[];
   commits: TaskCommit[];
 }) {
-  const { resolveNote } = useWorkspace();
   const summaries: [string, string | null | undefined][] = [
     ["Analysis", task.analysisSummary],
     ["Technical Plan", task.plan],
@@ -1162,68 +1136,6 @@ function WorkflowSection({
               </div>
             ) : null,
           )}
-        </div>
-      ) : null}
-
-      {/* Notes (decisions + standup callouts) — written by AIs only; hidden
-          when there are none */}
-      {notes.length ? (
-        <div>
-          <SectionLabel>Notes · {notes.length}</SectionLabel>
-          <ul className="mt-1 space-y-1">
-            {notes.map((n) => {
-              const saving = n.id.startsWith("temp-");
-              const isDecision = n.type === "decision";
-              const isReview = n.type === "review";
-              const resolved = Boolean(n.resolvedAt);
-              return (
-                <li
-                  key={n.id}
-                  className={`flex items-start gap-1.5 rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm ${saving ? "opacity-60" : ""} ${resolved ? "opacity-50" : ""}`}
-                >
-                  {isReview && !saving ? (
-                    <input
-                      type="checkbox"
-                      checked={resolved}
-                      onChange={() => resolveNote(task.id, n.id, !resolved)}
-                      className="mt-0.5 shrink-0 cursor-pointer accent-accent"
-                      aria-label={resolved ? "Re-open review" : "Mark reviewed"}
-                    />
-                  ) : null}
-                  <span className="min-w-0">
-                    {n.type ? (
-                      <span
-                        className={`mr-1.5 rounded px-1 py-0.5 font-mono text-[10px] uppercase ${
-                          isDecision
-                            ? "bg-accent-soft text-accent"
-                            : isReview
-                              ? "bg-nerf-soft text-nerf"
-                              : "bg-buff-soft text-buff"
-                        }`}
-                      >
-                        {n.type}
-                      </span>
-                    ) : null}
-                    <span className={resolved ? "text-fg line-through" : "text-fg"}>
-                      {n.note}
-                    </span>
-                    {n.tags?.length ? (
-                      <span className="text-faint">
-                        {" "}
-                        {n.tags.map((t) => `#${t}`).join(" ")}
-                      </span>
-                    ) : null}
-                  </span>
-                  {saving ? (
-                    <span
-                      className="ml-1.5 inline-block h-3 w-3 animate-spin rounded-full border border-faint border-t-transparent align-middle"
-                      aria-label="Saving"
-                    />
-                  ) : null}
-                </li>
-              );
-            })}
-          </ul>
         </div>
       ) : null}
 

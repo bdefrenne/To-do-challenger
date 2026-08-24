@@ -305,43 +305,7 @@ export const updateTaskSchema = z
   })
   .partial();
 
-/* ---- Workflow: notes, commits ---- */
-export const noteTypeSchema = z.enum([
-  "decision",
-  "progress",
-  "milestone",
-  "blocker",
-  "question",
-  "fyi",
-  "review",
-]);
-
-export const addNoteSchema = z.object({
-  note: z.string().min(1).max(10_000),
-  type: noteTypeSchema.nullable().optional(),
-  tags: z.array(z.string().min(1).max(60)).max(20).optional(),
-});
-
-/** POST body for a canvas sticky — same content shape as `addNoteSchema`
- *  plus its whiteboard position. `taskHandle` optionally ALSO links it to a
- *  task (a sticky about a specific task) — the anchors aren't exclusive. */
-export const addCanvasNoteSchema = addNoteSchema.extend({
-  x: z.number(),
-  y: z.number(),
-  taskHandle: z.string().min(1).max(120).optional(),
-});
-
-/** PATCH body for a note: resolve/re-open it, move it (a sticky drag), or
- *  both in one call. At least one field must be present. */
-export const patchNoteSchema = z
-  .object({
-    resolved: z.boolean().optional(),
-    x: z.number().optional(),
-    y: z.number().optional(),
-  })
-  .refine((v) => v.resolved !== undefined || v.x !== undefined || v.y !== undefined, {
-    message: "provide resolved and/or x/y",
-  });
+/* ---- Workflow: commits ---- */
 
 export const linkCommitSchema = z.object({
   sha: z.string().min(4).max(64),

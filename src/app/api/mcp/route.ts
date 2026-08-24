@@ -65,10 +65,6 @@ import {
   createBoard,
   updateBoard,
   mintRef,
-  addNote,
-  addCanvasNote,
-  listNotes,
-  resolveNote,
   linkCommit,
   listCanvases,
   getCanvas,
@@ -164,16 +160,6 @@ const taskHandle = z
       'share, like "PLAT-77" (a locked code) or "PLAT-77*" (a soft/unlocked ' +
       "code; the trailing * is optional). Both forms resolve to the same task.",
   );
-const noteTypeEnum = z.enum([
-  "decision",
-  "progress",
-  "milestone",
-  "blocker",
-  "question",
-  "fyi",
-  "review",
-]);
-
 /** MCP-authored changes are attributed to "Claude" in the activity log. */
 const AI_AUTHOR = "Claude";
 
@@ -383,7 +369,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_task",
-      "Get one task by its id OR its code (the short ref people share, e.g. PLAT-77 — locked, or PLAT-77* — soft) — its full detail plus its notes (decisions + standup callouts), linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context — including when someone hands you a code like PLAT-77. If it comes back with a non-empty `attachments` array, those are images someone attached as part of the brief: call `get_attachment` on each id to actually see them before you analyze.",
+      "Get one task by its id OR its code (the short ref people share, e.g. PLAT-77 — locked, or PLAT-77* — soft) — its full detail plus its linked commits, activity log/comments, and direct subtasks. Use this before working a task, or any time you need its history/context — including when someone hands you a code like PLAT-77. If it comes back with a non-empty `attachments` array, those are images someone attached as part of the brief: call `get_attachment` on each id to actually see them before you analyze.",
       { id: taskHandle },
       async ({ id }) => {
         const result = await getTask(id, currentUser());
@@ -626,9 +612,9 @@ const handler = createMcpHandler(
     );
 
     /* ----------------------------------------------------------------- */
-    /* WORKFLOW — the process layer: lock the code, record decisions +    */
-    /* notes as they happen, link commits. See work_on_task / finish_task */
-    /* prompts for the protocol. All auto-fire lifecycle timestamps.      */
+    /* WORKFLOW — the process layer: lock the code, link commits. See     */
+    /* work_on_task / finish_task prompts for the protocol. All auto-fire  */
+    /* lifecycle timestamps.                                               */
     /* ----------------------------------------------------------------- */
 
     server.tool(
@@ -638,74 +624,6 @@ const handler = createMcpHandler(
       async ({ id }) => {
         const task = await mintRef(id, currentUser(), AI_AUTHOR);
         return task ? text({ task }) : text({ error: "Task not found" });
-      },
-    );
-
-    server.tool(
-      "add_note",
-      "Add a note — the one log for anything worth remembering. Anchor it to a task (`id`), to a canvas as a sticky on the team whiteboard (`canvasId` + `x`/`y`), or both (a sticky that ALSO references a task) — pass at least one anchor. Use `decision` ONLY for a SIGNIFICANT choice, and usually only when the user says 'log this…' — never reflexively for small choices (put the 'why' in the note body). Use a standup-worthy callout otherwise: `progress`, `milestone`, `blocker`, `question`, `fyi`. Use `review` ONLY when the user explicitly asks you to flag something for them to visually double-check later — never add review notes on your own initiative. `tags` are free-form labels (e.g. \"technical\", \"product\") for later filtering.",
-      {
-        id: taskHandle.optional().describe("A task to anchor the note to."),
-        canvasId: z
-          .string()
-          .optional()
-          .describe("A canvas to drop a sticky note on — requires x/y."),
-        x: z.number().optional().describe("Canvas-space x, required with canvasId."),
-        y: z.number().optional().describe("Canvas-space y, required with canvasId."),
-        note: z.string().min(1).max(10_000),
-        type: noteTypeEnum.optional(),
-        tags: z.array(z.string().min(1).max(60)).max(20).optional(),
-      },
-      async ({ id, canvasId, x, y, note, type, tags }) => {
-        if (canvasId != null) {
-          if (x == null || y == null)
-            return text({ error: "x and y are required when canvasId is set" });
-          const n = await addCanvasNote(
-            canvasId,
-            x,
-            y,
-            { note, type, tags },
-            currentUser(),
-            AI_AUTHOR,
-            id,
-          );
-          return n
-            ? text({ note: n })
-            : text({ error: "Canvas not found (or id didn't resolve to a task)" });
-        }
-        if (!id) return text({ error: "Provide id and/or canvasId+x+y" });
-        const n = await addNote(id, { note, type, tags }, currentUser(), AI_AUTHOR);
-        return n ? text({ note: n }) : text({ error: "Task not found" });
-      },
-    );
-
-    server.tool(
-      "list_notes",
-      "Query notes across all tasks AND canvas stickies — filter by task, canvas, type (e.g. decision), or date range. Returns only OPEN notes unless `includeResolved` is true. Use for retros ('show our technical decisions'), audits, the standup digest, listing open `review` items to double-check, and reading a canvas's stickies (also returned inline by get_canvas).",
-      {
-        taskId: taskHandle.optional(),
-        canvasId: z.string().optional(),
-        type: noteTypeEnum.optional(),
-        from: z.string().max(40).optional(),
-        to: z.string().max(40).optional(),
-        includeResolved: z.boolean().optional(),
-      },
-      async (filter) => {
-        const notes = await listNotes(currentUser(), filter);
-        return text({ count: notes.length, notes });
-      },
-    );
-
-    server.tool(
-      "resolve_note",
-      "Check off (resolve) or re-open a note by its id — used to clear a transient note (e.g. a `review` item) once it's been handled, so it drops out of the live Notes view and standup. The user owns their review list; only resolve when they ask.",
-      {
-        id: z.string(),
-        resolved: z.boolean().default(true),
-      },
-      async ({ id, resolved }) => {
-        const n = await resolveNote(id, resolved, currentUser());
-        return n ? text({ note: n }) : text({ error: "Note not found" });
       },
     );
 
@@ -729,7 +647,7 @@ const handler = createMcpHandler(
         "\n" +
         "Work is attributed to WHOSE WORK IT IS, recorded when each status change happened: the assignee when a card was moved in the web UI (moving a card is scheduling, not doing), the actor on agent surfaces. So a task someone else closed on your behalf is NOT yours, and one you built but someone else closed still is. Defaults to you; pass `credited` for a teammate or `\"team\"` for everyone.\n" +
         "\n" +
-        "Four disjoint lists: `shipped` (reached done, and you worked a stage on it), `handled` (reached done with no working stage — non-code work taken straight to done; say \"handled\", never \"built\"), `worked` (still in flight, with the stage stints you did), and `closedUnattributed` (reached done with nobody creditable — `closedBy` says who pressed the button, which is on the record but is NOT their work). Plus `notes` for the window. An `attribution` field, when present, means the window predates the record — treat it as missing data, not an empty day.",
+        "Four disjoint lists: `shipped` (reached done, and you worked a stage on it), `handled` (reached done with no working stage — non-code work taken straight to done; say \"handled\", never \"built\"), `worked` (still in flight, with the stage stints you did), and `closedUnattributed` (reached done with nobody creditable — `closedBy` says who pressed the button, which is on the record but is NOT their work). An `attribution` field, when present, means the window predates the record — treat it as missing data, not an empty day.",
       {
         from: z.string().min(1).max(40).describe("start of window (inclusive)"),
         to: z.string().min(1).max(40).describe("end of window (inclusive)"),
@@ -747,10 +665,11 @@ const handler = createMcpHandler(
             : /^(team|all|everyone|\*)$/i.test(credited.trim())
               ? null
               : ((await resolveFilter({ actor: credited })).actor ?? NO_SUCH_USER);
-        const [digest, notes] = await Promise.all([
-          activityDigest(currentUser(), { from, to, credited: who }),
-          listNotes(currentUser(), { from, to }),
-        ]);
+        const digest = await activityDigest(currentUser(), {
+          from,
+          to,
+          credited: who,
+        });
         // A digest wants "what shipped", which is the `summary`. Carrying each
         // task's plan + analysis + description as well multiplies the payload
         // several times over for material nobody reads here.
@@ -773,7 +692,6 @@ const handler = createMcpHandler(
             to,
             credited: who === null ? "team" : who,
             ...(digest.attribution ? { attribution: digest.attribution } : {}),
-            notes,
             shipped: digest.shipped.map(entry),
             handled: digest.handled.map(entry),
             worked: digest.worked.map(entry),
@@ -784,7 +702,7 @@ const handler = createMcpHandler(
           },
           {
             // Shipped tasks carry their full summaries, so a wide window is the
-            // one read that reliably runs long. Cut those before the notes.
+            // one read that reliably runs long. Cut those first.
             items: "shipped",
             narrow: ["from", "to", "credited"],
           },
@@ -800,7 +718,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "work_day",
-      "Everything the end-of-day close-out needs for one project on one working day, in one read: `day` (the row, with `sealed`), `digest` (what you did — same four disjoint lists as `standup`), `notes`, `candidates` (tasks you actually touched that day and left in a late work status — the \"which of these finished?\" list, PROPOSALS only), and `drift` when a morning snapshot exists (`plannedNotDone`, and `doneNotPlanned` — the day's real interruptions).\n" +
+      "Everything the end-of-day close-out needs for one project on one working day, in one read: `day` (the row, with `sealed`), `digest` (what you did — same four disjoint lists as `standup`), `candidates` (tasks you actually touched that day and left in a late work status — the \"which of these finished?\" list, PROPOSALS only), and `drift` when a morning snapshot exists (`plannedNotDone`, and `doneNotPlanned` — the day's real interruptions).\n" +
         "\n" +
         "`openDays` lists EARLIER working days with the person's work on them that were never closed out. Raise those before writing today's standup — an unclosed day is work missing from the record, and nothing else surfaces it.\n" +
         "\n" +
@@ -826,7 +744,6 @@ const handler = createMcpHandler(
             ...(review.digest.attribution
               ? { attribution: review.digest.attribution }
               : {}),
-            notes: review.notes,
             candidates: review.candidates.map((t) => projectTask(t, "compact")),
             shipped: review.digest.shipped.map((e) => ({
               ...projectTask(e.task, "compact"),
@@ -1374,13 +1291,12 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes AND sticky notes. A canvas belongs to exactly one project (`projectId`) and lays out that project's boards; a task's `placement` resolves against ITS OWN project's canvas. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.thisWeek`, `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — this week's board, triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. THIS WEEK is where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. A tray's lanes are machine-made, but a section you add to a tray by hand is an ordinary section and is PREFERRED over a derived lane, so hand-named lanes are what work actually lands in. `notes` are this canvas's stickies (see add_note/list_notes) — open ones plus resolved ones (resolved stickies stay pinned, dimmed, until deleted).",
+      "Get one canvas by id with all its nodes. A canvas belongs to exactly one project (`projectId`) and lays out that project's boards; a task's `placement` resolves against ITS OWN project's canvas. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.thisWeek`, `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — this week's board, triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. THIS WEEK is where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. A tray's lanes are machine-made, but a section you add to a tray by hand is an ordinary section and is PREFERRED over a derived lane, so hand-named lanes are what work actually lands in.",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);
         if (!canvas) return text({ error: "Canvas not found" });
-        const notes = await listNotes(currentUser(), { canvasId: id, includeResolved: true });
-        return text({ canvas: { ...canvas, notes } });
+        return text({ canvas });
       },
     );
 
@@ -1735,23 +1651,16 @@ const handler = createMcpHandler(
           );
         const t = result.task;
         const since = t.lockedAt ?? t.createdAt;
-        const decisionNotes = result.notes.filter((n) => n.type === "decision");
         return await promptMsg(
           titleHeader(t.title) +
             `Let's finish task **${t.code ?? taskId}** (id: ${taskId}).\n\n` +
+            `Recorded analysis:\n${t.analysisSummary ?? "_(none)_"}\n\n` +
             `Recorded plan:\n${t.plan ?? "_(none)_"}\n\n` +
-            `Recorded decisions:\n${
-              decisionNotes.length
-                ? decisionNotes
-                    .map((n) => `- ${n.note}${n.tags.length ? ` [${n.tags.join(", ")}]` : ""}`)
-                    .join("\n")
-                : "_(none)_"
-            }\n\n` +
             `Run the **Finish** step of the todo workflow contract (in your server ` +
             `instructions / the \`todo://workflow\` resource): write a short ` +
             `\`summary\` of what actually shipped — you can diff git since${
               since ? ` (~${since})` : ""
-            } (or the branch point) and compare against the plan + decisions above ` +
+            } (or the branch point) and compare against the analysis + plan above ` +
             `to help. Add the context the diff can't show — the why, key decisions, ` +
             `gotchas, follow-ups — and give any scope added along the way its own ` +
             `line. Keep it concise. Then ask me "Can I mark this as done?" and ` +
@@ -1798,7 +1707,6 @@ const handler = createMcpHandler(
                   ref: c.task.code,
                   title: c.task.title,
                 })),
-                notes: review.notes,
                 drift: review.drift,
                 openDays: review.openDays,
               },
@@ -1832,14 +1740,15 @@ const handler = createMcpHandler(
         argsSchema: { from: z.string(), to: z.string() },
       },
       async ({ from, to }) => {
-        const [digest, notes] = await Promise.all([
-          activityDigest(currentUser(), { from, to, credited: currentUser() }),
-          listNotes(currentUser(), { from, to }),
-        ]);
+        const digest = await activityDigest(currentUser(), {
+          from,
+          to,
+          credited: currentUser(),
+        });
         return await promptMsg(
           `Here's the raw material for a standup covering ${from} → ${to}:\n\n` +
-            `${JSON.stringify({ ...digest, notes }, null, 2)}\n\n` +
-            `Please write a concise, shareable standup update: group notes into **Progress**, **Blockers**, **Questions**, and **To review** (review-type notes still open); list what shipped (with one-line summaries), and keep \`handled\` items separate from \`shipped\` ones — say "handled", never "built". Mention \`closedUnattributed\` as tasks cleared off the board, never as someone's work. Call out any notable decisions. Keep it tight enough to paste into a team channel.`,
+            `${JSON.stringify(digest, null, 2)}\n\n` +
+            `Please write a concise, shareable standup update from the tasks themselves — their summaries are what shipped. List what shipped (one line each), and keep \`handled\` items separate from \`shipped\` ones — say "handled", never "built". Say what's still in flight, and flag anything that looks stuck. Mention \`closedUnattributed\` as tasks cleared off the board, never as someone's work. Keep it tight enough to paste into a team channel.`,
         );
       },
     );
@@ -1870,7 +1779,6 @@ const handler = createMcpHandler(
           updatedAt: r.task.updatedAt,
           events: r.events,
           logs: r.logs,
-          notes: r.notes.map((n) => ({ type: n.type, note: n.note })),
           commits: r.commits.map((c) => ({ sha: c.sha, subject: c.subject })),
           flags: r.flags,
         });

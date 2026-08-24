@@ -1,5 +1,13 @@
 # Task Workflow — from braindump to shipped
 
+> **Notes are discontinued (TD2-209).** Everything below about notes —
+> `add_note` / `list_notes` / `resolve_note`, decisions, standup callouts,
+> `review` items, the Notes page, canvas sticky notes and the `task_notes`
+> table — describes a feature that no longer exists. It is kept as history.
+> A decision or trade-off now lives in the task's own `analysisSummary` /
+> `plan` / `summary`, a passing remark in a comment, and anything to check
+> later is its own task.
+
 How a task moves through its whole life: created by a human, handed to an AI,
 analyzed, worked, and finished with a summary that captures **everything** that
 actually shipped — including scope that was added along the way without its own

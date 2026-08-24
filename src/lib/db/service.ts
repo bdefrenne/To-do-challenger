@@ -18,7 +18,6 @@ import {
   taskLogs,
   taskStatusEvents,
   taskAttachments,
-  taskNotes,
   taskCommits,
   projects,
   projectMembers,
@@ -33,7 +32,6 @@ import {
   type TaskStatusEventRow,
   type NewTaskStatusEventRow,
   type TaskAttachmentRow,
-  type TaskNoteRow,
   type TaskCommitRow,
   type ProjectRow,
   type BoardRow,
@@ -73,8 +71,6 @@ import type {
   Attachment,
   Project,
   Board,
-  Note,
-  NoteType,
   TaskCommit,
   Canvas,
   CanvasNode,
@@ -853,22 +849,7 @@ async function ensureOwnerCode(
   return code;
 }
 
-/* ---- Row → DTO converters for notes / commits ---- */
-
-const rowToNote = (r: TaskNoteRow): Note => ({
-  id: r.id,
-  taskId: r.taskId,
-  canvasId: r.canvasId,
-  x: r.x,
-  y: r.y,
-  type: r.type,
-  note: r.note,
-  tags: r.tags ?? [],
-  author: r.author,
-  actorId: r.actorId,
-  createdAt: iso(r.createdAt)!,
-  resolvedAt: iso(r.resolvedAt),
-});
+/* ---- Row → DTO converter for commits ---- */
 
 const rowToCommit = (r: TaskCommitRow): TaskCommit => ({
   id: r.id,
@@ -1420,7 +1401,6 @@ export async function getTask(
 ): Promise<{
   task: TaskDTO;
   logs: TaskLogEntry[];
-  notes: Note[];
   commits: TaskCommit[];
 } | null> {
   const id = await resolveTaskId(handle, userId);
@@ -1432,11 +1412,10 @@ export async function getTask(
       .where(eq(tasks.id, id))
   )[0];
   if (!row) return null;
-  const [logRows, attachmentRows, noteRows, commitRows, childRows, ctx] =
+  const [logRows, attachmentRows, commitRows, childRows, ctx] =
     await Promise.all([
       db.select().from(taskLogs).where(eq(taskLogs.taskId, id)).orderBy(asc(taskLogs.at)),
       db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(asc(taskAttachments.createdAt)),
-      db.select().from(taskNotes).where(eq(taskNotes.taskId, id)).orderBy(asc(taskNotes.createdAt)),
       db.select().from(taskCommits).where(eq(taskCommits.taskId, id)).orderBy(asc(taskCommits.createdAt)),
       db
         .select()
@@ -1470,7 +1449,6 @@ export async function getTask(
       actorId: l.actorId ?? undefined,
       source: l.source ?? undefined,
     })),
-    notes: noteRows.map(rowToNote),
     commits: commitRows.map(rowToCommit),
   };
 }
@@ -1568,13 +1546,9 @@ export async function getChangeCursor(_userId: string): Promise<string> {
         (select count(*) from ${boards})      || ':' ||
         (select coalesce(extract(epoch from max(${boards.updatedAt}))::bigint, 0) from ${boards}) || ':' ||
         (select count(*) from ${projects})    || ':' ||
-        (select coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0) from ${projects}) || ':' ||
-        (select count(*) from ${taskNotes})   || ':' ||
-        (select coalesce(extract(epoch from max(${taskNotes.updatedAt}))::bigint, 0) from ${taskNotes})
+        (select coalesce(extract(epoch from max(${projects.updatedAt}))::bigint, 0) from ${projects})
       `,
     })
-    // Notes are folded in so a resolve/drag on a canvas note trips the poll for
-    // clients with no Liveblocks room open (Notes page, another canvas, MCP).
     .from(sql`(select 1) as _`);
   return row.c;
 }
@@ -3420,207 +3394,6 @@ export async function deleteAttachment(
 
 
 /* -------------------------------------------------------------------- */
-/* Notes (standup material)                                              */
-/* -------------------------------------------------------------------- */
-
-export interface AddNoteInput {
-  note: string;
-  type?: NoteType | null;
-  /** Free-form labels — e.g. a decision's area ("technical", "product"). */
-  tags?: string[];
-}
-
-/** Add a note to a task — a decision (with optional "Why" in the body) or a
- *  standup-worthy callout. Raw material for the standup digest + Notes page. */
-export async function addNote(
-  handle: string,
-  input: AddNoteInput,
-  userId: string,
-  author = "You",
-): Promise<Note | null> {
-  const taskId = await resolveTaskId(handle, userId);
-  if (!taskId) return null;
-  const ctx = currentLogContext();
-  const [row] = await db
-    .insert(taskNotes)
-    .values({
-      taskId,
-      userId,
-      note: input.note,
-      type: input.type ?? null,
-      tags: input.tags ?? [],
-      author,
-      actorId: ctx?.actorId,
-    })
-    .returning();
-  await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, taskId));
-  return rowToNote(row);
-}
-
-/** Add a note anchored to a canvas position — a sticky dropped on the team
- *  whiteboard. `taskHandle` optionally ALSO links it to a task: the two
- *  anchors aren't mutually exclusive (see the schema comment on `taskNotes`).
- *  Null if the canvas doesn't exist, or `taskHandle` is given but unresolvable. */
-export async function addCanvasNote(
-  canvasId: string,
-  x: number,
-  y: number,
-  input: AddNoteInput,
-  userId: string,
-  author = "You",
-  taskHandle?: string,
-): Promise<Note | null> {
-  if (!(await canvasExists(canvasId))) return null;
-  let taskId: string | null = null;
-  if (taskHandle) {
-    taskId = await resolveTaskId(taskHandle, userId);
-    if (!taskId) return null;
-  }
-  const ctx = currentLogContext();
-  const [row] = await db
-    .insert(taskNotes)
-    .values({
-      canvasId,
-      taskId,
-      x,
-      y,
-      userId,
-      note: input.note,
-      type: input.type ?? null,
-      tags: input.tags ?? [],
-      author,
-      actorId: ctx?.actorId,
-    })
-    .returning();
-  await db
-    .update(canvases)
-    .set({ updatedAt: new Date() })
-    .where(eq(canvases.id, canvasId));
-  return rowToNote(row);
-}
-
-export interface NoteFilter {
-  taskId?: string;
-  /** Several tasks at once — how a multi-task read (a board review) fences its
-   *  notes server-side instead of pulling every note and filtering in memory.
-   *  An EMPTY array means "no tasks", and returns nothing. */
-  taskIds?: string[];
-  canvasId?: string;
-  type?: NoteType;
-  from?: string;
-  to?: string;
-  /** Include checked-off (resolved) notes. Defaults to false — the live Notes
-   *  view and standup only want open items. */
-  includeResolved?: boolean;
-}
-
-/** Query notes across the team — powers the Notes page, standup, and a
- *  canvas's stickies. Team-visible like tasks/canvases: nobody is fenced out
- *  of anyone else's notes. By default only OPEN (unresolved) notes are
- *  returned. `_userId` stays a parameter (unused for scoping) so callers don't
- *  need to change and a future per-user view has a place to hang. */
-export async function listNotes(
-  _userId: string,
-  filter?: NoteFilter,
-): Promise<Note[]> {
-  const conds: (SQL | undefined)[] = [];
-  if (filter?.taskId) {
-    const taskId = await resolveTaskId(filter.taskId, _userId);
-    if (!taskId) return [];
-    conds.push(eq(taskNotes.taskId, taskId));
-  }
-  if (filter?.taskIds) {
-    if (!filter.taskIds.length) return [];
-    conds.push(inArray(taskNotes.taskId, filter.taskIds));
-  }
-  if (filter?.canvasId) conds.push(eq(taskNotes.canvasId, filter.canvasId));
-  if (filter?.type) conds.push(eq(taskNotes.type, filter.type));
-  conds.push(
-    ...inWindow(taskNotes.createdAt, dateWindow(filter?.from, filter?.to)),
-  );
-  if (!filter?.includeResolved) conds.push(isNull(taskNotes.resolvedAt));
-  const rows = await db
-    .select()
-    .from(taskNotes)
-    .where(conds.length ? and(...conds) : undefined)
-    .orderBy(desc(taskNotes.createdAt));
-  return rows.map(rowToNote);
-}
-
-/** Check off (or re-open) a note, or move it (a sticky drag). Team-visible —
- *  any signed-in user may resolve or move any note, matching tasks/canvases.
- *  Returns the updated note, or null if not found. */
-export async function patchNote(
-  noteId: string,
-  patch: { resolved?: boolean; x?: number; y?: number },
-): Promise<Note | null> {
-  const [row] = await db
-    .update(taskNotes)
-    .set({
-      ...(patch.resolved !== undefined
-        ? { resolvedAt: patch.resolved ? new Date() : null }
-        : {}),
-      ...(patch.x !== undefined ? { x: patch.x } : {}),
-      ...(patch.y !== undefined ? { y: patch.y } : {}),
-      updatedAt: new Date(),
-    })
-    .where(eq(taskNotes.id, noteId))
-    .returning();
-  if (!row) return null;
-  if (row.taskId) {
-    await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
-  }
-  if (row.canvasId) {
-    await db
-      .update(canvases)
-      .set({ updatedAt: new Date() })
-      .where(eq(canvases.id, row.canvasId));
-  }
-  return rowToNote(row);
-}
-
-/** Check off (or re-open) a note. Thin wrapper over `patchNote` — kept as its
- *  own export so the MCP tool name/behavior doesn't change. */
-export async function resolveNote(
-  noteId: string,
-  resolved: boolean,
-  _userId: string,
-): Promise<Note | null> {
-  return patchNote(noteId, { resolved });
-}
-
-/** Move a note — a sticky drag on the canvas. Thin wrapper over `patchNote`. */
-export async function moveNote(
-  noteId: string,
-  x: number,
-  y: number,
-  _userId: string,
-): Promise<Note | null> {
-  return patchNote(noteId, { x, y });
-}
-
-/** Permanently remove a note (a sticky's "×", or a mis-added task note).
- *  Unlike resolving, there's no undo. Team-visible — any signed-in user may
- *  delete any note, matching tasks/canvases. */
-export async function deleteNote(noteId: string): Promise<boolean> {
-  const [row] = await db
-    .delete(taskNotes)
-    .where(eq(taskNotes.id, noteId))
-    .returning({ taskId: taskNotes.taskId, canvasId: taskNotes.canvasId });
-  if (!row) return false;
-  if (row.taskId) {
-    await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, row.taskId));
-  }
-  if (row.canvasId) {
-    await db
-      .update(canvases)
-      .set({ updatedAt: new Date() })
-      .where(eq(canvases.id, row.canvasId));
-  }
-  return true;
-}
-
-/* -------------------------------------------------------------------- */
 /* Commits                                                               */
 /* -------------------------------------------------------------------- */
 
@@ -4226,8 +3999,6 @@ export interface WorkDayReview {
   day: WorkDay;
   /** Everything credited to this person on this day. */
   digest: ActivityDigest;
-  /** Notes written on the day — the standup's Progress/Blockers material. */
-  notes: Note[];
   /**
    * Probably-finished work: tasks sitting in a late work status that the person
    * actually touched that day. The close-out's "which of these finished?" list.
@@ -4620,10 +4391,9 @@ export async function workDayReview(
   day: string,
   tz = APP_TIMEZONE,
 ): Promise<WorkDayReview> {
-  const [dayRow, digest, notes, inFlight, openDays] = await Promise.all([
+  const [dayRow, digest, inFlight, openDays] = await Promise.all([
     getWorkDay(userId, projectId, day),
     activityDigest(userId, { from: day, to: day, credited: userId, tz }),
-    listNotes(userId, { from: day, to: day }),
     listTasksFlat(userId, {
       projectId,
       status: CANDIDATE_STATUSES,
@@ -4656,7 +4426,6 @@ export async function workDayReview(
   return {
     day: dayRow,
     digest,
-    notes,
     candidates,
     // A day being reviewed isn't its own debt, however it was reached.
     openDays: openDays.filter((d) => d !== day),
@@ -4791,9 +4560,6 @@ export type ReviewFlag =
   | { flag: "doneNotSwept" }
   | { flag: "workingNotThisWeek" }
   | { flag: "untriaged" }
-  | { flag: "openBlocker"; noteIds: string[] }
-  | { flag: "openQuestion"; noteIds: string[] }
-  | { flag: "openReview"; noteIds: string[] }
   | { flag: "unassigned" };
 
 export type ReviewFlagName = ReviewFlag["flag"];
@@ -4807,20 +4573,17 @@ export type ReviewFlagName = ReviewFlag["flag"];
  * context, not a problem.
  */
 const FLAG_WEIGHT: Record<ReviewFlagName, number> = {
-  openBlocker: 100,
   staleInStatus: 60,
   noActivityEver: 50,
   buildingNoPlan: 40,
   reviewNoSummary: 40,
   analyzingNoAnalysis: 30,
   buildingNoCommits: 25,
-  openQuestion: 25,
   doneNotSwept: 20,
   silentEdit: 15,
   workingNotThisWeek: 12,
   untriaged: 10,
   unassigned: 8,
-  openReview: 5,
   movedInWindow: 0,
 };
 
@@ -4839,12 +4602,10 @@ export interface ReviewFacts {
   /** `updatedAt` falls inside the evidence window. */
   updatedInWindow: boolean;
   /** How much the window turned up, by kind. */
-  inWindow: { events: number; logs: number; notes: number; commits: number };
+  inWindow: { events: number; logs: number; commits: number };
   has: WorkingFieldSizes;
   /** Commits linked all time. */
   commitCount: number;
-  /** Open (unresolved) notes, whatever their age. */
-  openNotes: { id: string; type?: NoteType | null }[];
   assigned: boolean;
   thresholds: Record<TaskStatus, number>;
 }
@@ -4868,8 +4629,7 @@ export function reviewFlags(f: ReviewFacts): ReviewFlag[] {
   // description edits are deliberately unlogged, so this is the honest way to
   // say "someone rewrote the prose" instead of showing a task with no evidence
   // and letting it read as untouched.
-  const evidence =
-    f.inWindow.events + f.inWindow.logs + f.inWindow.notes + f.inWindow.commits;
+  const evidence = f.inWindow.events + f.inWindow.logs + f.inWindow.commits;
   if (f.updatedInWindow && evidence === 0 && f.updatedAt)
     flags.push({ flag: "silentEdit", updatedAt: f.updatedAt });
   if (f.status === "analyzing" && f.has.analysis === 0)
@@ -4887,16 +4647,6 @@ export function reviewFlags(f: ReviewFacts): ReviewFlag[] {
   if (f.placement === "inbox" && f.status !== "done")
     flags.push({ flag: "untriaged" });
   if (ongoing && !f.assigned) flags.push({ flag: "unassigned" });
-  const ofType = (t: NoteType) =>
-    f.openNotes.filter((n) => n.type === t).map((n) => n.id);
-  const blockers = ofType("blocker");
-  if (blockers.length) flags.push({ flag: "openBlocker", noteIds: blockers });
-  const questions = ofType("question");
-  if (questions.length) flags.push({ flag: "openQuestion", noteIds: questions });
-  // Ben's own visual-review list. Surfaced so it isn't forgotten; never resolved
-  // on the agent's initiative (see the cleanup contract).
-  const reviews = ofType("review");
-  if (reviews.length) flags.push({ flag: "openReview", noteIds: reviews });
   return flags.sort((a, b) => FLAG_WEIGHT[b.flag] - FLAG_WEIGHT[a.flag]);
 }
 
@@ -4913,10 +4663,7 @@ export const reviewSeverity = (flags: ReviewFlag[]): number =>
    to come down with them, or every read truncates. */
 const REVIEW_MAX_EVENTS = 8;
 const REVIEW_MAX_LOGS = 5;
-const REVIEW_MAX_NOTES = 4;
 const REVIEW_MAX_MESSAGE = 160;
-/** A note is evidence, not a document — enough to recognise it and go read it. */
-const REVIEW_MAX_NOTE_TEXT = 280;
 /** Candidates whose evidence is fetched before flags decide the real order. A
  *  project with more than this in flight has a bigger problem than tidiness. */
 const REVIEW_MAX_CANDIDATES = 250;
@@ -4931,7 +4678,7 @@ export interface BoardReviewTask {
   why: ("status" | "thisWeek" | "inbox" | "unswept")[];
   placement: TaskPlacement;
   daysInStatus: number;
-  /** Newest of (log · status event · linked commit · note · updatedAt), lifetime. */
+  /** Newest of (log · status event · linked commit · updatedAt), lifetime. */
   lastActivityAt: string;
   daysSinceActivity: number;
   /** Whether the working fields exist and how long they are — not their text. */
@@ -4951,10 +4698,9 @@ export interface BoardReviewTask {
     source?: string;
     actorId?: string;
   }[];
-  notes: Note[];
   commits: TaskCommit[];
   /** What the caps cut, so a trimmed row never reads as a complete one. */
-  omitted?: { events?: number; logs?: number; notes?: number };
+  omitted?: { events?: number; logs?: number };
   flags: ReviewFlag[];
 }
 
@@ -5141,8 +4887,6 @@ export async function boardReview(
     commitCounts,
     lifetimeLogs,
     sizes,
-    windowNotes,
-    openNotes,
     writeUps,
     otherOngoing,
     projectRows,
@@ -5177,8 +4921,6 @@ export async function boardReview(
           .groupBy(taskLogs.taskId)
       : Promise.resolve([] as { taskId: string; n: number; last: string | null }[]),
     workingFieldSizes(ids),
-    listNotes(userId, { taskIds: ids, from, to, includeResolved: true }),
-    listNotes(userId, { taskIds: ids }),
     listDayWriteUps({ projectId, fromDay: writeUpFrom, toDay: to }),
     listTasksFlat(userId, {
       status: [...ongoing],
@@ -5193,21 +4935,17 @@ export async function boardReview(
   const eventsBy = byTask(eventRows);
   const logsBy = byTask(logs);
   const commitsBy = byTask(windowCommits);
-  const windowNotesBy = byTask(windowNotes);
-  const openNotesBy = byTask(openNotes);
   const lifetimeBy = new Map(lifetimeLogs.map((r) => [r.taskId, r]));
 
   const rows: BoardReviewTask[] = pool.map(({ task, why, placement }) => {
     const evs = eventsBy.get(task.id) ?? [];
     const lgs = logsBy.get(task.id) ?? [];
     const cms = commitsBy.get(task.id) ?? [];
-    const nts = windowNotesBy.get(task.id) ?? [];
-    const open = openNotesBy.get(task.id) ?? [];
     const life = lifetimeBy.get(task.id);
 
     /* Lifetime last-activity: the newest of the row's own watermark, when it
        entered its status, and its last log entry. `updatedAt` alone is noisy —
-       a note edit or a linked commit bumps it — but it is the only thing that
+       a linked commit bumps it — but it is the only thing that
        moves for an unlogged prose edit, so it belongs in the max. */
     const lastActivityAt = [
       task.updatedAt,
@@ -5237,15 +4975,9 @@ export async function boardReview(
         (!w.start || new Date(task.updatedAt) >= w.start) &&
         (!w.end || new Date(task.updatedAt) < w.end)
       ),
-      inWindow: {
-        events: evs.length,
-        logs: lgs.length,
-        notes: nts.length,
-        commits: cms.length,
-      },
+      inWindow: { events: evs.length, logs: lgs.length, commits: cms.length },
       has,
       commitCount: commitCounts.get(task.id) ?? 0,
-      openNotes: open.map((n) => ({ id: n.id, type: n.type })),
       assigned: (task.assigneeIds ?? []).length > 0,
       thresholds: STALE_AFTER_DAYS,
     };
@@ -5255,9 +4987,6 @@ export async function boardReview(
         ? { events: evs.length - REVIEW_MAX_EVENTS }
         : {}),
       ...(lgs.length > REVIEW_MAX_LOGS ? { logs: lgs.length - REVIEW_MAX_LOGS } : {}),
-      ...(nts.length > REVIEW_MAX_NOTES
-        ? { notes: nts.length - REVIEW_MAX_NOTES }
-        : {}),
     };
 
     return {
@@ -5285,13 +5014,6 @@ export async function boardReview(
             : l.message,
         ...(l.source ? { source: l.source } : {}),
         ...(l.actorId ? { actorId: l.actorId } : {}),
-      })),
-      notes: nts.slice(0, REVIEW_MAX_NOTES).map((n) => ({
-        ...n,
-        note:
-          n.note.length > REVIEW_MAX_NOTE_TEXT
-            ? `${n.note.slice(0, REVIEW_MAX_NOTE_TEXT)}…`
-            : n.note,
       })),
       commits: cms,
       ...(Object.keys(omitted).length ? { omitted } : {}),
@@ -5384,7 +5106,7 @@ export async function boardReview(
    which is the very conflation this task removed — a task you shipped and one
    someone else closed off the board are different facts and now have different
    homes. Callers (the MCP tool, the standup prompt, /api/standup) read the
-   digest directly and pair it with `listNotes`. */
+   digest directly. */
 
 /* -------------------------------------------------------------------- */
 /* Projects & Boards                                                     */

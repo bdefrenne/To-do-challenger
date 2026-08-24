@@ -20,7 +20,6 @@ export const openShortcutsHelp = () =>
 const CANVAS_SHORTCUTS = [
   { keys: ["V"], label: "Select" },
   { keys: ["T"], label: "Text" },
-  { keys: ["N"], label: "Sticky note" },
   { keys: ["S"], label: "Section of tasks" },
   { keys: ["G"], label: "Section group" },
   { keys: ["P"], label: "Draw" },

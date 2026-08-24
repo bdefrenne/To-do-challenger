@@ -53,7 +53,6 @@ interface WorkDay {
 
 interface Review {
   day: WorkDay;
-  notes: { id: string; kind: string; body: string }[];
   candidates: DayTask[];
   shipped: DayTask[];
   handled: DayTask[];

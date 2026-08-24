@@ -17,8 +17,6 @@ import type {
   TaskLogEntry,
   Project,
   Board,
-  Note,
-  NoteType,
   TaskCommit,
 } from "@/lib/types";
 import {
@@ -113,30 +111,6 @@ interface WorkspaceContextValue {
   nodes: TaskNode[];
   taskMap: Record<string, Task>;
   logs: Record<string, TaskLogEntry[]>;
-  /** Per-task workflow detail, loaded alongside the activity log. */
-  notes: Record<string, Note[]>;
-  /** Stickies for whichever canvas is currently mounted (keyed by canvasId).
-   *  Only ever populated for `registerOpenCanvas`'s current id. */
-  canvasNotes: Record<string, Note[]>;
-  /** Canvas-only: tell this context which canvas (if any) is on screen, so
-   *  the poll/remote-refresh loop knows to keep its stickies current. Pass
-   *  null on unmount. Mirrors `registerPlacement` below. */
-  registerOpenCanvas: (canvasId: string | null) => void;
-  /** Drop a sticky at a canvas position. `taskHandle` optionally ALSO links
-   *  it to a task — the two anchors aren't exclusive. */
-  addCanvasNote: (
-    canvasId: string,
-    x: number,
-    y: number,
-    input: { note: string; type?: NoteType; tags?: string[] },
-    taskHandle?: string,
-  ) => Promise<void>;
-  /** Persist a sticky's dropped position (called once on pointerup). */
-  moveCanvasNote: (canvasId: string, noteId: string, x: number, y: number) => Promise<void>;
-  /** Check off (resolve) or re-open a sticky. */
-  resolveCanvasNote: (canvasId: string, noteId: string, resolved: boolean) => Promise<void>;
-  /** Permanently remove a sticky (its "×"). No undo. */
-  deleteCanvasNote: (canvasId: string, noteId: string) => Promise<void>;
   commits: Record<string, TaskCommit[]>;
   projects: Project[];
   /** Stack of open task-detail modals (bottom → top). Each click pushes a new
@@ -290,13 +264,6 @@ interface WorkspaceContextValue {
   lockTask: (id: string) => Promise<string>;
   /** Return a ready-to-paste handoff prompt by kind. Every kind locks the code
    *  first (the analyze handoff is the first commitment). */
-  /** Add a note to a task (decision or standup callout), then reload its detail. */
-  addNote: (
-    id: string,
-    input: { note: string; type?: NoteType; tags?: string[] },
-  ) => Promise<void>;
-  /** Check off (resolve) or re-open a note on a task. */
-  resolveNote: (taskId: string, noteId: string, resolved: boolean) => Promise<void>;
   /** Edit workflow summary fields (analysisSummary / plan / summary). */
   editWorkflow: (
     id: string,
@@ -455,13 +422,10 @@ export type TaskEdit = Partial<
 
 /** What a local change broadcasts to peers. `refetch` = structural change, peers
  *  reload from Postgres; `patch` = a batched field delta peers apply directly to
- *  their taskMap (so the view is live even though the DB write is deferred);
- *  `notesRefetch` = a canvas sticky changed (add/move/resolve) — peers reload
- *  just that canvas's notes, not the whole task/project state. */
+ *  their taskMap (so the view is live even though the DB write is deferred). */
 export type ChangeSignal =
   | { kind: "refetch" }
-  | { kind: "patch"; taskId: string; patch: TaskEdit }
-  | { kind: "notesRefetch"; canvasId: string };
+  | { kind: "patch"; taskId: string; patch: TaskEdit };
 
 /** Human-authored content fields. An edit touching any of these opts into the
  *  optimistic-concurrency check; positional/status-only writes don't
@@ -658,7 +622,6 @@ export function WorkspaceProvider({
   const [nodes, setNodes] = useState<TaskNode[]>([]);
   const [taskMap, setTaskMap] = useState<Record<string, Task>>({});
   const [logs, setLogs] = useState<Record<string, TaskLogEntry[]>>({});
-  const [notes, setNotes] = useState<Record<string, Note[]>>({});
   const [commits, setCommits] = useState<Record<string, TaskCommit[]>>({});
   const [projects, setProjects] = useState<Project[]>([]);
   // Stack of open task-detail modals (bottom → top). Empty = nothing open.
@@ -838,12 +801,6 @@ export function WorkspaceProvider({
     openTaskIdsRef.current = openTaskIds;
   }, [openTaskIds]);
 
-  // Which canvas (if any) CanvasEditor currently has mounted — same "let the
-  // poll closure know what's on screen without re-arming it" trick as above,
-  // just for one id instead of a stack (only one canvas is ever open).
-  const [canvasNotes, setCanvasNotes] = useState<Record<string, Note[]>>({});
-  const openCanvasIdRef = useRef<string | null>(null);
-
   // Mirror the modal stack to the URL (?tasks=id1,id2,…) without touching the
   // route path, so a refresh restores the exact stack. replaceState keeps this
   // out of history (no back-button spam); hydration happens in the load effect.
@@ -1009,12 +966,10 @@ export function WorkspaceProvider({
     api<{
       task: Task;
       logs: TaskLogEntry[];
-      notes?: Note[];
       commits?: TaskCommit[];
     }>(`/api/tasks/${id}`)
       .then((r) => {
         setLogs((prev) => ({ ...prev, [id]: r.logs }));
-        setNotes((prev) => ({ ...prev, [id]: r.notes ?? [] }));
         setCommits((prev) => ({ ...prev, [id]: r.commits ?? [] }));
         // Keep the task map fresh (code/phase/summaries may have changed) — but
         // under the SAME reconcile rules as `applyTaskMap`, which this used to
@@ -1022,7 +977,7 @@ export function WorkspaceProvider({
         // the ~10s `editTaskLive` window wrote the stale server text back over
         // a description/title you were still typing, and re-seeding the editor
         // from it then persisted the old text over the new one. The thread
-        // (logs/notes/commits) above is unconditional — it has no local edits
+        // (logs/commits) above is unconditional — it has no local edits
         // to lose, so a racing mutation is no reason to drop it.
         if (!r.task) return;
         const overlay = overlayRef.current.get(id)?.patch;
@@ -1060,30 +1015,6 @@ export function WorkspaceProvider({
       .catch((e) => console.error("[workspace] failed to load task detail", e));
   }, []);
 
-  // Load one canvas's stickies (open + resolved). Used when a canvas mounts,
-  // and by the poll/remote-refresh loop while `openCanvasIdRef` names one.
-  const loadCanvasNotes = useCallback((canvasId: string) => {
-    // This replaces the whole list, so it needs the same generation guard as a
-    // task read: a note the user just dragged or resolved has an optimistic
-    // position/state that a snapshot taken before that PATCH would undo (the
-    // sticky visibly snapping back until the next refetch).
-    const seq = reconcileSeq.current;
-    api<{ notes: Note[] }>(`/api/canvases/${canvasId}/notes`)
-      .then((r) => {
-        if (reconcileSeq.current !== seq) return;
-        setCanvasNotes((prev) => ({ ...prev, [canvasId]: r.notes }));
-      })
-      .catch((e) => console.error("[workspace] failed to load canvas notes", e));
-  }, []);
-
-  const registerOpenCanvas = useCallback(
-    (canvasId: string | null) => {
-      openCanvasIdRef.current = canvasId;
-      if (canvasId) loadCanvasNotes(canvasId);
-    },
-    [loadCanvasNotes],
-  );
-
   /* ---- Cross-client "task data changed" signal (realtime hot path) ---- */
   // Local mutations notify subscribers; the canvas Liveblocks bridge broadcasts
   // them to peers in the room so their view updates instantly (vs the ≤2s poll).
@@ -1117,12 +1048,11 @@ export function WorkspaceProvider({
       Promise.all([fetchAll(), fetchProjects()])
         .then(() => {
           openTaskIdsRef.current.forEach((id) => loadLogs(id));
-          if (openCanvasIdRef.current) loadCanvasNotes(openCanvasIdRef.current);
           return refreshVersion();
         })
         .catch((e) => console.error("[workspace] remote refresh failed", e));
     }, 150);
-  }, [fetchAll, fetchProjects, refreshVersion, loadLogs, loadCanvasNotes]);
+  }, [fetchAll, fetchProjects, refreshVersion, loadLogs]);
 
   // Initial load, then poll a tiny change-cursor (not the whole list) and
   // only re-fetch when it moves. Plus revalidate-on-focus.
@@ -1132,7 +1062,6 @@ export function WorkspaceProvider({
     const reload = () =>
       Promise.all([fetchAll(), fetchProjects()]).then(() => {
         openTaskIdsRef.current.forEach((id) => loadLogs(id));
-        if (openCanvasIdRef.current) loadCanvasNotes(openCanvasIdRef.current);
         return refreshVersion();
       });
     // Hydrate the modal stack from the URL on first load, then reconcile.
@@ -1180,11 +1109,6 @@ export function WorkspaceProvider({
             await Promise.all([fetchDelta(), fetchProjects()]);
             // Keep every open task's thread current (e.g. a new Claude comment).
             openTaskIdsRef.current.forEach((id) => loadLogs(id));
-            // Same for an open canvas's stickies — this is the fallback path for
-            // a note resolved/moved from a surface with no Liveblocks room open
-            // (the Notes page, MCP, Telegram): getChangeCursor folds in
-            // task_notes, so this cursor still moves even without a broadcast.
-            if (openCanvasIdRef.current) loadCanvasNotes(openCanvasIdRef.current);
           }
         } catch (e) {
           console.error("[workspace] version poll failed", e);
@@ -1218,7 +1142,7 @@ export function WorkspaceProvider({
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [fetchAll, fetchDelta, fetchProjects, refreshVersion, loadLogs, loadCanvasNotes]);
+  }, [fetchAll, fetchDelta, fetchProjects, refreshVersion, loadLogs]);
 
   /** Optimistic update now, server call, then reconcile from the source.
    *  `onSuccess` runs with the server call's result after it resolves (e.g. to
@@ -2958,7 +2882,7 @@ export function WorkspaceProvider({
     loadLogs(id); // reconcile the temp entry with the server's stored comment
   }
 
-  /* ---- Workflow: lock / notes / summaries ---- */
+  /* ---- Workflow: lock / summaries ---- */
 
   // Lock the code (freeze it) and assign the task to me — the handoff side
   // effect behind every Copy-prompt click. Idempotent, so repeat clicks are
@@ -2973,168 +2897,6 @@ export function WorkspaceProvider({
       prev[id] ? { ...prev, [id]: { ...prev[id], ...res.task } } : prev,
     );
     return res.prompt;
-  }
-
-  // Optimistically append a temp row (rendered with a small "saving" spinner),
-  // POST it, then reload so the temp entry is replaced by the server row.
-  async function addNote(
-    id: string,
-    input: { note: string; type?: NoteType; tags?: string[] },
-  ) {
-    const tempId = `temp-${Date.now()}`;
-    const now = new Date().toISOString();
-    await mutate(
-      () =>
-        setNotes((prev) => ({
-          ...prev,
-          [id]: [
-            ...(prev[id] ?? []),
-            {
-              id: tempId,
-              taskId: id,
-              canvasId: null,
-              note: input.note,
-              type: input.type,
-              tags: input.tags ?? [],
-              author: meName,
-              createdAt: now,
-            },
-          ],
-        })),
-      () =>
-        api(`/api/tasks/${id}/notes`, {
-          method: "POST",
-          body: JSON.stringify(input),
-        }),
-    );
-    loadLogs(id);
-  }
-
-  // Optimistically flip a note's resolvedAt, PATCH it, then reconcile.
-  async function resolveNote(taskId: string, noteId: string, resolved: boolean) {
-    const now = new Date().toISOString();
-    await mutate(
-      () =>
-        setNotes((prev) => ({
-          ...prev,
-          [taskId]: (prev[taskId] ?? []).map((n) =>
-            n.id === noteId ? { ...n, resolvedAt: resolved ? now : null } : n,
-          ),
-        })),
-      () =>
-        api(`/api/notes/${noteId}`, {
-          method: "PATCH",
-          body: JSON.stringify({ resolved }),
-        }),
-    );
-    loadLogs(taskId);
-  }
-
-  // Canvas stickies are Postgres-backed (task_notes with a canvasId), not
-  // Liveblocks storage, and low-frequency — they don't go through `mutate`
-  // (which reconciles the whole task/project list; unnecessary here). Each
-  // one pings peers in the room directly via `emitLocalChange`.
-  //
-  // They DO bump the reconcile generation, though: `loadCanvasNotes` replaces
-  // the list wholesale, and skipping `mutate` used to mean nothing told an
-  // in-flight refetch that these optimistic values are newer than its snapshot.
-  async function addCanvasNote(
-    canvasId: string,
-    x: number,
-    y: number,
-    input: { note: string; type?: NoteType; tags?: string[] },
-    taskHandle?: string,
-  ) {
-    const tempId = `temp-${Date.now()}`;
-    const now = new Date().toISOString();
-    reconcileSeq.current++;
-    setCanvasNotes((prev) => ({
-      ...prev,
-      [canvasId]: [
-        ...(prev[canvasId] ?? []),
-        {
-          id: tempId,
-          taskId: null,
-          canvasId,
-          x,
-          y,
-          note: input.note,
-          type: input.type,
-          tags: input.tags ?? [],
-          author: meName,
-          createdAt: now,
-        },
-      ],
-    }));
-    try {
-      const { note } = await api<{ note: Note }>(`/api/canvases/${canvasId}/notes`, {
-        method: "POST",
-        body: JSON.stringify({ ...input, x, y, taskHandle }),
-      });
-      setCanvasNotes((prev) => ({
-        ...prev,
-        [canvasId]: (prev[canvasId] ?? []).map((n) => (n.id === tempId ? note : n)),
-      }));
-    } catch (e) {
-      console.error("[workspace] add canvas note failed", e);
-      setCanvasNotes((prev) => ({
-        ...prev,
-        [canvasId]: (prev[canvasId] ?? []).filter((n) => n.id !== tempId),
-      }));
-      showNotice("Couldn’t add that note.", errorDetail("failed", e));
-    }
-    emitLocalChange({ kind: "notesRefetch", canvasId });
-  }
-
-  async function moveCanvasNote(canvasId: string, noteId: string, x: number, y: number) {
-    reconcileSeq.current++;
-    setCanvasNotes((prev) => ({
-      ...prev,
-      [canvasId]: (prev[canvasId] ?? []).map((n) => (n.id === noteId ? { ...n, x, y } : n)),
-    }));
-    try {
-      await api(`/api/notes/${noteId}`, { method: "PATCH", body: JSON.stringify({ x, y }) });
-    } catch (e) {
-      console.error("[workspace] move canvas note failed", e);
-    }
-    emitLocalChange({ kind: "notesRefetch", canvasId });
-  }
-
-  async function resolveCanvasNote(canvasId: string, noteId: string, resolved: boolean) {
-    const now = new Date().toISOString();
-    reconcileSeq.current++;
-    setCanvasNotes((prev) => ({
-      ...prev,
-      [canvasId]: (prev[canvasId] ?? []).map((n) =>
-        n.id === noteId ? { ...n, resolvedAt: resolved ? now : null } : n,
-      ),
-    }));
-    try {
-      await api(`/api/notes/${noteId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ resolved }),
-      });
-    } catch (e) {
-      console.error("[workspace] resolve canvas note failed", e);
-    }
-    emitLocalChange({ kind: "notesRefetch", canvasId });
-  }
-
-  async function deleteCanvasNote(canvasId: string, noteId: string) {
-    const prevForCanvas = canvasNotes[canvasId] ?? [];
-    reconcileSeq.current++;
-    setCanvasNotes((prev) => ({
-      ...prev,
-      [canvasId]: prevForCanvas.filter((n) => n.id !== noteId),
-    }));
-    try {
-      await api(`/api/notes/${noteId}`, { method: "DELETE" });
-    } catch (e) {
-      console.error("[workspace] delete canvas note failed", e);
-      setCanvasNotes((prev) => ({ ...prev, [canvasId]: prevForCanvas }));
-      showNotice("Couldn’t delete that note.", errorDetail("failed", e));
-    }
-    emitLocalChange({ kind: "notesRefetch", canvasId });
   }
 
   async function editWorkflow(
@@ -3228,13 +2990,6 @@ export function WorkspaceProvider({
         nodes,
         taskMap,
         logs,
-        notes,
-        canvasNotes,
-        registerOpenCanvas,
-        addCanvasNote,
-        moveCanvasNote,
-        resolveCanvasNote,
-        deleteCanvasNote,
         commits,
         projects,
         openTaskIds,
@@ -3273,8 +3028,6 @@ export function WorkspaceProvider({
         addSectionTask,
         addComment,
         lockTask,
-        addNote,
-        resolveNote,
         editWorkflow,
         addAttachment,
         removeAttachment,

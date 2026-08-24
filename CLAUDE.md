@@ -28,10 +28,10 @@ questions about *actual* tasks, projects, and boards, not just the code, e.g.
 "what's on my plate today?", "what did I decide on task X?", "add a task for …".
 
 Answer those against the MCP, not the source. Useful tools: `list_projects`,
-`list_tasks` / `search_tasks` / `get_task`, `standup`, `list_decisions` /
-`list_notes`, and the write tools (`create_task`, `update_task`,
-`complete_task`, `record_decision`, …). Follow the todo MCP's own usage
-instructions when creating or modifying anything.
+`list_tasks` / `search_tasks` / `get_task`, `standup`, `board_review`, and the
+write tools (`create_task`, `update_task`, `complete_task`, `add_comment`, …).
+Follow the todo MCP's own usage instructions when creating or modifying
+anything.
 
 **Todo mapping.** When creating a task here (per the global "always work from
 the todo" rule), file it under the **RYDR** project → **TO DO** board (`TD2`).
@@ -84,8 +84,13 @@ of the RYDR board set.)
   drop rows, and they refuse anything not already in the Trash. Scripts that make
   scratch tasks must PURGE them (see `scrub` in the check scripts) or the bin
   fills up with test residue.
-- **Visual-review notes.** When Ben asks you to flag something for a later
-  visual check, add a `review`-type note to the relevant task
-  (`add_note type:"review"`). Never add review notes on your own initiative —
-  only when Ben explicitly asks. Ben checks them off himself (they clear via
-  `resolve_note`); don't resolve them for him.
+- **Notes are DISCONTINUED (TD2-209).** The whole feature is gone: no
+  `add_note` / `list_notes` / `resolve_note`, no decisions, standup callouts or
+  `review` items, no Notes page, no canvas sticky notes, no `task_notes` table.
+  If an older instruction — here, in the global `CLAUDE.md`, or in a habit —
+  tells you to add or resolve a note, **that instruction is stale: say so and
+  don't try**, nothing will accept the call. A decision or trade-off goes in the
+  task's `analysisSummary` / `plan`, what shipped and its gotchas in its
+  `summary`, a passing remark in a comment (`add_comment`), and anything Ben
+  wants to check later is its own task. If he asks you to "note" or "flag"
+  something, ask which of those he means.

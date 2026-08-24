@@ -1,5 +1,13 @@
 # Implementation Plan — Task Workflow
 
+> **Notes are discontinued (TD2-209).** Everything below about notes —
+> `add_note` / `list_notes` / `resolve_note`, decisions, standup callouts,
+> `review` items, the Notes page, canvas sticky notes and the `task_notes`
+> table — describes a feature that no longer exists. It is kept as history.
+> A decision or trade-off now lives in the task's own `analysisSummary` /
+> `plan` / `summary`, a passing remark in a comment, and anything to check
+> later is its own task.
+
 Turns [task-workflow.md](./task-workflow.md) into shippable work. Sequenced in
 **5 layers**, each independently deployable and useful on its own, so nothing is
 a big-bang. Every layer follows the repo's existing spine:

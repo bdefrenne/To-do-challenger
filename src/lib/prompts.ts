@@ -45,8 +45,8 @@ function loadContext(): string {
   return (
     `Then get_task to load full context and read the relevant code in any ` +
     `relevant repo — read the code directly; don't infer where it lives from ` +
-    `other tasks' notes. Follow the todo workflow contract — it's in the MCP ` +
-    `server instructions and the todo://workflow resource (read it if you ` +
+    `other tasks' write-ups. Follow the todo workflow contract — it's in the ` +
+    `MCP server instructions and the todo://workflow resource (read it if you ` +
     `haven't). `
   );
 }
@@ -98,8 +98,7 @@ export function analyzeThenWorkPrompt(code: string, title: string, lang?: Langua
     `**Then STOP and wait for my go-ahead — do not write any code yet.**\n` +
     `3. **Build** once I say go — set status "building", write \`plan\` via ` +
     `update_task (the actual step-by-step plan you'll execute, not a summary of ` +
-    `it), then execute it. add_note for significant decisions or ` +
-    `standup-worthy updates.\n` +
+    `it), then execute it.\n` +
     `4. **Finish** — write a short \`summary\` of what actually shipped (you can ` +
     `diff git to help; call out any added scope). Then ask me "Can I mark this as ` +
     `done?" and only mark it done once I confirm — never just because the code is ` +
@@ -123,7 +122,7 @@ export function workPrompt(code: string, title: string, lang?: Language | null):
     `summary of it) — you don't need my approval on it, just leave it on the ` +
     `record. If something genuinely blocks you, or the task turns out to be much ` +
     `bigger or riskier than it reads, stop and ask me rather than guessing. ` +
-    `Use add_note only for significant decisions or standup-worthy updates.\n\n` +
+
     `When it's built, run the finish protocol: write a short \`summary\` of what ` +
     `actually shipped (you can diff git to help; call out any added scope). Then ` +
     `ask me "Can I mark this as done?" and only mark it done once I confirm — ` +

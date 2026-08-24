@@ -101,39 +101,6 @@ export interface Project {
   members?: string[];
 }
 
-/** A note's type. `decision` = a choice made (optional "Why" in the body);
- *  the rest are standup-worthy callouts; `review` = something to visually
- *  double-check later. */
-export type NoteType =
-  | "decision"
-  | "progress"
-  | "milestone"
-  | "blocker"
-  | "question"
-  | "fyi"
-  | "review";
-
-/** A note — a decision, a standup-worthy callout, or a review item. Anchored
- *  to a task, a canvas position (a sticky on the team whiteboard), or both —
- *  `taskId`/`canvasId` aren't mutually exclusive, only at least one is set. */
-export interface Note {
-  id: string;
-  taskId: string | null;
-  canvasId: string | null;
-  /** Canvas-space position — set only when `canvasId` is (a sticky note). */
-  x?: number | null;
-  y?: number | null;
-  type?: NoteType | null;
-  note: string;
-  tags: string[];
-  author?: string | null;
-  /** Who actually wrote it, when known (a signed-in user, not a display label). */
-  actorId?: string | null;
-  createdAt: string; // ISO
-  /** When set, the note has been checked off (resolved). null/undefined = open. */
-  resolvedAt?: string | null; // ISO
-}
-
 /** A git commit linked back to a task. */
 export interface TaskCommit {
   id: string;

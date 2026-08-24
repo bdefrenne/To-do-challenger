@@ -54,8 +54,8 @@ normal "create it, then start work" flow needs nothing extra. Every project's
 canvas has a THIS WEEK group and the rest of the trays automatically, so filing
 always has somewhere to land.
 
-**To start**, call \`get_task\` to load the full context (description, notes,
-commits, activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
+**To start**, call \`get_task\` to load the full context (description, commits,
+activity, subtasks) and read the relevant code. Ask about anything unclear before deciding. (The
 \`work_on_task\` prompt does this and locks the code for you.)
 
 **Look at the images.** If the task came back with a non-empty
@@ -68,7 +68,7 @@ alone.
 **Read the code, don't infer it from other tasks.** A task's
 \`analysisSummary\`/\`plan\`/\`summary\` describe how *that* task was worked — they
 are context, never a map of the current codebase. Never use another task's
-notes to guess where code lives or how it's shaped; open the actual files and
+write-ups to guess where code lives or how it's shaped; open the actual files and
 read them directly. (That's why \`list_tasks\`/\`search_tasks\` omit those
 fields — they're only on the task you \`get_task\` directly.)
 
@@ -112,18 +112,10 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    plan itself, not a summary of it. An analysis normally precedes it. A task
    can validly **stop here** — plan written, not yet built. This is the
    **Analyzed → Building** handoff and doesn't change status on its own.
-3. **Decide + note** — with \`add_note\`. Log a \`type: "decision"\` ONLY for a
-   *significant* choice, and usually only when the user says "log this…" — never
-   reflexively for small choices (put the "why" in the body; \`tags\` like
-   "technical"/"product" for filtering). Use
-   \`progress\`/\`milestone\`/\`blocker\`/\`question\`/\`fyi\` for standup-worthy
-   updates. Use \`type: "review"\` ONLY when the user explicitly asks you to flag
-   something for them to visually double-check later — never on your own
-   initiative; they check these off themselves (\`resolve_note\`).
-4. **Build** — set \`status: "building"\` and execute the plan. When the code is
+3. **Build** — set \`status: "building"\` and execute the plan. When the code is
    written but not yet signed off, set \`status: "review"\` — a resting state
    meaning "built, awaiting a look" (a valid place to stop).
-5. **Finish** — write a short \`summary\` of what was done (you can use
+4. **Finish** — write a short \`summary\` of what was done (you can use
    \`git log\`/\`git diff\` to help), plus the context the diff can't show (the
    why, key decisions, gotchas, follow-ups) — give any scope added along the way
    its own line. Keep it concise; length is the driver's call. Then **ask first —
@@ -132,11 +124,26 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    written; the user may want to view or visually check something first.
    \`update_task\` will refuse \`status: "done"\` for this reason — completion goes
    through \`complete_task\`.
-6. **Subtasks close first.** A parent is done when everything under it is, so
+5. **Subtasks close first.** A parent is done when everything under it is, so
    \`complete_task\` refuses a task with unfinished subtasks and names them. Close
    those (each with its own confirmation), or — only if the user asked to finish
    the whole branch — pass \`withSubtasks: true\`. The rule runs the other way too:
    nesting unfinished work under a done task reopens it.
+
+## Notes are DISCONTINUED
+
+The notes feature is **gone** — task notes, decisions, standup callouts, review
+items and canvas sticky notes alike. There is no \`add_note\`, \`list_notes\` or
+\`resolve_note\` tool, no \`notes\` field on a task, and no notes table. If an
+older \`CLAUDE.md\`, prompt or habit tells you to add or resolve a note, that
+instruction is stale: **say so and don't try** — nothing will accept the call.
+
+Write what you would have noted where it now belongs: a decision or a trade-off
+goes in the task's \`analysisSummary\` or \`plan\`, what shipped and its gotchas
+go in its \`summary\`, a passing remark goes in a comment (\`add_comment\`), and
+anything the user wants to check later is its own task. If the user asks you to
+"note" or "flag" something, ask which of those they mean rather than inventing a
+place for it.
 `;
 
 /*
@@ -194,9 +201,9 @@ result. Walk it with the user:
    triage lane. One record for everything.
 3. **Check the dates.** Anything credited to a day other than the one it was
    recorded on should be visible, not implied.
-4. **Write the standup.** Group the day's notes into **Progress**, **Blockers**,
-   **Questions** and **To review** (open \`review\` notes); list what shipped with
-   one-line summaries; keep \`handled\` separate from \`shipped\` — say "handled",
+4. **Write the standup.** Write it from the tasks themselves — their summaries
+   are what shipped. List what shipped with one-line summaries, say what's still
+   in flight, and flag anything that looks stuck; keep \`handled\` separate from \`shipped\` — say "handled",
    never "built"; report \`closedUnattributed\` as tasks cleared off the board,
    never as someone's work. Pass it as \`summary\`, with any non-task points
    ("out Thursday") as \`bullets\`. Keep it tight enough to paste into a channel.
@@ -232,8 +239,7 @@ export const BOARD_CLEANUP = `# Cleaning up the board
 
 \`board_review\` returns **evidence, never conclusions**: what's in flight, what
 moved in the window, what's been sitting still, whether each task has an
-analysis / plan / summary, what commits are linked, and which notes are still
-open. It cannot know whether the work is done. **Only the repo knows that.**
+analysis / plan / summary, and what commits are linked. It cannot know whether the work is done. **Only the repo knows that.**
 
 So a cleanup is a **reconciliation**, the same move as the Finish step, over
 three sources in this order: (1) what the board claims, (2) what the code shows —
@@ -265,9 +271,6 @@ the batch.
 
 **Pass \`expectedUpdatedAt\`** from the review on every \`update_task\`. A review
 is a snapshot, and the user edits the board too — sometimes while you're talking.
-
-**Never resolve a \`review\` note.** Those are the user's own visual checks; they
-get surfaced, and they get checked off by hand.
 
 **A cleanup that finds nothing to change is a good outcome.** Say the board is
 honest. Never invent progress, or a tidying move, to justify having run the pass.

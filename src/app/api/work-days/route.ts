@@ -1,7 +1,7 @@
 /*
   /api/work-days?projectId=&day=&tz=
     GET  — the day's close-out payload: the row (with `sealed` derived), the
-           day's digest and notes, the probably-finished candidates, and the
+           day's digest, the probably-finished candidates, and the
            snapshot-vs-reality drift.
     POST — "Ready for the day": freeze the todo as it stands.
 

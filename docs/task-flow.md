@@ -33,7 +33,7 @@ different people/AIs, or by the same one end to end:
 - `[System]` **locks** the code: `GH-20*` → `GH-20`, frozen forever, so every
   commit can cite it. Status → **Analyzing**. (The lock is guaranteed — the
   prompt does it, and a plain ask from Claude Code locks on first touch.)
-- `[AI]` loads full context — `get_task` (description, notes, commits, activity,
+- `[AI]` loads full context — `get_task` (description, commits, activity,
   subtasks), reads the board/project description + `gitFolder`, reads the code —
   and asks anything unclear **before** deciding.
 - `[AI]` produces two things (as long as they need to be — no length limit):
@@ -44,9 +44,8 @@ different people/AIs, or by the same one end to end:
     what's a duplicate or relocated, what's out of scope, and any risk.
   - **Technical Plan** — the *how*: the order of attack for building it. This is
     where the file-level, step-by-step detail lives.
-- `[AI]` logs only the *significant* decisions — and usually because you said
-  *"log this…"*, never reflexively (`add_note type:"decision"`, the *why* in
-  the body).
+- `[AI]` records the decisions that matter in the **Analysis** itself — there is
+  no separate note for them (see *Notes are discontinued* below).
 
 **Analyzed** — understood + planned, ready to build (a valid resting state)
 - Status → **Analyzed** once the Analysis + Technical Plan are settled.
@@ -59,8 +58,6 @@ different people/AIs, or by the same one end to end:
   and it moves to **Building**. (Or one AI runs analyze → build straight
   through.)
 - `[AI]` executes the Technical Plan.
-- `[AI]` drops standup-worthy notes as they happen — `add_note`
-  `progress` / `milestone` / `blocker` / `question` / `fyi`.
 - `[AI]` references the code in commit messages (`[GH-20] add reset endpoint`).
   Optionally `link_commit`s a sha so the commit shows on the task page (the
   deployed app can't read your repo, so this is the only way it surfaces there).
@@ -77,8 +74,8 @@ different people/AIs, or by the same one end to end:
 
 **Standup** — out of band, cross-task
 - `[User]` runs the standup digest for a date window.
-- `[System]` sweeps all tasks: notes grouped by type + tasks finished in the
-  window with their summaries → one shareable update.
+- `[System]` sweeps all tasks: what shipped in the window with their summaries,
+  plus what's still in flight → one shareable update.
 
 ---
 
@@ -92,7 +89,19 @@ different people/AIs, or by the same one end to end:
 
 ---
 
-## Notes
+## Notes are discontinued (TD2-209)
+
+There is no notes feature: no `add_note` / `list_notes` / `resolve_note`, no
+decisions, standup callouts or `review` items, no Notes page, no canvas sticky
+notes, and no `task_notes` table. If an older instruction tells you to add or
+resolve a note, it is stale — say so rather than trying. A decision or trade-off
+belongs in the task's `analysisSummary` or `plan`, what shipped and its gotchas
+in its `summary`, a passing remark in a comment (`add_comment`), and anything to
+double-check later is its own task.
+
+---
+
+## Notes on the model
 
 - **One axis.** `status` *is* the process — there's no separate "phase". Analysis
   is real work, so it has its own stages (Analyzing / Analyzed) rather than being

@@ -1,12 +1,12 @@
 /*
   /api/standup?from=YYYY-MM-DD&to=YYYY-MM-DD
-    GET — the standup digest data for a window: notes (incl. decisions) +
-          finished tasks. Defaults to the last 24h if no range is given.
+    GET — the standup digest data for a window: what was worked, shipped and
+          handled. Defaults to the last 24h if no range is given.
 */
 
 import { NextRequest } from "next/server";
 import { route, json, type AuthedCtx } from "@/lib/api";
-import { activityDigest, listNotes, resolveAssignees } from "@/lib/db/service";
+import { activityDigest, resolveAssignees } from "@/lib/db/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -24,9 +24,11 @@ export const GET = route(async (req: NextRequest, { userId }: AuthedCtx) => {
     : /^(team|all|everyone|\*)$/i.test(raw.trim())
       ? null
       : (await resolveAssignees([raw]))[0] ?? "__no_such_user__";
-  const [digest, notes] = await Promise.all([
-    activityDigest(userId, { from, to, credited, tz: sp.get("tz") ?? undefined }),
-    listNotes(userId, { from, to }),
-  ]);
-  return json({ ...digest, notes });
+  const digest = await activityDigest(userId, {
+    from,
+    to,
+    credited,
+    tz: sp.get("tz") ?? undefined,
+  });
+  return json(digest);
 });

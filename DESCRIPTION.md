@@ -38,11 +38,15 @@ edit and a human edit go through the exact same door.
   and the steps an agent follows can't drift. A working day runs 04:00 → 04:00
   local (`src/lib/workday.ts`), and closing one out produces the standup.
 - **The board is checked against the code, not trusted.** `board_review` gathers
-  everything in flight — what moved, what has sat still, what's missing a plan or
-  a summary, what commits are linked, which notes are open — and flags it
-  deterministically. It returns **evidence, never conclusions**: every flag is a
-  question the agent answers by reading the repo, before proposing anything to a
-  human who decides. Nothing else notices a task that simply stopped.
+  everything in flight — what moved, what has sat still, what's missing a plan
+  or a summary, and what commits are linked — and flags it deterministically. It
+  returns **evidence, never conclusions**: every flag is a question the agent
+  answers by reading the repo, before proposing anything to a human who decides.
+  Nothing else notices a task that simply stopped.
+- **There is no notes feature** (removed in TD2-209). A task's own
+  `analysisSummary` / `plan` / `summary` carry the thinking, comments carry the
+  conversation, and anything to check later is its own task — one place per kind
+  of writing rather than a parallel log beside the board.
 - **Keyboard-first cards:** hovering any task card — on the canvas, the project
   Boards view, a board's kanban or the task list — gives the same keys, from one
   definition (`useTaskCardShortcuts`): **D** done, **S/I/A** pickers, **1/2**

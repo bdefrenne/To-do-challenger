@@ -58,10 +58,9 @@ const facts = (over: Partial<ReviewFacts> = {}): ReviewFacts => ({
   hasEverLogged: true,
   updatedAt: "2026-08-24T09:00:00.000Z",
   updatedInWindow: true,
-  inWindow: { events: 1, logs: 1, notes: 0, commits: 0 },
+  inWindow: { events: 1, logs: 1, commits: 0 },
   has: { analysis: 500, plan: 500, summary: 500 },
   commitCount: 3,
-  openNotes: [],
   assigned: true,
   thresholds: STALE_AFTER_DAYS,
   ...over,
@@ -120,7 +119,7 @@ group("staleInStatus — the two ladders");
 
 group("silentEdit — updatedAt moved and nothing explains it");
 {
-  const quiet = { events: 0, logs: 0, notes: 0, commits: 0 };
+  const quiet = { events: 0, logs: 0, commits: 0 };
   eq("fires when the window turned up nothing at all",
      has(reviewFlags(facts({ updatedInWindow: true, inWindow: quiet })), "silentEdit"),
      true);
@@ -133,9 +132,6 @@ group("silentEdit — updatedAt moved and nothing explains it");
      false);
   eq("a linked commit explains it too (linking bumps updatedAt)",
      has(reviewFlags(facts({ updatedInWindow: true, inWindow: { ...quiet, commits: 1 } })), "silentEdit"),
-     false);
-  eq("a note explains it (so does editing one)",
-     has(reviewFlags(facts({ updatedInWindow: true, inWindow: { ...quiet, notes: 1 } })), "silentEdit"),
      false);
   eq("an untouched task is not a silent edit",
      has(reviewFlags(facts({ updatedInWindow: false, inWindow: quiet })), "silentEdit"),
@@ -202,48 +198,19 @@ group("placement — status and tray disagreeing");
      false);
 }
 
-/* --------------------------------- notes ------------------------------- */
-
-group("open notes — surfaced, never resolved");
-{
-  const f = reviewFlags(
-    facts({
-      openNotes: [
-        { id: "n1", type: "blocker" },
-        { id: "n2", type: "question" },
-        { id: "n3", type: "review" },
-        { id: "n4", type: "progress" },
-      ],
-    }),
-  );
-  eq("a blocker names its notes", f.find((x) => x.flag === "openBlocker"),
-     { flag: "openBlocker", noteIds: ["n1"] });
-  eq("so does a question", f.find((x) => x.flag === "openQuestion"),
-     { flag: "openQuestion", noteIds: ["n2"] });
-  eq("Ben's own review notes are surfaced too", f.find((x) => x.flag === "openReview"),
-     { flag: "openReview", noteIds: ["n3"] });
-  eq("a progress note is not a flag — it's a record, not a debt",
-     f.some((x) => x.flag.startsWith("open") && JSON.stringify(x).includes("n4")),
-     false);
-  eq("several blockers come back as one flag listing all of them",
-     reviewFlags(facts({ openNotes: [{ id: "a", type: "blocker" }, { id: "b", type: "blocker" }] }))
-       .find((x) => x.flag === "openBlocker"),
-     { flag: "openBlocker", noteIds: ["a", "b"] });
-}
-
 /* -------------------------------- ordering ----------------------------- */
 
 group("severity — what a truncated read must never drop");
 {
-  const blocked = reviewFlags(facts({ openNotes: [{ id: "n", type: "blocker" }] }));
+  const stale = reviewFlags(facts({ daysInStatus: 12 }));
   const tidy = reviewFlags(facts({ placement: "inbox" }));
-  eq("a blocked task outranks an untidy one",
-     reviewSeverity(blocked) > reviewSeverity(tidy), true);
+  eq("a task rotting in its status outranks a merely untidy one",
+     reviewSeverity(stale) > reviewSeverity(tidy), true);
   eq("a clean task scores zero", reviewSeverity(reviewFlags(facts())), 0);
   eq("`movedInWindow` alone is not a problem — it's context",
-     reviewSeverity(reviewFlags(facts({ inWindow: { events: 2, logs: 0, notes: 0, commits: 0 } }))), 0);
+     reviewSeverity(reviewFlags(facts({ inWindow: { events: 2, logs: 0, commits: 0 } }))), 0);
   eq("…but it is still reported",
-     has(reviewFlags(facts({ inWindow: { events: 2, logs: 0, notes: 0, commits: 0 } })), "movedInWindow"),
+     has(reviewFlags(facts({ inWindow: { events: 2, logs: 0, commits: 0 } })), "movedInWindow"),
      true);
   eq("flags arrive worst-first within a task",
      names(reviewFlags(facts({
@@ -251,15 +218,14 @@ group("severity — what a truncated read must never drop");
        daysInStatus: 9,
        has: { analysis: 0, plan: 0, summary: 0 },
        commitCount: 0,
-       openNotes: [{ id: "n", type: "blocker" }],
-       inWindow: { events: 0, logs: 0, notes: 0, commits: 0 },
+       inWindow: { events: 0, logs: 0, commits: 0 },
        updatedInWindow: false,
      })))[0],
-     "openBlocker");
+     "staleInStatus");
   const stalled = reviewFlags(facts({
     status: "building", daysInStatus: 12, commitCount: 0,
     has: { analysis: 0, plan: 0, summary: 0 },
-    inWindow: { events: 0, logs: 0, notes: 0, commits: 0 }, updatedInWindow: false,
+    inWindow: { events: 0, logs: 0, commits: 0 }, updatedInWindow: false,
   }));
   eq("a long-stalled unplanned build outranks a merely stale task",
      reviewSeverity(stalled) > reviewSeverity(reviewFlags(facts({ daysInStatus: 12 }))),
@@ -274,8 +240,7 @@ group("the contract — evidence, not recommendations");
     status: "building", placement: "inbox", daysInStatus: 30,
     hasEverLogged: false, assigned: false, commitCount: 0,
     has: { analysis: 0, plan: 0, summary: 0 },
-    inWindow: { events: 0, logs: 0, notes: 0, commits: 0 },
-    openNotes: [{ id: "n", type: "blocker" }],
+    inWindow: { events: 0, logs: 0, commits: 0 },
   }));
   eq("no flag carries an action, a recommendation or a suggested status",
      every.every((f) => {
@@ -284,10 +249,10 @@ group("the contract — evidence, not recommendations");
      }),
      true);
   eq("the worst possible task still only states facts",
-     names(every).length, 9);
+     names(every).length, 8);
   eq("a clean, quiet task produces no flags at all — an honest board says nothing",
      names(reviewFlags(facts({
-       inWindow: { events: 0, logs: 0, notes: 0, commits: 0 },
+       inWindow: { events: 0, logs: 0, commits: 0 },
        updatedInWindow: false,
      }))),
      []);
