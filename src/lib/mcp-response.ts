@@ -65,6 +65,18 @@ export const TRUNCATION_KEY = "_truncation";
 /** Ladder of per-string caps tried before any row is dropped. */
 const TEXT_LADDER = [4_000, 2_000, 1_000, 400, 200] as const;
 
+/**
+ * A string shorter than this is never trimmed, however low the ladder goes.
+ *
+ * Trimming is meant to reclaim the payload's bulk. Cutting a 250-char title to
+ * 200 saves fifty characters and costs the row its identity — the agent can no
+ * longer tell what it is holding, let alone re-read it. Cutting a 3,000-char
+ * summary in the same pass saves 2,800. So the floor is not a list of
+ * protected field names (the guard has no business knowing what a `title` is);
+ * it is the point below which the trade stops being worth making.
+ */
+const TEXT_TRIM_FLOOR = 400;
+
 /** Appended to a string this module shortened. */
 const TRIM_MARK = " …[truncated]";
 const PREVIEW_MARK = " …[trimmed]";
@@ -81,12 +93,13 @@ const MAX_AXIS_DEPTH = 2;
 /** Resolution of the keep-fraction search. */
 const K_GRID = 1024;
 
-/** Rough chars-per-token for the mixed JSON we actually emit — used only to
- *  size `preview` teasers, never to enforce the ceiling. */
-const MIXED_CHARS_PER_TOKEN = 2.5;
+/** Chars-per-token for teaser PROSE specifically, by the estimator's own
+ *  reckoning. Used only to size previews, never to enforce the ceiling. */
+const PROSE_CHARS_PER_TOKEN = 3;
 
-/** Share of the budget a digest may spend on teaser text. */
-const PREVIEW_SHARE = 0.35;
+/** Of the room left after the rest of the payload, how much teasers may take.
+ *  The rest is slack for the envelope and for the estimate being wrong. */
+const PREVIEW_SLACK = 0.8;
 const PREVIEW_FLOOR = 120;
 const PREVIEW_CEIL = 600;
 
@@ -180,7 +193,7 @@ export function trimText(
   const fields = new Set<string>();
   const walk = (v: unknown, path: string): unknown => {
     if (typeof v === "string") {
-      if (v.length <= max) return v;
+      if (v.length <= max || v.length < TEXT_TRIM_FLOOR) return v;
       fields.add(path || "(root)");
       return cutOnBoundary(v, max) + TRIM_MARK;
     }
@@ -443,26 +456,33 @@ export function preview(
 }
 
 /**
- * How many chars of teaser each row may have, given how many rows there are.
+ * How many chars of teaser each row may have.
  *
  * A fixed constant is wrong in both directions: too stingy on an eight-task
- * day, too greedy on a quarter-wide window. Spending the budget you actually
- * have turns a wide read from "truncated" into "complete but teased", which is
- * the outcome the ceiling alone can't reach. Still only a heuristic — the
- * ladder above remains the guarantee.
+ * day, too greedy on a quarter-wide window. But so is a fixed SHARE of the
+ * budget — how much room teasers actually have depends on what the rest of the
+ * payload weighs, and that varies with the ids, stints and moves each row
+ * carries. Guessing it put the first version 90% over, so `capped()` had to
+ * finish the job with its blunt rung and the teaser design never ran.
+ *
+ * So `overhead` is MEASURED by the caller — serialize the rows without their
+ * teasers and estimate that — and what's left over is what gets divided. The
+ * ladder in `capped()` remains the guarantee; this is what stops it from
+ * having to intervene.
  */
 export function previewBudget(
   rows: number,
   opts: {
+    /** Estimated tokens the payload costs WITHOUT any teaser text. */
+    overhead?: number;
     budget?: number;
-    share?: number;
     floor?: number;
     ceil?: number;
   } = {},
 ): number {
   const budget = Math.max(opts.budget ?? BUDGET_TOKENS, MIN_BUDGET_TOKENS);
-  const chars = budget * MIXED_CHARS_PER_TOKEN * (opts.share ?? PREVIEW_SHARE);
-  const per = Math.floor(chars / Math.max(rows, 1));
+  const room = Math.max(0, budget - (opts.overhead ?? 0)) * PREVIEW_SLACK;
+  const per = Math.floor((room * PROSE_CHARS_PER_TOKEN) / Math.max(rows, 1));
   return Math.max(
     opts.floor ?? PREVIEW_FLOOR,
     Math.min(opts.ceil ?? PREVIEW_CEIL, per),

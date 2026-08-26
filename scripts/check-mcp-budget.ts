@@ -226,15 +226,31 @@ group("the ladder — the rungs below");
 
 group("trimText");
 {
-  const { data, fields } = trimText({ a: "x".repeat(50), b: { c: "y" } }, 10);
-  eq("cuts the long one", (data as { a: string }).a.startsWith("xxxxxxxxxx"), true);
+  // Fixtures must clear TEXT_TRIM_FLOOR (400) to be trimmed at all.
+  const { data, fields } = trimText({ a: "x".repeat(900), b: { c: "y" } }, 100);
+  eq("cuts the long one", (data as { a: string }).a.length < 200, true);
   eq("marks it", (data as { a: string }).a.includes("truncated"), true);
   eq("leaves the short one", (data as { b: { c: string } }).b.c, "y");
   eq("names the cut field", fields, ["a"]);
   eq(
     "array elements collapse to one path, not one per index",
-    trimText({ xs: [{ s: "x".repeat(50) }, { s: "y".repeat(50) }] }, 10).fields,
+    trimText({ xs: [{ s: "x".repeat(900) }, { s: "y".repeat(900) }] }, 100).fields,
     ["xs.s"],
+  );
+
+  // A title is identity. Cutting 250 chars to 200 saves nothing worth having
+  // and leaves the agent unable to say what it is holding — so the floor
+  // stops the trade being made at all, without the guard needing to know
+  // which field is a title.
+  const mixed = { title: "t".repeat(250), summary: "s".repeat(3_000) };
+  const r = trimText(mixed, 200);
+  eq("a short-ish field is left whole below the floor", (r.data as typeof mixed).title.length, 250);
+  eq("…while the field actually carrying the bulk is cut", (r.data as typeof mixed).summary.length < 250, true);
+  eq("…and only that one is reported", r.fields, ["summary"]);
+  eq(
+    "the floor applies however low the ladder goes",
+    (trimText(mixed, 10).data as typeof mixed).title.length,
+    250,
   );
 }
 
@@ -258,17 +274,86 @@ group("preview — the digest teaser");
   eq("marks that there is more", (long ?? "").endsWith("…[trimmed]"), true);
 }
 
-group("previewBudget — spend the budget you have");
+group("previewBudget — measured, not guessed");
 {
   eq("a quiet day gets the ceiling", previewBudget(8), 600);
   eq("a wide window gets the floor", previewBudget(500), 120);
-  eq(
-    "a busy day lands in between",
-    previewBudget(42) > 120 && previewBudget(42) < 600,
-    true,
-  );
   eq("more rows never means more text each", previewBudget(100) <= previewBudget(20), true);
   eq("zero rows doesn't divide by zero", Number.isFinite(previewBudget(0)), true);
+
+  // The fix: what's left for teasers depends on what the REST of the payload
+  // weighs. Guessing that as a fixed share put the first version 90% over, so
+  // `capped()` finished the job with its blunt rung and clipped titles too.
+  eq(
+    "a heavy payload leaves less room per row",
+    previewBudget(42, { overhead: 18_000 }) < previewBudget(42, { overhead: 2_000 }),
+    true,
+  );
+  eq(
+    "overhead at the budget leaves only the floor",
+    previewBudget(42, { overhead: BUDGET_TOKENS }),
+    120,
+  );
+  eq(
+    "…and never goes negative",
+    previewBudget(42, { overhead: BUDGET_TOKENS * 10 }),
+    120,
+  );
+
+  // The property that matters: a digest sized this way must not need capped()
+  // to intervene. 49 rows is the real 2026-08-24 day, and the row shape below
+  // is the real compact projection — ids, timestamps, stints and moves — not
+  // a toy, because it is exactly that weight the teaser has to be sized around.
+  const uuid = (n: number) => `2b5911c1-501e-468c-b18d-6b89a8bd4b${String(n).padStart(3, "0")}`;
+  const digestRow = (i: number, withSummary: boolean) => ({
+    id: uuid(i),
+    code: `RACI-${150 + i}`,
+    ref: `RACI-${150 + i}`,
+    title: "Bots: drift as a cornering mode in the speed model, not decoration",
+    status: "done",
+    statusSince: "2026-08-24T19:02:23.586Z",
+    assigneeIds: [uuid(900)],
+    boardId: uuid(800),
+    projectId: uuid(700),
+    importance: 0,
+    completedAt: "2026-08-24T19:02:23.586Z",
+    archivedAt: "2026-08-25T07:51:47.352Z",
+    ...(withSummary ? { summary: PROSE.repeat(20) } : {}),
+    stints: [{ status: "building", from: "2026-08-24T12:28:40.570Z", to: "2026-08-24T12:48:06.082Z", minutes: 19 }],
+    moves: [
+      { to: "building", at: "2026-08-24T12:28:40.570Z" },
+      { to: "review", at: "2026-08-24T12:48:06.082Z" },
+      { to: "done", at: "2026-08-24T19:02:23.586Z" },
+    ],
+  });
+  const many = (n: number, ws: boolean) => Array.from({ length: n }, (_, i) => digestRow(i, ws));
+  const bareReal = { from: "2026-08-24", to: "2026-08-24", credited: uuid(900), shipped: many(42, false), worked: many(7, false) };
+  const teaserReal = previewBudget(49, { overhead: estimateTokens(serialize(bareReal)) });
+  const teasedReal = {
+    ...bareReal,
+    shipped: many(42, true).map((r) => ({ ...r, summary: preview(r.summary!, teaserReal) })),
+    worked: many(7, true).map((r) => ({ ...r, summary: preview(r.summary!, teaserReal) })),
+  };
+  const real = cappedDetailed(teasedReal, { narrow: ["from", "to", "credited"] });
+  eq(`a REAL-shaped 49-row day needs no intervention (teaser ${teaserReal})`, real.truncation, undefined);
+  // NOT "bigger than the 200 it used to get" — measuring showed ~187 is simply
+  // what fits once real ids, stints and moves are paid for. The win is that the
+  // number is derived rather than guessed, that `preview` does the cutting (so
+  // headings are stripped and the marker is honest), and that titles survive.
+  eq("…and every row keeps its title intact", 
+     JSON.parse(real.text).shipped.every((r: { title: string }) => !r.title.includes("truncated")), true);
+  eq("…and summaries carry the preview marker, not the blunt one",
+     JSON.parse(real.text).shipped[0].summary.endsWith("…[trimmed]"), true);
+
+  const bare = { shipped: rows(42, 0), worked: rows(7, 0) };
+  const overhead = estimateTokens(serialize(bare));
+  const teaser = previewBudget(49, { overhead });
+  const teased = {
+    shipped: rows(42).map((r) => ({ ...r, summary: preview(r.summary, teaser) })),
+    worked: rows(7).map((r) => ({ ...r, summary: preview(r.summary, teaser) })),
+  };
+  const { truncation } = cappedDetailed(teased);
+  eq(`a real-sized day needs no intervention (teaser ${teaser})`, truncation, undefined);
 }
 
 group("the invariant — fuzz");

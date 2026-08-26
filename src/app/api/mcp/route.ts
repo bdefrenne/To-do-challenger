@@ -85,8 +85,10 @@ import { WORKFLOW, DAY_CLOSE, BOARD_CLEANUP } from "@/lib/workflow";
 import { langSuffix, titleHeader } from "@/lib/prompts";
 import {
   capped,
+  estimateTokens,
   preview,
   previewBudget,
+  serialize,
   type CapOpts,
 } from "@/lib/mcp-response";
 
@@ -307,11 +309,25 @@ function projectTask(t: TaskDTO, detail: TaskDetail): TaskDTO {
  * gives the full write-up for the one or two worth opening. Shared by
  * `standup` and `work_day` so the two can't drift.
  */
-const digestTask = (t: TaskDTO, teaser: number): TaskDTO =>
+const digestTask = (t: TaskDTO, teaser: number | null): TaskDTO =>
   ({
     ...projectTask(t, "compact"),
-    ...(t.summary ? { summary: preview(t.summary, teaser) } : {}),
+    ...(t.summary && teaser !== null
+      ? { summary: preview(t.summary, teaser) }
+      : {}),
   }) as TaskDTO;
+
+/**
+ * Size the teasers by WEIGHING the payload without them.
+ *
+ * `build(null)` is the same response with every summary omitted, so estimating
+ * it gives the real overhead — ids, stints, moves and all — instead of a guess
+ * at what fraction of the budget the rest might take. Guessing that fraction
+ * is what left `capped()` doing the final cut with its blunt rung, which then
+ * clipped titles as well as summaries.
+ */
+const withTeasers = <T,>(build: (teaser: number | null) => T, rows: number): T =>
+  build(previewBudget(rows, { overhead: estimateTokens(serialize(build(null))) }));
 
 /** Rows a digest is about to render — what the teaser budget is divided by. */
 const digestRows = (d: {
@@ -710,21 +726,20 @@ const handler = createMcpHandler(
           to,
           credited: who,
         });
-        const teaser = previewBudget(digestRows(digest));
-        const entry = (e: {
-          task: TaskDTO;
-          stints: unknown[];
-          moves: unknown[];
-        }) => ({
-          ...digestTask(e.task, teaser),
-          // `stints` = time actively working (analyzing/building only).
-          // `moves` = every credited transition, so "handed the analysis over"
-          // is visible even though it has no work time of its own.
-          stints: e.stints,
-          moves: e.moves,
-        });
-        return text(
-          {
+        const build = (teaser: number | null) => {
+          const entry = (e: {
+            task: TaskDTO;
+            stints: unknown[];
+            moves: unknown[];
+          }) => ({
+            ...digestTask(e.task, teaser),
+            // `stints` = time actively working (analyzing/building only).
+            // `moves` = every credited transition, so "handed the analysis
+            // over" is visible even though it has no work time of its own.
+            stints: e.stints,
+            moves: e.moves,
+          });
+          return {
             from,
             to,
             credited: who === null ? "team" : who,
@@ -736,9 +751,11 @@ const handler = createMcpHandler(
               ...projectTask(c.task, "compact"),
               closedBy: c.closedBy,
             })),
-          },
-          { narrow: ["from", "to", "credited"] },
-        );
+          };
+        };
+        return text(withTeasers(build, digestRows(digest)), {
+          narrow: ["from", "to", "credited"],
+        });
       },
     );
 
@@ -769,8 +786,7 @@ const handler = createMcpHandler(
       },
       async ({ projectId, day, tz }) => {
         const review = await workDayReview(currentUser(), projectId, day, tz);
-        return text(
-          {
+        const build = (teaser: number | null) => ({
             day: review.day,
             ...(review.openDays.length ? { openDays: review.openDays } : {}),
             ...(review.digest.attribution
@@ -778,7 +794,7 @@ const handler = createMcpHandler(
               : {}),
             candidates: review.candidates.map((t) => projectTask(t, "compact")),
             shipped: review.digest.shipped.map((e) =>
-              digestTask(e.task, previewBudget(digestRows(review.digest))),
+              digestTask(e.task, teaser),
             ),
             handled: review.digest.handled.map((e) =>
               projectTask(e.task, "compact"),
@@ -801,9 +817,10 @@ const handler = createMcpHandler(
                   },
                 }
               : {}),
-          },
-          { narrow: ["projectId", "day"] },
-        );
+        });
+        return text(withTeasers(build, digestRows(review.digest)), {
+          narrow: ["projectId", "day"],
+        });
       },
     );
 
