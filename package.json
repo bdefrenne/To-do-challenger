@@ -29,6 +29,7 @@
     "check:parent-done": "tsx scripts/check-parent-done.ts",
     "check:day": "tsx scripts/check-work-days.ts",
     "check:outline": "tsx scripts/check-outline.ts",
+    "check:budget": "tsx scripts/check-mcp-budget.ts",
     "repair:week-pins": "tsx scripts/repair-week-pins.ts",
     "user:create": "tsx scripts/create-user.ts",
     "team:create": "tsx scripts/create-team.ts",

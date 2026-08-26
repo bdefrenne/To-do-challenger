@@ -80,8 +80,11 @@ and by activity window: \`statusChangedFrom\`/\`To\` (what moved),
 window. \`actor\` narrows to who actually *did* the work (the activity log) —
 that, not \`assignee\`, is what "what did I do today" means. Reach for
 \`detail: "full"\` only when you truly need the working fields. A read that
-still doesn't fit comes back \`truncated\` with the filters that would narrow
-it: use them rather than re-running the same wide call.
+still doesn't fit comes back with a \`_truncation\` block naming what it had to
+drop — \`cut\` lists the fields that lost rows, \`truncatedFields\` the ones whose
+text was shortened — and the filters that would narrow it. Use those rather than
+re-running the same wide call. A read that reports \`response_too_large\` returned
+nothing at all: narrow it before trying again.
 
 The steps below are **composable** — not every task needs every one. Depending
 on what's asked, you might do just the analysis, just the technical plan

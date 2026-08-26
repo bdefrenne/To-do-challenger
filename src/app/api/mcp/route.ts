@@ -83,7 +83,12 @@ import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
 import { WORKFLOW, DAY_CLOSE, BOARD_CLEANUP } from "@/lib/workflow";
 import { langSuffix, titleHeader } from "@/lib/prompts";
-import { capped, type CapOpts } from "@/lib/mcp-response";
+import {
+  capped,
+  preview,
+  previewBudget,
+  type CapOpts,
+} from "@/lib/mcp-response";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -292,6 +297,34 @@ function projectTask(t: TaskDTO, detail: TaskDetail): TaskDTO {
   return out;
 }
 
+/**
+ * A task as a digest reports it: compact, plus a TEASER of what shipped.
+ *
+ * A digest wants "what shipped", which is the `summary` — but these run to
+ * 2,000+ chars of release notes each, and forty of them is the whole response
+ * budget before a single title. A teaser sized to the number of rows keeps
+ * every task in the list, which is what a standup is for; `get_task` by `code`
+ * gives the full write-up for the one or two worth opening. Shared by
+ * `standup` and `work_day` so the two can't drift.
+ */
+const digestTask = (t: TaskDTO, teaser: number): TaskDTO =>
+  ({
+    ...projectTask(t, "compact"),
+    ...(t.summary ? { summary: preview(t.summary, teaser) } : {}),
+  }) as TaskDTO;
+
+/** Rows a digest is about to render — what the teaser budget is divided by. */
+const digestRows = (d: {
+  shipped: unknown[];
+  handled: unknown[];
+  worked: unknown[];
+  closedUnattributed: unknown[];
+}): number =>
+  d.shipped.length +
+  d.handled.length +
+  d.worked.length +
+  d.closedUnattributed.length;
+
 /** An image content block (base64) — how an AI actually "sees" an attachment. */
 const image = (data: string, mimeType: string) => ({
   content: [{ type: "image" as const, data, mimeType }],
@@ -301,10 +334,11 @@ const image = (data: string, mimeType: string) => ({
 const md = (uri: string, body: string) => ({
   contents: [{ uri, mimeType: "text/markdown", text: body }],
 });
-const json = (uri: string, data: unknown) => ({
-  contents: [
-    { uri, mimeType: "application/json", text: JSON.stringify(data, null, 2) },
-  ],
+/* Resources go through the budget too. `todo://task/{id}` returns exactly what
+   `get_task` does, and a whole-board read grows with the board — neither is
+   any smaller for being fetched as a resource. */
+const json = (uri: string, data: unknown, opts?: CapOpts) => ({
+  contents: [{ uri, mimeType: "application/json", text: capped(data, opts) }],
 });
 /** A prompt result: a single pre-filled user message. */
 const userMsg = (body: string) => ({
@@ -317,7 +351,11 @@ const userMsg = (body: string) => ({
  *  every slash-command prompt respects the caller's language setting. */
 const promptMsg = async (body: string) => {
   const u = await getUserById(currentUser());
-  return userMsg(body + langSuffix(u?.language));
+  /* Capped like a tool result: these bodies embed whole task records and whole
+     activity digests, and a prompt that overflows the context window fails the
+     same way a tool result does. `capped` on a string cuts on a boundary and
+     says what it dropped, so a long prompt degrades instead of breaking. */
+  return userMsg(capped(body + langSuffix(u?.language)));
 };
 
 const handler = createMcpHandler(
@@ -647,7 +685,9 @@ const handler = createMcpHandler(
         "\n" +
         "Work is attributed to WHOSE WORK IT IS, recorded when each status change happened: the assignee when a card was moved in the web UI (moving a card is scheduling, not doing), the actor on agent surfaces. So a task someone else closed on your behalf is NOT yours, and one you built but someone else closed still is. Defaults to you; pass `credited` for a teammate or `\"team\"` for everyone.\n" +
         "\n" +
-        "Four disjoint lists: `shipped` (reached done, and you worked a stage on it), `handled` (reached done with no working stage — non-code work taken straight to done; say \"handled\", never \"built\"), `worked` (still in flight, with the stage stints you did), and `closedUnattributed` (reached done with nobody creditable — `closedBy` says who pressed the button, which is on the record but is NOT their work). An `attribution` field, when present, means the window predates the record — treat it as missing data, not an empty day.",
+        "Four disjoint lists: `shipped` (reached done, and you worked a stage on it), `handled` (reached done with no working stage — non-code work taken straight to done; say \"handled\", never \"built\"), `worked` (still in flight, with the stage stints you did), and `closedUnattributed` (reached done with nobody creditable — `closedBy` says who pressed the button, which is on the record but is NOT their work). An `attribution` field, when present, means the window predates the record — treat it as missing data, not an empty day.\n" +
+        "\n" +
+        "`summary` is a TEASER, not the write-up: it is sized to how many tasks the window holds, and one ending `…[trimmed]` has more behind it — `get_task` its `code` for the full text. Quote it as what shipped, never as the whole record.",
       {
         from: z.string().min(1).max(40).describe("start of window (inclusive)"),
         to: z.string().min(1).max(40).describe("end of window (inclusive)"),
@@ -670,16 +710,13 @@ const handler = createMcpHandler(
           to,
           credited: who,
         });
-        // A digest wants "what shipped", which is the `summary`. Carrying each
-        // task's plan + analysis + description as well multiplies the payload
-        // several times over for material nobody reads here.
+        const teaser = previewBudget(digestRows(digest));
         const entry = (e: {
           task: TaskDTO;
           stints: unknown[];
           moves: unknown[];
         }) => ({
-          ...projectTask(e.task, "compact"),
-          summary: e.task.summary,
+          ...digestTask(e.task, teaser),
           // `stints` = time actively working (analyzing/building only).
           // `moves` = every credited transition, so "handed the analysis over"
           // is visible even though it has no work time of its own.
@@ -700,12 +737,7 @@ const handler = createMcpHandler(
               closedBy: c.closedBy,
             })),
           },
-          {
-            // Shipped tasks carry their full summaries, so a wide window is the
-            // one read that reliably runs long. Cut those first.
-            items: "shipped",
-            narrow: ["from", "to", "credited"],
-          },
+          { narrow: ["from", "to", "credited"] },
         );
       },
     );
@@ -718,7 +750,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "work_day",
-      "Everything the end-of-day close-out needs for one project on one working day, in one read: `day` (the row, with `sealed`), `digest` (what you did — same four disjoint lists as `standup`), `candidates` (tasks you actually touched that day and left in a late work status — the \"which of these finished?\" list, PROPOSALS only), and `drift` when a morning snapshot exists (`plannedNotDone`, and `doneNotPlanned` — the day's real interruptions).\n" +
+      "Everything the end-of-day close-out needs for one project on one working day, in one read: `day` (the row, with `sealed`), `digest` (what you did — same four disjoint lists as `standup`, with `summary` a teaser sized to the day: one ending `…[trimmed]` has more behind it, so `get_task` its `code` before quoting it whole), `candidates` (tasks you actually touched that day and left in a late work status — the \"which of these finished?\" list, PROPOSALS only), and `drift` when a morning snapshot exists (`plannedNotDone`, and `doneNotPlanned` — the day's real interruptions).\n" +
         "\n" +
         "`openDays` lists EARLIER working days with the person's work on them that were never closed out. Raise those before writing today's standup — an unclosed day is work missing from the record, and nothing else surfaces it.\n" +
         "\n" +
@@ -745,10 +777,9 @@ const handler = createMcpHandler(
               ? { attribution: review.digest.attribution }
               : {}),
             candidates: review.candidates.map((t) => projectTask(t, "compact")),
-            shipped: review.digest.shipped.map((e) => ({
-              ...projectTask(e.task, "compact"),
-              summary: e.task.summary,
-            })),
+            shipped: review.digest.shipped.map((e) =>
+              digestTask(e.task, previewBudget(digestRows(review.digest))),
+            ),
             handled: review.digest.handled.map((e) =>
               projectTask(e.task, "compact"),
             ),
@@ -771,7 +802,7 @@ const handler = createMcpHandler(
                 }
               : {}),
           },
-          { items: "shipped", narrow: ["projectId", "day"] },
+          { narrow: ["projectId", "day"] },
         );
       },
     );

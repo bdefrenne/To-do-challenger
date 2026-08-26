@@ -105,6 +105,22 @@ const STRIP: [RegExp, string][] = [
  * `truncated` reports whether anything was actually cut, so a caller can decide
  * whether there's more to show rather than guessing from the length.
  */
+/**
+ * Cut `s` to at most `max` chars on the last space in range, so a teaser never
+ * ends mid-word. A single very long token takes the hard cut — a broken word
+ * beats a column that wraps forever. Shared with the MCP response budget
+ * (`@/lib/mcp-response`), so "don't end mid-word" means one thing everywhere.
+ */
+export function cutOnBoundary(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  return (space > max * 0.6 ? cut.slice(0, space) : cut).replace(
+    /[\s·,;:.\-—]+$/,
+    "",
+  );
+}
+
 export function previewOf(
   markdown: string | null | undefined,
   max = 180,
@@ -122,14 +138,5 @@ export function previewOf(
 
   if (flat.length <= max) return { preview: flat, truncated: false };
 
-  /* Cut on the last space in range so the teaser never ends mid-word. If there
-     isn't one — a single very long token — take the hard cut; a wrapped-forever
-     column is worse than a broken word. */
-  const cut = flat.slice(0, max);
-  const space = cut.lastIndexOf(" ");
-  const kept = (space > max * 0.6 ? cut.slice(0, space) : cut).replace(
-    /[\s·,;:.]+$/,
-    "",
-  );
-  return { preview: `${kept}…`, truncated: true };
+  return { preview: `${cutOnBoundary(flat, max)}…`, truncated: true };
 }
