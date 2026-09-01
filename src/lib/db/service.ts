@@ -8,7 +8,7 @@
   ====================================================================
 */
 
-import { and, asc, desc, eq, getTableColumns, ilike, inArray, isNotNull, isNull, ne, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, ilike, inArray, isNotNull, isNull, ne, notInArray, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import { del } from "@vercel/blob";
 import { blobAuth } from "@/lib/blob";
 import { previewOf } from "@/lib/format";
@@ -16,6 +16,7 @@ import { db } from "./client";
 import {
   tasks,
   taskLogs,
+  mcpCalls,
   taskStatusEvents,
   taskAttachments,
   taskCommits,
@@ -5987,4 +5988,259 @@ function taskLines(
   if (t.description) lines.push(`${pad}  ${t.description}`);
   for (const s of t.subtasks ?? []) lines.push(...taskLines(s, depth + 1, names));
   return lines;
+}
+
+/* ====================================================================
+   THE ACTIVITY FEED (TD2-211)
+
+   "What has everyone been doing" is TWO questions the system answers from two
+   different tables, and merging them is the whole point of this section:
+
+     • `task_logs`    — what CHANGED. Every surface writes here (ui, api, mcp,
+                        telegram), so a human dragging a card and an agent
+                        moving one both show up.
+     • `mcp_calls`    — what was ASKED. Only agents reach this table, and it is
+                        the only record of the reads (`list_tasks`, `get_task`,
+                        `standup`, `board_review`) that make up most of what an
+                        agent does and change nothing.
+
+   Neither alone answers the question. A feed of task_logs makes an agent that
+   read the board forty times look idle; a feed of mcp_calls doesn't know a
+   human exists.
+
+   Visibility: instance-wide, like every other read here — tasks and projects
+   are team-visible and `project_members` is a curation layer for the assignee
+   picker, not a fence (see `taskWhere`). `userId` is accepted and ignored, the
+   same convention the rest of this file uses, so a fence added later has one
+   obvious place to go.
+   ==================================================================== */
+
+/** One entry in the merged feed. `kind` is the discriminator: a `task` entry
+ *  came from the activity log, a `call` entry from the MCP call log. */
+export type FeedEntry =
+  | {
+      kind: "task";
+      id: string;
+      at: string;
+      actorId?: string;
+      /** Legacy display label ("You", "Claude") for rows predating actorId. */
+      author?: string;
+      source?: LogSource;
+      /** The activity kind: created | status | moved | comment | updated | … */
+      action: TaskLogEntry["kind"];
+      message: string;
+      taskId: string;
+      taskTitle: string;
+      taskCode?: string;
+      projectId?: string;
+      boardId?: string;
+    }
+  | {
+      kind: "call";
+      id: string;
+      at: string;
+      actorId?: string;
+      source?: LogSource;
+      /** tool | prompt | resource. */
+      action: string;
+      /** The tool name — "list_tasks", "update_task", … */
+      name: string;
+      args?: unknown;
+      ok: boolean;
+      error?: string;
+      durationMs: number;
+      resultBytes?: number;
+    };
+
+export interface FeedOptions {
+  from?: string;
+  to?: string;
+  tz?: string;
+  /** Only this user's actions (a user id — resolve names before calling). */
+  actor?: string;
+  /** Which surfaces to include. Applies to both streams. */
+  sources?: LogSource[];
+  /** Which streams to include. Default: both. */
+  streams?: ("task" | "call")[];
+  /** Hide the calls that changed nothing — the read-only noise floor. */
+  writesOnly?: boolean;
+  /** Substring match on the message (task stream) or tool name (call stream). */
+  text?: string;
+  limit?: number;
+}
+
+/** Rows per stream before the merge. Each stream is fetched at the full limit
+ *  and the merge trims, because either one can legitimately be the whole page:
+ *  an agent session is all calls, a busy morning on the web UI is all logs. */
+const FEED_MAX = 500;
+
+/**
+ * The merged activity feed, newest first.
+ *
+ * Both streams are read for the same window and interleaved by timestamp. The
+ * cost of that is honest and worth stating: the returned page is the newest
+ * `limit` entries of the UNION, so paging past it means narrowing the window,
+ * not an offset — an offset over two independently-limited queries would skip
+ * rows silently, which is exactly the failure mode a log must not have.
+ */
+export async function activityFeed(
+  _userId: string,
+  opts: FeedOptions = {},
+): Promise<FeedEntry[]> {
+  const limit = Math.min(opts.limit ?? 200, FEED_MAX);
+  const w = dateWindow(opts.from, opts.to, opts.tz ?? APP_TIMEZONE);
+  const streams = opts.streams ?? ["task", "call"];
+  const wantTask = streams.includes("task");
+  const wantCall = streams.includes("call");
+
+  const [logRows, callRows] = await Promise.all([
+    wantTask
+      ? db
+          .select({
+            id: taskLogs.id,
+            at: taskLogs.at,
+            kind: taskLogs.kind,
+            message: taskLogs.message,
+            author: taskLogs.author,
+            actorId: taskLogs.actorId,
+            source: taskLogs.source,
+            taskId: taskLogs.taskId,
+            taskTitle: tasks.title,
+            taskRef: tasks.ref,
+            projectId: tasks.projectId,
+            boardId: tasks.boardId,
+          })
+          .from(taskLogs)
+          // Builds its own WHERE on a table joined to `tasks`, so it applies the
+          // soft-delete fence itself — `taskWhere` doesn't reach here.
+          .innerJoin(tasks, eq(tasks.id, taskLogs.taskId))
+          .where(
+            and(
+              isNull(tasks.deletedAt),
+              ...inWindow(taskLogs.at, w),
+              ...(opts.actor ? [eq(taskLogs.actorId, opts.actor)] : []),
+              ...(opts.sources?.length
+                ? [inArray(taskLogs.source, opts.sources)]
+                : []),
+              ...(opts.text
+                ? [ilike(taskLogs.message, `%${opts.text}%`)]
+                : []),
+            ),
+          )
+          .orderBy(desc(taskLogs.at))
+          .limit(limit)
+      : Promise.resolve([]),
+    wantCall
+      ? db
+          .select()
+          .from(mcpCalls)
+          .where(
+            and(
+              ...inWindow(mcpCalls.at, w),
+              ...(opts.actor ? [eq(mcpCalls.userId, opts.actor)] : []),
+              ...(opts.sources?.length
+                ? [inArray(mcpCalls.surface, opts.sources)]
+                : []),
+              ...(opts.text ? [ilike(mcpCalls.name, `%${opts.text}%`)] : []),
+              // The read-only tools are the noise floor: they're most of the
+              // rows and none of the changes.
+              ...(opts.writesOnly
+                ? [notInArray(mcpCalls.name, [...READ_ONLY_TOOLS])]
+                : []),
+            ),
+          )
+          .orderBy(desc(mcpCalls.at))
+          .limit(limit)
+      : Promise.resolve([]),
+  ]);
+
+  const entries: FeedEntry[] = [
+    ...logRows.map(
+      (l): FeedEntry => ({
+        kind: "task",
+        id: l.id,
+        at: iso(l.at)!,
+        actorId: l.actorId ?? undefined,
+        author: l.author ?? undefined,
+        source: l.source ?? undefined,
+        action: l.kind,
+        message: l.message,
+        taskId: l.taskId,
+        taskTitle: l.taskTitle,
+        taskCode: l.taskRef ?? undefined,
+        projectId: l.projectId ?? undefined,
+        boardId: l.boardId ?? undefined,
+      }),
+    ),
+    ...callRows.map(
+      (c): FeedEntry => ({
+        kind: "call",
+        id: c.id,
+        at: iso(c.at)!,
+        actorId: c.userId ?? undefined,
+        source: c.surface,
+        action: c.kind,
+        name: c.name,
+        args: c.args ?? undefined,
+        ok: c.ok,
+        error: c.error ?? undefined,
+        durationMs: c.durationMs,
+        resultBytes: c.resultBytes ?? undefined,
+      }),
+    ),
+  ];
+  entries.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+  return entries.slice(0, limit);
+}
+
+/** The MCP tools that only READ. Named here rather than derived, because
+ *  "does this tool change anything" is a property of the tool's contract, not
+ *  something the call log can infer from a row. */
+const READ_ONLY_TOOLS = [
+  "list_tasks",
+  "get_task",
+  "search_tasks",
+  "list_projects",
+  "list_users",
+  "standup",
+  "board_review",
+  "get_canvas",
+  "list_canvases",
+  "get_attachment",
+  "list_calendar_events",
+  "list_calendars",
+  "ready_for_day",
+  "work_day",
+] as const;
+
+/** Per-user, per-tool counts for a window — the "who is hammering what" summary
+ *  above the feed. Cheap enough to run beside it (one grouped scan). */
+export async function mcpCallStats(
+  _userId: string,
+  opts: { from?: string; to?: string; tz?: string } = {},
+): Promise<
+  {
+    userId: string | null;
+    name: string;
+    calls: number;
+    failures: number;
+    avgMs: number;
+    totalBytes: number;
+  }[]
+> {
+  const w = dateWindow(opts.from, opts.to, opts.tz ?? APP_TIMEZONE);
+  const rows = await db
+    .select({
+      userId: mcpCalls.userId,
+      name: mcpCalls.name,
+      calls: sql<number>`count(*)::int`,
+      failures: sql<number>`count(*) filter (where not ${mcpCalls.ok})::int`,
+      avgMs: sql<number>`coalesce(avg(${mcpCalls.durationMs}), 0)::int`,
+      totalBytes: sql<number>`coalesce(sum(${mcpCalls.resultBytes}), 0)::int`,
+    })
+    .from(mcpCalls)
+    .where(and(...inWindow(mcpCalls.at, w)))
+    .groupBy(mcpCalls.userId, mcpCalls.name)
+    .orderBy(desc(sql`count(*)`));
+  return rows;
 }

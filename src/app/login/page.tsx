@@ -1,8 +1,93 @@
 "use client";
 
 import { Check } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { Avatar } from "@/components/ui/Badge";
+
+interface DevUser {
+  id: string;
+  name: string;
+  email: string;
+  color: string;
+  avatarUrl: string | null;
+}
+
+/*
+  Development sign-in (TD2-212). There is NO client-side flag guarding this:
+  it asks the server for the roster, and a fenced server answers 404, so this
+  block renders nothing. The gate lives in devLoginEnabled() and only there —
+  a NEXT_PUBLIC_ mirror could disagree with it, and would fail open.
+*/
+function DevSignIn() {
+  const router = useRouter();
+  const [users, setUsers] = useState<DevUser[] | null>(null);
+  const [database, setDatabase] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    fetch("/api/dev/login")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!live || !d) return;
+        setUsers(d.users ?? []);
+        setDatabase(d.database ?? null);
+      })
+      .catch(() => {
+        /* fenced, or offline — the block simply doesn't appear */
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (!users?.length) return null;
+
+  async function signInAs(u: DevUser) {
+    setBusy(u.id);
+    try {
+      const res = await fetch("/api/dev/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id }),
+      });
+      if (!res.ok) return;
+      router.push("/");
+      router.refresh();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border border-dashed border-border bg-surface p-4">
+      <div className="mb-1 text-xs font-medium text-muted">Development sign-in</div>
+      {database && (
+        <div className="mb-3 text-[11px] text-faint">
+          <span className="font-semibold text-amber-600">LIVE DATA</span> · {database}
+        </div>
+      )}
+      <div className="flex flex-col gap-1">
+        {users.map((u) => (
+          <button
+            key={u.id}
+            type="button"
+            onClick={() => signInAs(u)}
+            disabled={busy !== null}
+            className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-surface-2 disabled:opacity-50"
+          >
+            <Avatar name={u.name} size={24} imageUrl={u.avatarUrl} color={u.color} />
+            <span className="min-w-0">
+              <span className="block truncate text-sm text-fg">{u.name}</span>
+              <span className="block truncate text-[11px] text-faint">{u.email}</span>
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -88,6 +173,8 @@ export default function LoginPage() {
             {busy ? "Signing in…" : "Sign in"}
           </button>
         </form>
+
+        <DevSignIn />
       </div>
     </div>
   );

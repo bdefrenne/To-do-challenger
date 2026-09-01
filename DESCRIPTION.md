@@ -79,6 +79,14 @@ edit and a human edit go through the exact same door.
   row stays read-only for the moment that takes, so you inherit its current text
   rather than typing over a snapshot, and it tells you if the line moved while
   you waited.
+- **An activity page that includes what the AI did.** `/activity` is one
+  chronological feed of every task change from every surface, interleaved with
+  every MCP call an agent made — including the *reads* (`list_tasks`,
+  `board_review`, …), which change nothing and so leave no trace in the activity
+  log at all. Each call carries its arguments, whether it succeeded, how long it
+  took and how much it returned, so "what has Claude been doing on my board" is
+  a question the board can actually answer. Logged at a single chokepoint, so a
+  tool added later is recorded without anyone remembering to.
 - **Integrations:** Vercel Blob (pictures), Google Calendar, a Telegram bot.
 
 ## Constraints

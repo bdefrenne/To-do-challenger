@@ -20,6 +20,7 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { requireUser, AuthError } from "@/lib/auth";
 import { withLogContext } from "@/lib/db/log-context";
+import { recordMcpCall } from "@/lib/db/mcp-log";
 import {
   ConflictError,
   bulkOpSchema,
@@ -374,8 +375,107 @@ const promptMsg = async (body: string) => {
   return userMsg(capped(body + langSuffix(u?.language)));
 };
 
+
+/*
+  CALL LOGGING (TD2-211) — one wrapper, applied once, so every tool is recorded
+  whether or not its author thought about it.
+
+  This monkey-patches `server.tool` / `server.prompt` before any registration
+  runs, wrapping each callback with timing + a `recordMcpCall`. It is
+  deliberately NOT a line added to all ~50 tool bodies: the thing that makes a
+  call log worth reading is that nothing is missing from it, and a per-call-site
+  convention is missing the moment someone adds tool 51. Here, a new tool is
+  logged because it is a tool.
+
+  What this catches that `task_logs` cannot: reads. `list_tasks`, `get_task`,
+  `standup` and `board_review` change nothing, so they leave no activity row —
+  yet they are most of what an agent actually does.
+
+  The callback is always the LAST argument across every `tool()` overload
+  (name, [description], [schema], cb), which is what lets one wrapper cover them
+  all without knowing which overload a call site used.
+*/
+type AnyFn = (...args: unknown[]) => unknown;
+
+/** The acting user, or null outside a request — the log must not throw where
+ *  `currentUser()` would. */
+const currentUserOrNull = (): string | null => userStore.getStore() ?? null;
+
+/** Rough size of what we handed back — the input to "which read is expensive".
+ *  Never throws: a result we can't serialize just has no size. */
+function sizeOf(result: unknown): number | undefined {
+  try {
+    const s = JSON.stringify(result);
+    return typeof s === "string" ? s.length : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Wrap one registration callback so the invocation is recorded either way. */
+function logged(kind: string, name: string, cb: AnyFn): AnyFn {
+  return async (...args: unknown[]) => {
+    const started = Date.now();
+    // The first arg is the parsed arguments object for tools/prompts that take
+    // one; for a no-arg tool it's the request extra, which we don't store.
+    const raw = args[0];
+    const callArgs =
+      raw && typeof raw === "object" && !Array.isArray(raw) && !("signal" in raw)
+        ? raw
+        : null;
+    try {
+      const result = await cb(...args);
+      recordMcpCall({
+        userId: currentUserOrNull(),
+        kind,
+        name,
+        args: callArgs,
+        ok: true,
+        durationMs: Date.now() - started,
+        resultBytes: sizeOf(result),
+      });
+      return result;
+    } catch (e) {
+      // A thrown tool is still a call worth seeing — arguably the one you most
+      // want in the log — so it is recorded before the error carries on.
+      recordMcpCall({
+        userId: currentUserOrNull(),
+        kind,
+        name,
+        args: callArgs,
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        durationMs: Date.now() - started,
+      });
+      throw e;
+    }
+  };
+}
+
+/** Patch a server's registration methods in place, before anything registers. */
+function instrument(server: unknown): void {
+  const s = server as Record<string, AnyFn>;
+  for (const [method, kind] of [
+    ["tool", "tool"],
+    ["prompt", "prompt"],
+  ] as const) {
+    const original = s[method];
+    if (typeof original !== "function") continue;
+    s[method] = function (this: unknown, ...args: unknown[]) {
+      const name = typeof args[0] === "string" ? args[0] : "(unknown)";
+      const last = args[args.length - 1];
+      if (typeof last === "function")
+        args[args.length - 1] = logged(kind, name, last as AnyFn);
+      return original.apply(this, args);
+    };
+  }
+}
+
 const handler = createMcpHandler(
   (server) => {
+    // Must run BEFORE any registration below — it patches the methods they use.
+    instrument(server);
+
     server.tool(
       "list_tasks",
       "Read tasks — FILTER FIRST, never download the board. Every filter is optional and they AND together; `detail` controls how much of each task comes back and `limit` caps the rows.\n" +

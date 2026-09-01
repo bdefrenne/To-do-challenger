@@ -913,3 +913,58 @@ export type CanvasNodeRow = typeof canvasNodes.$inferSelect;
 export type NewCanvasNodeRow = typeof canvasNodes.$inferInsert;
 export type WorkDayRow = typeof workDays.$inferSelect;
 export type NewWorkDayRow = typeof workDays.$inferInsert;
+
+/* ---- MCP call log (TD2-211) ----
+   One row per MCP invocation, written at the ONE chokepoint that every tool
+   goes through (`instrument()` in src/app/api/mcp/route.ts wraps `server.tool`
+   once, so a tool added later is logged without anyone remembering to).
+
+   Distinct from `task_logs`, and the distinction is the point. `task_logs` is
+   what CHANGED on a task — it says nothing about reads, and nothing about the
+   calls that changed nothing. This table is what was ASKED: every `list_tasks`,
+   `get_task`, `standup` and `board_review` an agent runs, whether it succeeded,
+   how long it took and how much it returned. That's the record you need to
+   answer "what has Claude been doing on my board", which the activity log
+   structurally cannot.
+
+   Deliberately NOT foreign-keyed to a task: a call names zero, one or fifty of
+   them, and it's still a call if it names none. */
+export const mcpCalls = pgTable(
+  "mcp_calls",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+    at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
+    /** Whose token made the call. Null only if the user is later deleted. */
+    userId: text("user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    /** Which surface — 'mcp' today; the column exists so REST/Telegram request
+     *  logging can land in this same table rather than a parallel one. */
+    surface: logSource("surface").notNull().default("mcp"),
+    /** What kind of MCP entry point: a tool call, a prompt, a resource read. */
+    kind: text("kind").notNull().default("tool"),
+    /** The tool/prompt/resource name, e.g. "list_tasks". */
+    name: text("name").notNull(),
+    /** The call's arguments, truncated — see `MAX_ARGS_CHARS` in mcp-log.ts.
+     *  Null when the call had none. */
+    args: jsonb("args"),
+    /** Did it return normally? A thrown tool is still a call worth seeing. */
+    ok: boolean("ok").notNull(),
+    /** The error message when `ok` is false, truncated. */
+    error: text("error"),
+    /** Wall-clock time inside the tool callback. */
+    durationMs: integer("duration_ms").notNull(),
+    /** Size of the serialized result — the input to "which read is expensive". */
+    resultBytes: integer("result_bytes"),
+  },
+  (t) => [
+    /* The feed's only scan: newest calls first. */
+    index("mcp_calls_at_idx").on(t.at),
+    /* "What has this user's agent been doing". */
+    index("mcp_calls_user_at_idx").on(t.userId, t.at),
+    /* "How often is this tool called, and how slow is it". */
+    index("mcp_calls_name_at_idx").on(t.name, t.at),
+  ],
+);

@@ -19,6 +19,7 @@ import { ShortcutsHelp, openShortcutsHelp } from "./workspace/ShortcutsHelp";
 import { BoardModal } from "./workspace/BoardModal";
 import { ProjectModal } from "./workspace/ProjectModal";
 import {
+  Activity,
   Archive,
   Calendar,
   Check,
@@ -60,6 +61,7 @@ const NAV: { href: string; label: string; icon: LucideIcon }[] = [
   { href: "/day", label: "Finish work", icon: CircleDot },
   { href: "/canvas", label: "Canvas", icon: LayoutDashboard },
   { href: "/calendar", label: "Calendar", icon: Calendar },
+  { href: "/activity", label: "Activity", icon: Activity },
   { href: "/archived", label: "Archived", icon: Archive },
   { href: "/trash", label: "Trash", icon: Trash2 },
 ];

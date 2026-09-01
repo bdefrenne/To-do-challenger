@@ -30,6 +30,8 @@
     "check:day": "tsx scripts/check-work-days.ts",
     "check:outline": "tsx scripts/check-outline.ts",
     "check:budget": "tsx scripts/check-mcp-budget.ts",
+    "check:activity": "tsx scripts/check-activity.ts",
+    "check:devlogin": "tsx scripts/check-dev-login.ts",
     "repair:week-pins": "tsx scripts/repair-week-pins.ts",
     "user:create": "tsx scripts/create-user.ts",
     "team:create": "tsx scripts/create-team.ts",

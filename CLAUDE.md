@@ -61,6 +61,21 @@ of the RYDR board set.)
   the flags decide which tasks an agent looks at first and, because `capped()`
   drops from the tail, which ones a truncated read silently loses; a wrong weight
   hides the task that most needed attention rather than rendering oddly.
+- `npm run check:activity` — the activity-feed checks (19 assertions, against
+  DATABASE_URL: that a call actually reaches Postgres, that a 20k-char argument
+  is clipped before it does, that a FAILING call is still recorded, and that the
+  merged feed interleaves both streams newest-first). **Run it after touching
+  `mcp-log.ts`, `activityFeed` / `mcpCallStats`, or `instrument()` in the MCP
+  route** — `recordMcpCall` is fire-and-forget by design, so nothing upstream
+  ever sees it fail and this script is the only place the write is proven to
+  land.
+- `npm run check:devlogin` — the dev sign-in fence (17 pure assertions: the
+  `NODE_ENV` × `DEV_LOGIN` × `VERCEL` truth table, open in exactly one row, and
+  that the cookie it mints is the same signed cookie `/api/auth/login` produces
+  — tampered ones rejected). **Run it after touching `src/lib/dev-login.ts` or
+  `src/app/api/dev/login/route.ts`** — that route hands a session for any
+  account with no credential at all, so the gate is the entire security model
+  and a loosened condition is not something to discover in production.
 - `npm run check:bulk` — the write-path checks, against DATABASE_URL (it makes its
   own scratch tasks and cleans up). This is where a rule the pure suite can only
   *state* gets proven to reach the database: canvas pins across a board change,
@@ -84,6 +99,28 @@ of the RYDR board set.)
   drop rows, and they refuse anything not already in the Trash. Scripts that make
   scratch tasks must PURGE them (see `scrub` in the check scripts) or the bin
   fills up with test residue.
+- **Every MCP call is logged at ONE chokepoint (TD2-211).** `instrument()` in
+  the MCP route patches `server.tool` / `server.prompt` before any registration
+  runs, so a tool added later is recorded because it is a tool — **never add
+  per-tool logging**, and never register a tool outside that callback. The rows
+  land in `mcp_calls` and surface on **/activity**, merged with `task_logs`.
+  The two tables answer different questions and both are needed: `task_logs` is
+  what CHANGED (every surface), `mcp_calls` is what was ASKED (agents only,
+  including the reads that change nothing and appear nowhere else).
+- **Looking at a page (TD2-212).** In local development only, `/login` grows a
+  profile picker: click a user, you're in, no password. For an agent it's one
+  URL — `/api/dev/login?as=<email>&next=/activity` signs in and lands on the
+  page, which is what makes a headless screenshot possible in a single browser
+  invocation. **Verify a UI change by looking at it, not just by `npm run
+  build`.** The gate is `devLoginEnabled()` in `src/lib/dev-login.ts` and lives
+  ONLY there — three conditions (`NODE_ENV !== "production"`, `DEV_LOGIN=1`, no
+  `VERCEL`), all server-side, answering 404 when shut. Never mirror it into a
+  `NEXT_PUBLIC_` flag: a second copy of a fence can disagree with the first, and
+  it fails open. Two things to hold in mind while driving the app: **dev shares
+  Postgres with production**, so every click is a write to the real board (the
+  picker says `LIVE DATA` and names the host for this reason) — browse as
+  `testuser` rather than as a real person, so a stray edit isn't attributed to
+  them.
 - **Notes are DISCONTINUED (TD2-209).** The whole feature is gone: no
   `add_note` / `list_notes` / `resolve_note`, no decisions, standup callouts or
   `review` items, no Notes page, no canvas sticky notes, no `task_notes` table.
