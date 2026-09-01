@@ -82,6 +82,7 @@ import {
 import { listUsers, getUserById, type PublicUser } from "@/lib/db/users";
 import { listPublicConnections } from "@/lib/google/connections";
 import { SYNC_NOTE } from "@/lib/repo-sync";
+import { allBoards } from "@/lib/boards";
 import { WORKFLOW, DAY_CLOSE, BOARD_CLEANUP } from "@/lib/workflow";
 import { langSuffix, titleHeader } from "@/lib/prompts";
 import {
@@ -1084,10 +1085,13 @@ const handler = createMcpHandler(
               id: p.id,
               name: p.name,
               gitFolder: p.gitFolder,
-              boards: (p.boards ?? []).map((b) => ({
+              // Hidden boards included, flagged: they're put away, not gone, so
+              // a review the user asks for by name must still be scopeable.
+              boards: allBoards(p).map((b) => ({
                 id: b.id,
                 name: b.name,
                 gitFolder: b.gitFolder,
+                ...(b.hidden ? { hidden: true } : {}),
               })),
             })),
           });
@@ -1144,7 +1148,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "list_projects",
-      `List your projects, each with its boards. Every project AND board includes: \`id\`, \`name\`, \`code\` (its ≤4-char shortname / ref prefix, e.g. "GH"), \`color\` (hex), \`image\` (picture URL or null), \`gitFolder\` (the path to its git working directory — where its code lives on disk, or null if unset), and \`description\` (a Markdown readme explaining what it is and its constraints, or null). Projects also include \`members\` — the roster users ({id, name, email}) the assignee picker offers on that project's tasks (empty ⇒ the whole roster is offered). READ each \`description\` and \`gitFolder\` first to understand what a project/board is about and where its code lives before working on its tasks. ${SYNC_NOTE} Use a board \`id\` as the \`boardId\` when creating or moving tasks to file them under the right board.`,
+      `List your projects, each with its boards. Every project AND board includes: \`id\`, \`name\`, \`code\` (its ≤4-char shortname / ref prefix, e.g. "GH"), \`color\` (hex), \`image\` (picture URL or null), \`gitFolder\` (the path to its git working directory — where its code lives on disk, or null if unset), and \`description\` (a Markdown readme explaining what it is and its constraints, or null). Projects also include \`members\` — the roster users ({id, name, email}) the assignee picker offers on that project's tasks (empty ⇒ the whole roster is offered) — and \`hiddenBoards\`, boards that have been PUT AWAY: still real, still holding their tasks and refs, but drawn nowhere in the app but its settings, because nobody is working on them. Treat \`boards\` as the live set: don't file new work onto a hidden board unless the user names it, and if a task you're asked about lives on one, say so. READ each \`description\` and \`gitFolder\` first to understand what a project/board is about and where its code lives before working on its tasks. ${SYNC_NOTE} Use a board \`id\` as the \`boardId\` when creating or moving tasks to file them under the right board.`,
       {},
       async () => {
         const [projectList, roster] = await Promise.all([

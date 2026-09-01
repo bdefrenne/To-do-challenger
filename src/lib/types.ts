@@ -76,6 +76,11 @@ export interface Board {
   gitFolder?: string | null;
   /** Markdown readme: what this board is and its constraints. */
   description?: string | null;
+  /** Put away, not deleted (TD2-213): the board is drawn nowhere but the
+   *  project's settings modal. Only ever `true` on a board that arrived in
+   *  {@link Project.hiddenBoards} — the split is what does the hiding, this
+   *  flag is what lets settings label and toggle it. */
+  hidden?: boolean;
 }
 
 /** Top level of the hierarchy (e.g. a whole game); holds Boards. */
@@ -93,7 +98,17 @@ export interface Project {
   gitFolder?: string | null;
   /** Markdown readme: what this project is and its constraints. */
   description?: string | null;
+  /** The boards this project SHOWS, in `position` order. Hidden ones are not
+   *  here — see `hiddenBoards`. That split is deliberate: every surface that
+   *  renders a project's boards reads this field, so hiding is the default and a
+   *  new surface inherits it rather than having to remember a filter. */
   boards?: Board[];
+  /** The boards that are put away (TD2-213), same order. Read by the project's
+   *  settings modal (the only place they're shown, and where they're brought
+   *  back) and, unioned with `boards` via `allBoards`, by anything asking what a
+   *  board is CALLED — a task on a hidden board still shows up in the Trash, the
+   *  Archived view and the task table, and must name its board there. */
+  hiddenBoards?: Board[];
   /** Roster user ids who are members of this project — the assignee picker on
    *  the project's tasks offers only these people (empty ⇒ whole-roster
    *  fallback). Boards inherit their project's members. The owner is always

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { findBoard } from "@/lib/boards";
 import { STATUS_LABEL, STATUS_TONE } from "@/lib/statuses";
 import type { Task } from "@/lib/types";
 
@@ -87,11 +88,11 @@ export default function TrashPage() {
 
   const boardName = useMemo(() => {
     return (id?: string | null) => {
-      for (const p of projects) {
-        const b = p.boards?.find((bd) => bd.id === id);
-        if (b) return `${p.name} · ${b.name}`;
-      }
-      return "No board";
+      // Hidden boards included: a board being put away doesn't unfile the
+      // tasks on it, and naming their board "No board" here would read as the
+      // Trash having lost track of where they came from.
+      const hit = findBoard(projects, id);
+      return hit ? `${hit.project.name} · ${hit.board.name}` : "No board";
     };
   }, [projects]);
 

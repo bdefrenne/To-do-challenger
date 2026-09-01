@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
+import { allBoards } from "@/lib/boards";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskTableRow, GRID } from "./TaskTableRow";
 import type { BoardGroup } from "./BoardPill";
@@ -40,16 +41,23 @@ export function TaskTable({
     addTask,
   } = useWorkspace();
 
+  /* The three lookups below answer "what is the board with this id called /
+     coloured / in?", so they read HIDDEN boards too (TD2-213): a task on a
+     board that's been put away can still be on screen — the board's own page, a
+     search, the Archived view — and tagging it "No board" would read as the
+     task having lost its board rather than the board having been put away.
+     `toGroup`, just below, is the opposite question (which boards may a task be
+     moved ONTO?) and deliberately offers only the visible ones. */
   const boardNameById = useMemo(() => {
     const m: Record<string, string> = {};
-    for (const p of projects) for (const b of p.boards ?? []) m[b.id] = b.name;
+    for (const p of projects) for (const b of allBoards(p)) m[b.id] = b.name;
     return m;
   }, [projects]);
 
   // boardId → its project, so a row can offer sibling boards (same project).
   const projectByBoardId = useMemo(() => {
     const m: Record<string, Project> = {};
-    for (const p of projects) for (const b of p.boards ?? []) m[b.id] = p;
+    for (const p of projects) for (const b of allBoards(p)) m[b.id] = p;
     return m;
   }, [projects]);
 
@@ -57,11 +65,13 @@ export function TaskTable({
   const boardColorById = useMemo(() => {
     const m: Record<string, string> = {};
     for (const p of projects)
-      for (const b of p.boards ?? [])
+      for (const b of allBoards(p))
         m[b.id] = b.color || p.color || "#7b68ee";
     return m;
   }, [projects]);
 
+  // Where a task may be MOVED — the live boards only, so the picker never
+  // offers to file work onto a board nobody is looking at.
   const toGroup = (p: Project): BoardGroup => ({
     projectId: p.id,
     projectName: p.name,

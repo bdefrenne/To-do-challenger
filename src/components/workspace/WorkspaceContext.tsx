@@ -27,6 +27,7 @@ import {
   type SystemGroup,
 } from "@/lib/sections";
 import { compareTaskOrder, insertRelative } from "@/lib/task-order";
+import { allBoards } from "@/lib/boards";
 import { MAX_BULK_OPS, type OpResult } from "@/lib/bulk";
 
 /*
@@ -315,7 +316,8 @@ interface WorkspaceContextValue {
     },
   ) => Promise<Board | null>;
   /** Edit a board's name / shortname (code) / color / picture / git folder /
-   *  readme. `image`/`gitFolder`/`description` accept null to clear. */
+   *  readme, or put it away / bring it back (`hidden`, TD2-213).
+   *  `image`/`gitFolder`/`description` accept null to clear. */
   renameBoard: (
     id: string,
     patch: {
@@ -325,6 +327,7 @@ interface WorkspaceContextValue {
       image?: string | null;
       gitFolder?: string | null;
       description?: string | null;
+      hidden?: boolean;
     },
   ) => Promise<void>;
   /** Upload a board picture (client crops to a square first). */
@@ -1837,9 +1840,13 @@ export function WorkspaceProvider({
     scope: { boardId?: string; projectId?: string } = {},
   ): Promise<number> {
     // Board ids in scope: the one board, every board of the project, or all.
+    // Hidden boards included, matching the server (which scopes by
+    // `tasks.project_id`) and `ArchiveDoneButton`'s count — see the note there.
     const projectBoardIds = scope.projectId
       ? new Set(
-          (projects.find((p) => p.id === scope.projectId)?.boards ?? []).map((b) => b.id),
+          allBoards(projects.find((p) => p.id === scope.projectId) ?? {}).map(
+            (b) => b.id,
+          ),
         )
       : null;
     const inScope = (boardId: string | null | undefined) =>
@@ -2578,6 +2585,7 @@ export function WorkspaceProvider({
       image?: string | null;
       gitFolder?: string | null;
       description?: string | null;
+      hidden?: boolean;
     },
   ) =>
     mutateProjects(() =>

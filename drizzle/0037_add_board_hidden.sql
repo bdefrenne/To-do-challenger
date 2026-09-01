@@ -1,0 +1,14 @@
+-- Hide a board without deleting it (TD2-213).
+--
+-- A project like RYDR carries a dozen boards, most of them dormant, and every
+-- canvas tray holds a lane for EVERY board (TD-138) — so a board nobody is
+-- working on still costs a column in every band of the Boards view and a lane
+-- in every tray. Deleting isn't the answer: it's refused while the board holds
+-- tasks, and rightly so (the cascade would take its tasks out of Postgres
+-- without passing through the Trash).
+--
+-- `hidden` is therefore a VISIBILITY axis, not an exit. The row, its tasks,
+-- their refs and their history are untouched; the board simply stops being
+-- drawn. The one surface that still shows it is the project's settings modal,
+-- which is where it gets brought back.
+ALTER TABLE "boards" ADD COLUMN "hidden" boolean DEFAULT false NOT NULL;

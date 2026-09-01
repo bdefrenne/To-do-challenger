@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { findBoard } from "@/lib/boards";
 import { STATUS_LABEL, STATUS_TONE } from "@/lib/statuses";
 import type { Task } from "@/lib/types";
 
@@ -51,12 +52,11 @@ export default function ArchivedPage() {
     void load();
   }, [load]);
 
+  // Hidden boards included — same reason as the Trash: archived work keeps the
+  // board it was done on, whether or not that board is still drawn.
   const boardName = (id?: string | null) => {
-    for (const p of projects) {
-      const b = p.boards?.find((bd) => bd.id === id);
-      if (b) return `${p.name} · ${b.name}`;
-    }
-    return "No board";
+    const hit = findBoard(projects, id);
+    return hit ? `${hit.project.name} · ${hit.board.name}` : "No board";
   };
 
   const run = async (id: string, fn: () => Promise<unknown>) => {

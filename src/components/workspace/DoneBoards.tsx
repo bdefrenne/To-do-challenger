@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Board, Project, Task } from "@/lib/types";
+import { allBoards } from "@/lib/boards";
 import { addDays, fromYmd, startOfWeek, ymd } from "@/lib/dates";
 import { workingDayOf } from "@/lib/workday";
 import { Avatar } from "@/components/ui/Badge";
@@ -297,17 +298,21 @@ export function DoneBoards({ project }: { project: Project }) {
     [me, openFrom, writeUpAt],
   );
 
+  /* Both lookups below read hidden boards too (TD2-213). The Done view is
+     HISTORY: work finished on a board that has since been put away still
+     happened, and the day it was finished must still name the board it was on.
+     Hiding a board takes it off what's being WORKED, not out of the record. */
   /** Board order within the project — the order the Boards view and the sidebar
    *  already use, so the same work sits in the same place on every screen. */
   const boardIndex = useMemo(() => {
     const m = new Map<string, number>();
-    (project.boards ?? []).forEach((b, i) => m.set(b.id, i));
+    allBoards(project).forEach((b, i) => m.set(b.id, i));
     return m;
-  }, [project.boards]);
+  }, [project]);
 
   const boardOf = useCallback(
-    (id?: string | null) => (project.boards ?? []).find((b) => b.id === id),
-    [project.boards],
+    (id?: string | null) => allBoards(project).find((b) => b.id === id),
+    [project],
   );
 
   /** Roster order (name-sorted), so a person keeps the same column position from

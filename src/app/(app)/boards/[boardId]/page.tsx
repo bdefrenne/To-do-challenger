@@ -11,6 +11,7 @@ import { TaskTable } from "@/components/workspace/TaskTable";
 import { EntityReadme } from "@/components/workspace/EntityReadme";
 import { BoardModal } from "@/components/workspace/BoardModal";
 import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
+import { findBoard } from "@/lib/boards";
 
 /**
  * Single-board view. Two modes:
@@ -20,8 +21,12 @@ import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
 export default function BoardPage() {
   const { boardId } = useParams<{ boardId: string }>();
   const { projects } = useWorkspace();
-  const project = projects.find((p) => p.boards?.some((b) => b.id === boardId));
-  const board = project?.boards?.find((b) => b.id === boardId);
+  // Hidden boards included: a board that's been put away is reachable from the
+  // project's settings and by its own URL, and its page has to load — hiding it
+  // takes it off the views that LIST boards, it doesn't retire the board.
+  const hit = findBoard(projects, boardId);
+  const project = hit?.project;
+  const board = hit?.board;
   const [view, setView] = useViewMode<"list" | "board">("view-mode:board", "list");
   const [editing, setEditing] = useState(false);
 
@@ -29,12 +34,17 @@ export default function BoardPage() {
     <div className="min-h-screen">
       <PageHeader
         title={board?.name ?? "Board"}
+        // A hidden board says so (TD2-213). Its own page still works, so
+        // without this the only clue is its absence from the sidebar — which
+        // reads as a bug rather than as a board someone put away.
         subtitle={
-          board?.code
-            ? `${board.code}${project ? ` · in ${project.name}` : ""}`
-            : project
-              ? `in ${project.name}`
-              : undefined
+          [
+            board?.code,
+            project ? `in ${project.name}` : null,
+            board?.hidden ? "hidden" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined
         }
         left={
           board ? (

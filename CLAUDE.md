@@ -83,12 +83,28 @@ of the RYDR board set.)
   for a line opened mid-list. **Run it after touching `createTask` / `moveTask` /
   `bulkApply` or the request schemas in `src/lib/api.ts`** — a field that a zod
   schema silently strips fails nowhere else.
+- `npm run check:delete` — what blocks a board/project delete and what the delete
+  destroys (19 assertions, against DATABASE_URL; makes its own scratch
+  project/boards/tasks and purges them). **Run it after touching
+  `cascadeTaskCount` / `hiddenTaskCount` / `deleteBoard` / `deleteProject`** —
+  `tasks.board_id` is ON DELETE CASCADE, so that count is the entire safety
+  model on the one exit in the app that ends a task without the Trash: count a
+  hidden row and a board nobody can empty is stuck forever; miss a live one and
+  someone's work is gone with no undo.
 
 ## Conventions
 
 - A project's/board's description lives in `DESCRIPTION.md` in its repo and
   mirrors the app; keep the two in sync (see above). This is the *description*
   layer — distinct from this instructions file.
+- **A board/project delete is blocked by LIVE tasks only (TD2-214).**
+  `cascadeTaskCount` counts what's on the board; archived and trashed rows are
+  not counted, because refusing on them named tasks the person could not see
+  anywhere (a board that reads empty and still won't delete). They ARE destroyed
+  by the cascade, with no Trash stop — so any surface with a human in front of it
+  reads `hiddenTaskCount` and says how many first (`useHiddenTaskCount` +
+  `/api/tasks/hidden-count` do that for the two modals). Proven by
+  `npm run check:delete`.
 - **Deleting is soft (TD2-196).** `tasks.deletedAt` means "in the Trash". Two
   fences keep it off every surface, and a new read path must go through one of
   them rather than filtering for itself: `taskWhere` (every list/search/digest
@@ -99,6 +115,22 @@ of the RYDR board set.)
   drop rows, and they refuse anything not already in the Trash. Scripts that make
   scratch tasks must PURGE them (see `scrub` in the check scripts) or the bin
   fills up with test residue.
+- **Hiding a board happens in `listProjects`, nowhere else (TD2-213).**
+  `boards.hidden` means "put away": the board keeps its tasks, refs and history
+  and simply stops being drawn. `listProjects` is the ONE place that reads the
+  column — it splits the rows into `Project.boards` (what a project shows) and
+  `Project.hiddenBoards` — so all three surfaces and every view hide a board for
+  free, and a view written later inherits that instead of needing a filter it has
+  never heard of. **Never add a per-view `hidden` filter**, and never read the
+  column outside that function. The one exception is a NAME lookup — a task on a
+  hidden board is still in the Trash, the Archived view and the task table, and
+  its own page must still load — which unions the two arrays through
+  `allBoards` / `findBoard` in `src/lib/boards.ts`. The test for which you want:
+  "which boards does this project SHOW?" is `project.boards`; "what is the board
+  with this id CALLED?" is `allBoards`. On the canvas there is no new code at
+  all — the lane reconciler reads the visible set, so a hidden board is
+  indistinguishable from one that left the project and its lanes are swept from
+  every tray.
 - **Every MCP call is logged at ONE chokepoint (TD2-211).** `instrument()` in
   the MCP route patches `server.tool` / `server.prompt` before any registration
   runs, so a tool added later is recorded because it is a tool — **never add

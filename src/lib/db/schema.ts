@@ -305,6 +305,14 @@ export const boards = pgTable(
     nextSeq: integer("next_seq").notNull().default(1),
     /** Fractional sort key for ordering boards within a project. */
     position: doublePrecision("position").notNull().default(0),
+    /** Put away, not deleted (TD2-213) — a board nobody is working on stops
+     *  being drawn: no column in the project's views, no lane on the canvas, no
+     *  entry in the sidebar. Its tasks, refs and history are untouched, and the
+     *  project's settings modal is where it's shown again. `listProjects` is the
+     *  ONE place this is read: it hands the hidden rows back separately
+     *  (`Project.hiddenBoards`), so a surface reading `project.boards` hides
+     *  them without knowing this column exists. */
+    hidden: boolean("hidden").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

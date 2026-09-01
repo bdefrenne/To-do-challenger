@@ -32,6 +32,13 @@ edit and a human edit go through the exact same door.
   sees and edits that user's data.
 - **Projects & boards** each have: name, shortname (`code`), color, picture,
   `gitFolder`, and a Markdown description mirrored to this file.
+- **A board can be put away.** A project accumulates boards faster than it
+  retires them, and every canvas tray holds a lane for *every* board — so a
+  dormant one costs a column in every band and a lane in every tray. Hiding it
+  from the project's settings takes it off every view, its canvas and the
+  sidebar while it keeps its tasks, its refs and its history; that settings list
+  is the only place it still appears, and the only place it comes back from.
+  Deleting stays what it was: refused while the board holds tasks.
 - **Process model:** a task's journey (`Backlog → … → Done`), a **working day**'s
   record, and a **board cleanup** are the three contracts, written once in
   `src/lib/workflow.ts` and read by every surface — so the steps a person sees

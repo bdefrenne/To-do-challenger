@@ -87,6 +87,7 @@ import {
   type SystemGroup,
 } from "@/lib/sections";
 import type { TaskPlacement } from "@/lib/types";
+import { allBoards } from "@/lib/boards";
 
 type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
 
@@ -968,14 +969,21 @@ export function CanvasEditor({
    *  exactly like a hand-bound section's). */
   const boardNames = useMemo(() => {
     const m = new Map<string, string>();
-    for (const p of projects) for (const b of p.boards ?? []) m.set(b.id, b.name);
+    // Hidden boards included: a title is a lookup, and a section someone bound
+    // by hand to a board that has since been put away still has to say what it
+    // is. Which lanes EXIST is `projectBoards` below — the visible set — so
+    // hiding a board is what sweeps its machine lanes out of every tray.
+    for (const p of projects) for (const b of allBoards(p)) m.set(b.id, b.name);
     return m;
   }, [projects]);
 
   /** This project's boards, in SIDEBAR order — the ordering every tray uses for
    *  its lanes, and the set every tray holds a lane for (TD-138). `p.boards`
    *  arrives sorted by `boards.position`, the same order the sidebar and the
-   *  project Boards view's columns read. */
+   *  project Boards view's columns read, and it EXCLUDES boards that have been
+   *  put away (TD2-213) — which is the whole of hiding a board on the canvas:
+   *  the lane reconciler treats a hidden board exactly as one that left the
+   *  project, so its lanes are removed from every tray on the next pass. */
   const projectBoards = useMemo(
     () => projects.find((p) => p.id === projectId)?.boards ?? [],
     [projects, projectId],

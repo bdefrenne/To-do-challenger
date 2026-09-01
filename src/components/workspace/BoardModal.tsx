@@ -3,6 +3,7 @@
 import { usePathname, useRouter } from "next/navigation";
 import { EntityFormModal } from "./EntityFormModal";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { useHiddenTaskCount, hiddenTasksPhrase } from "./useHiddenTaskCount";
 import type { Board } from "@/lib/types";
 
 /**
@@ -30,12 +31,20 @@ export function BoardModal({
   const router = useRouter();
   const pathname = usePathname();
 
-  // A board that still holds tasks can't be deleted (see onDelete below), so
+  // A board that still holds LIVE tasks can't be deleted (see onDelete below), so
   // this count is what the delete button is disabled ON, and what the hint names.
+  // `taskMap` holds exactly the live ones — archived and trashed tasks are out of
+  // it — which is now the same set the server refuses on (TD2-214), so the button
+  // and the POST can no longer disagree.
   const taskCount =
     mode === "edit" && board
       ? Object.values(taskMap).filter((t) => t.boardId === board.id).length
       : 0;
+
+  // …but those hidden rows still go with the cascade, and that's the one exit
+  // with no Trash behind it. Name them before asking (TD2-214).
+  const hidden = useHiddenTaskCount(mode === "edit" && board ? { boardId: board.id } : null);
+  const doomed = hiddenTasksPhrase(hidden);
 
   return (
     <EntityFormModal
@@ -46,14 +55,23 @@ export function BoardModal({
       initial={board ?? {}}
       onClose={onClose}
       // Same rule as a project (and enforced server-side in `deleteBoard`): a
-      // board that still holds tasks can't be deleted. Deleting the row would
-      // cascade its tasks out of Postgres — the one exit that skips the Trash —
-      // so the tasks leave first, through a door that has an undo.
+      // board that still holds live tasks can't be deleted. Deleting the row
+      // would cascade its tasks out of Postgres — the one exit that skips the
+      // Trash — so the tasks leave first, through a door that has an undo.
+      // Archived/trashed rows don't hold it up, they're just named first.
       onDelete={
         mode === "edit" && board
           ? async () => {
               if (taskCount > 0) return;
-              if (!confirm(`Delete board “${board.name}”? This can't be undone.`)) return;
+              if (
+                !confirm(
+                  (doomed
+                    ? `Delete board “${board.name}”? The ${doomed} on it will be destroyed ` +
+                      `too — permanently, with no Trash to restore from. `
+                    : `Delete board “${board.name}”? `) + `This can't be undone.`,
+                )
+              )
+                return;
               await deleteBoard(board.id);
               if (pathname === `/boards/${board.id}`)
                 router.push(projectId ? `/projects/${projectId}` : "/");
@@ -68,7 +86,9 @@ export function BoardModal({
               taskCount === 1 ? "" : "s"
             } before deleting it — deleting a board would destroy them outright, ` +
             `without the Trash.`
-          : "Permanently delete this board."
+          : doomed
+            ? `Permanently delete this board — the ${doomed} on it will be destroyed with it.`
+            : "Permanently delete this board."
       }
       onSave={async (v, pic) => {
         if (mode === "create") {

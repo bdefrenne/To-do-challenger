@@ -4,8 +4,11 @@ import { useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { EntityFormModal } from "./EntityFormModal";
 import { ProjectMembersField } from "./ProjectMembersField";
+import { BoardVisibilityField } from "./BoardVisibilityField";
+import { allBoards } from "@/lib/boards";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import { usePeople } from "@/components/PeopleContext";
+import { useHiddenTaskCount, hiddenTasksPhrase } from "./useHiddenTaskCount";
 import type { Project } from "@/lib/types";
 
 /**
@@ -38,8 +41,13 @@ export function ProjectModal({
 
   // A project can only be deleted once it's empty — no tasks on any of its
   // boards, and no board-less tasks scoped directly to it. That keeps the
-  // delete a clean, cascade-free removal (nothing to orphan).
-  const boardIds = new Set((project?.boards ?? []).map((b) => b.id));
+  // delete a clean, cascade-free removal (nothing to orphan). Hidden boards
+  // count (TD2-213): they still hold their tasks, and a delete guard that
+  // couldn't see them would wave through a project whose cascade takes work
+  // with it — hiding a board must never be a way past a fence.
+  // Only LIVE tasks block it (TD2-214) — which is exactly what `taskMap` holds,
+  // so this count and the server's now agree.
+  const boardIds = new Set(allBoards(project ?? {}).map((b) => b.id));
   const taskCount =
     mode === "edit" && project
       ? Object.values(taskMap).filter(
@@ -48,6 +56,11 @@ export function ProjectModal({
             (t.boardId != null && boardIds.has(t.boardId)),
         ).length
       : 0;
+
+  // Archived and trashed tasks don't block the delete, but the cascade destroys
+  // them with no Trash behind it — so say how many before asking (TD2-214).
+  const hidden = useHiddenTaskCount(mode === "edit" && project ? { projectId: project.id } : null);
+  const doomed = hiddenTasksPhrase(hidden);
 
   return (
     <EntityFormModal
@@ -64,7 +77,12 @@ export function ProjectModal({
               if (
                 !confirm(
                   `Delete project “${project.name}”? This also removes its ` +
-                    `${project.boards?.length ?? 0} board(s). This can't be undone.`,
+                    `${allBoards(project).length} board(s). ` +
+                    (doomed
+                      ? `The ${doomed} in it will be destroyed too — permanently, with no ` +
+                        `Trash to restore from. `
+                      : "") +
+                    `This can't be undone.`,
                 )
               )
                 return;
@@ -80,10 +98,20 @@ export function ProjectModal({
           ? `Move or delete this project's ${taskCount} task${
               taskCount === 1 ? "" : "s"
             } before deleting it.`
-          : "Permanently delete this project and its boards."
+          : doomed
+            ? `Permanently delete this project and its boards — the ${doomed} in them ` +
+              `will be destroyed too.`
+            : "Permanently delete this project and its boards."
       }
       extraSection={
-        <ProjectMembersField selected={memberIds} onChange={setMemberIds} />
+        <div className="space-y-3">
+          <ProjectMembersField selected={memberIds} onChange={setMemberIds} />
+          {/* Edit only: hiding is a property of a board, and on create there
+              are none yet. */}
+          {mode === "edit" && project ? (
+            <BoardVisibilityField project={project} />
+          ) : null}
+        </div>
       }
       onSave={async (v, pic) => {
         if (mode === "create") {

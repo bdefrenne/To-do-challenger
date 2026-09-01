@@ -5122,6 +5122,7 @@ const rowToBoard = (r: BoardRow): Board => ({
   image: r.image,
   gitFolder: r.gitFolder,
   description: r.description,
+  hidden: r.hidden,
 });
 
 /** Map a project row to its DTO scalars (boards attached separately). */
@@ -5186,8 +5187,19 @@ async function nextOrdinal(
   return Number(max) + 1;
 }
 
-/** Every project on the instance, each with its boards nested (position order).
- *  Team-wide: projects/boards are shared, so `userId` is ignored. */
+/**
+ * Every project on the instance, each with its boards nested (position order).
+ * Team-wide: projects/boards are shared, so `userId` is ignored.
+ *
+ * THE hiding chokepoint (TD2-213). A hidden board goes into `hiddenBoards`
+ * rather than `boards`, so every caller — three surfaces and a dozen views, all
+ * of which iterate `project.boards` — stops drawing it without a line of change,
+ * and a caller written later inherits that rather than having to remember a
+ * filter. The settings modal asks for `hiddenBoards` by name because showing
+ * them is its whole job; anything that only needs a board's NAME unions the two
+ * (`allBoards`), since a task on a hidden board is still in the Trash and still
+ * a row in the task table.
+ */
 export async function listProjects(_userId: string): Promise<Project[]> {
   const [projectRows, boardRows, memberRows] = await Promise.all([
     db.select().from(projects).orderBy(asc(projects.position)),
@@ -5201,10 +5213,12 @@ export async function listProjects(_userId: string): Promise<Project[]> {
       .from(projectMembers),
   ]);
   const byProject = new Map<string, Board[]>();
+  const hiddenByProject = new Map<string, Board[]>();
   for (const b of boardRows) {
-    const list = byProject.get(b.projectId) ?? [];
+    const into = b.hidden ? hiddenByProject : byProject;
+    const list = into.get(b.projectId) ?? [];
     list.push(rowToBoard(b));
-    byProject.set(b.projectId, list);
+    into.set(b.projectId, list);
   }
   const membersByProject = new Map<string, string[]>();
   for (const m of memberRows) {
@@ -5215,6 +5229,7 @@ export async function listProjects(_userId: string): Promise<Project[]> {
   return projectRows.map((p: ProjectRow) => ({
     ...rowToProject(p),
     boards: byProject.get(p.id) ?? [],
+    hiddenBoards: hiddenByProject.get(p.id) ?? [],
     members: membersByProject.get(p.id) ?? [],
   }));
 }
@@ -5277,7 +5292,7 @@ export async function createProject(
   // files everything into INBOX. Creating it up-front also keeps the 1:1
   // invariant true by construction rather than by convention.
   await createCanvas(userId, name, row.id);
-  return { ...rowToProject(row), boards: [], members: validIds };
+  return { ...rowToProject(row), boards: [], hiddenBoards: [], members: validIds };
 }
 
 export async function updateProject(
@@ -5329,58 +5344,76 @@ export async function updateProject(
 }
 
 /**
- * How many tasks a cascade would take with a board/project — live, archived AND
- * trashed, because the point is what would be DESTROYED, and a `tasks` row is a
- * row whatever view it's hidden from.
+ * How many LIVE tasks a board/project still holds — the count that BLOCKS a
+ * delete (TD2-214).
  *
- * `trashed` is reported separately so the refusal can name the fix: an ordinary
- * task has to be moved or deleted, one already in the Trash has to be restored
- * and moved, or emptied.
+ * Archived and trashed rows are deliberately not counted. They're out of every
+ * active view, so counting them refused a delete while naming tasks the person
+ * could not see anywhere on the board — the Vivax board read empty and still
+ * wouldn't go. What's on a board is what's on a board.
+ *
+ * They ARE still destroyed by the cascade, without the Trash stop. That's the
+ * accepted trade, and it's why `hiddenTaskCount` exists: a surface with a human
+ * in front of it says how many are about to go before it asks the question.
  */
 async function cascadeTaskCount(
   scope: { boardId?: string; projectId?: string },
-): Promise<{ total: number; trashed: number }> {
-  const where = scope.boardId
-    ? eq(tasks.boardId, scope.boardId)
-    : eq(tasks.projectId, scope.projectId!);
+): Promise<number> {
+  const [row] = await db
+    .select({ live: sql<number>`count(*)` })
+    .from(tasks)
+    .where(
+      and(
+        scope.boardId ? eq(tasks.boardId, scope.boardId) : eq(tasks.projectId, scope.projectId!),
+        isNull(tasks.deletedAt),
+        isNull(tasks.archivedAt),
+      ),
+    );
+  return Number(row?.live ?? 0);
+}
+
+/**
+ * The rows a delete would destroy SILENTLY — archived and trashed, split so the
+ * warning can name each. Nothing refuses on these (see `cascadeTaskCount`); it's
+ * what the confirm dialog reads so the destruction is never a surprise.
+ */
+export async function hiddenTaskCount(
+  scope: { boardId?: string; projectId?: string },
+): Promise<{ archived: number; trashed: number }> {
   const [row] = await db
     .select({
-      total: sql<number>`count(*)`,
+      archived: sql<number>`count(*) filter (where ${tasks.archivedAt} is not null and ${tasks.deletedAt} is null)`,
       trashed: sql<number>`count(${tasks.deletedAt})`,
     })
     .from(tasks)
-    .where(where);
-  return { total: Number(row?.total ?? 0), trashed: Number(row?.trashed ?? 0) };
+    .where(
+      scope.boardId ? eq(tasks.boardId, scope.boardId) : eq(tasks.projectId, scope.projectId!),
+    );
+  return { archived: Number(row?.archived ?? 0), trashed: Number(row?.trashed ?? 0) };
 }
 
 /** The refusal, phrased as the thing to do next. */
-function tasksInTheWayError(
-  what: string,
-  name: string,
-  counts: { total: number; trashed: number },
-): ValidationError {
-  const n = counts.total;
-  const trashed =
-    counts.trashed > 0
-      ? ` (${counts.trashed} of them in the Trash — restore and move them, or empty the Trash)`
-      : "";
+function tasksInTheWayError(what: string, name: string, n: number): ValidationError {
   return new ValidationError(
-    `Can’t delete ${what} “${name}”: it still holds ${n} task${n === 1 ? "" : "s"}${trashed}. ` +
+    `Can’t delete ${what} “${name}”: it still holds ${n} task${n === 1 ? "" : "s"}. ` +
       `Move them to another ${what} first, or delete them — deleting ${what === "board" ? "a board" : "a project"} ` +
       `would destroy them outright, and nothing else in the app can do that.`,
-    { code: "tasks_in_the_way", taskCount: n, trashedCount: counts.trashed },
+    { code: "tasks_in_the_way", taskCount: n },
   );
 }
 
 /**
- * Delete a project — REFUSED while it still holds tasks (TD2-196).
+ * Delete a project — REFUSED while it still holds LIVE tasks (TD2-196, narrowed
+ * to live-only by TD2-214).
  *
  * Every other way of deleting a task puts it in the Trash, where it can be
  * restored; the row cascade here is the one path that would end tasks for good,
  * which makes it the one path that must not be reachable by accident. So the
  * cascade is kept for the project's own furniture (boards, canvas, members) and
- * closed for tasks: empty it first, deliberately, through the door that has an
- * undo.
+ * closed for tasks on the board: empty it first, deliberately, through the door
+ * that has an undo. Archived and trashed rows are already off every board, so
+ * they don't hold the delete up — they just go with it, which is what
+ * `hiddenTaskCount` is for.
  */
 export async function deleteProject(userId: string, id: string): Promise<boolean> {
   const [project] = await db
@@ -5388,8 +5421,8 @@ export async function deleteProject(userId: string, id: string): Promise<boolean
     .from(projects)
     .where(eq(projects.id, id));
   if (!project) return false;
-  const counts = await cascadeTaskCount({ projectId: id });
-  if (counts.total > 0) throw tasksInTheWayError("project", project.name, counts);
+  const live = await cascadeTaskCount({ projectId: id });
+  if (live > 0) throw tasksInTheWayError("project", project.name, live);
   const res = await db
     .delete(projects)
     .where(eq(projects.id, id))
@@ -5560,6 +5593,10 @@ export async function updateBoard(
     image?: string | null;
     gitFolder?: string | null;
     description?: string | null;
+    /** Put the board away, or bring it back (TD2-213). Nothing else moves: it
+     *  keeps its tasks, its position, its ref counter and its history, and
+     *  `listProjects` simply stops listing it among the ones a project shows. */
+    hidden?: boolean;
   },
 ): Promise<Board | null> {
   const cur = (
@@ -5583,6 +5620,7 @@ export async function updateBoard(
       ...(patch.image !== undefined ? { image: patch.image } : {}),
       ...(patch.gitFolder !== undefined ? { gitFolder: patch.gitFolder } : {}),
       ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.hidden !== undefined ? { hidden: patch.hidden } : {}),
       updatedAt: new Date(),
     })
     .where(eq(boards.id, id))
@@ -5614,17 +5652,19 @@ export async function reorderBoards(
   return true;
 }
 
-/** Delete a board — REFUSED while it still holds tasks, for the reason
+/** Delete a board — REFUSED while it still holds LIVE tasks, for the reason
  *  `deleteProject` gives: the row cascade is the only path in the app that can
- *  end a task without it passing through the Trash first. */
+ *  end a task without it passing through the Trash first. Archived and trashed
+ *  rows don't block it and go with the cascade (TD2-214) — a caller with a
+ *  human in front of it should `hiddenTaskCount` and say so first. */
 export async function deleteBoard(userId: string, id: string): Promise<boolean> {
   const [board] = await db
     .select({ name: boards.name })
     .from(boards)
     .where(eq(boards.id, id));
   if (!board) return false;
-  const counts = await cascadeTaskCount({ boardId: id });
-  if (counts.total > 0) throw tasksInTheWayError("board", board.name, counts);
+  const live = await cascadeTaskCount({ boardId: id });
+  if (live > 0) throw tasksInTheWayError("board", board.name, live);
   const res = await db
     .delete(boards)
     .where(eq(boards.id, id))

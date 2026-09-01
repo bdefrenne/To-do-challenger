@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useWorkspace } from "./WorkspaceContext";
+import { allBoards } from "@/lib/boards";
 
 /**
  * "Archive done (N)" header action — archives every done task in scope (a board
@@ -19,8 +20,13 @@ export function ArchiveDoneButton({
   const { nodes, projects, archiveAllDone } = useWorkspace();
   const [busy, setBusy] = useState(false);
 
+  // Hidden boards counted (TD2-213): the server sweeps a project by
+  // `tasks.project_id`, which doesn't know about hiding, so counting only the
+  // visible boards would put a number in the confirm dialog that's smaller than
+  // what the button actually archives. Sweeping a put-away board's finished work
+  // is the right outcome anyway — it's the one exit it still has.
   const projectBoardIds = projectId
-    ? new Set((projects.find((p) => p.id === projectId)?.boards ?? []).map((b) => b.id))
+    ? new Set(allBoards(projects.find((p) => p.id === projectId) ?? {}).map((b) => b.id))
     : null;
   const inScope = (bId: string | null | undefined) =>
     boardId ? bId === boardId : projectBoardIds ? bId != null && projectBoardIds.has(bId) : true;

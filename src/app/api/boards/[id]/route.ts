@@ -1,6 +1,6 @@
 /*
   /api/boards/:id
-    PATCH  — rename the board.
+    PATCH  — rename the board, or hide/show it (`hidden`).
     DELETE — remove the board (cascades to its tasks and their logs).
 */
 

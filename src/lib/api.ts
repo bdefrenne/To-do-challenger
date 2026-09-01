@@ -480,6 +480,10 @@ export const updateBoardSchema = z
     image: pictureUrl.nullable(),
     gitFolder: gitFolder.nullable(),
     description: description.nullable(),
+    /** Put the board away / bring it back (TD2-213) — a visibility flag, not an
+     *  exit: it keeps every task, ref and log it had, and simply stops being
+     *  drawn outside the project's settings. */
+    hidden: z.boolean(),
   })
   .partial();
 
