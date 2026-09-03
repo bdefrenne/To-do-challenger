@@ -41,9 +41,10 @@ export const NEW_GROUP_SIZE = { width: 460, height: 220 };
  *  GET here, since you never build one by hand. */
 const EMPTY_TRAY_HINT: Record<SystemGroup, string> = {
   inbox: "Nothing untriaged",
+  today: "Nothing committed to today — hover a card and press ⇧↑",
   thisWeek: "Nothing on this week's board — hover a card and press ↑",
-  backlog: "Nothing in the backlog — hover a card and press →",
-  later: "Nothing deferred — hover a card and press ↓",
+  backlog: "Nothing in the backlog — hover a card and press ↓",
+  later: "Nothing deferred — hover a card and press ←",
   doneThisWeek: "Nothing finished yet — press Delete on a done card, or one in review",
 };
 

@@ -17,6 +17,7 @@ import { DrawNode } from "./DrawNode";
 import { ImageNode } from "./ImageNode";
 import { SectionGroupNode } from "./SectionGroupNode";
 import { HEIGHT_COMMIT_MS } from "./canvasWrites";
+import { NO_FILTER, type RenderFilter } from "@/lib/task-filters";
 export { NEW_SECTION_SIZE } from "./SectionNode";
 export { NEW_GROUP_SIZE } from "./SectionGroupNode";
 
@@ -113,7 +114,7 @@ export function CanvasNode({
   onRemove,
   groupMemberCount = 0,
   groupDropActive = false,
-  filterAssigneeId = null,
+  filter = NO_FILTER,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -157,9 +158,10 @@ export function CanvasNode({
   /** section_group-only: a section is being dragged over it right now. */
   groupDropActive?: boolean;
   /** section_group-only: mark/unmark this group as the THIS WEEK board. */
-  /** Section-only: show only this assignee's cards (TD-59), across every
-   *  section on the canvas. Render-only — never patched into storage. */
-  filterAssigneeId?: string | null;
+  /** Section-only: show only some cards — one person's, some boards', or both
+   *  (TD-59/TD2-216), across every section on the canvas. Render-only — never
+   *  patched into storage. */
+  filter?: RenderFilter;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
@@ -304,7 +306,7 @@ export function CanvasNode({
         isMaster={isMaster}
         masterSection={masterSection}
         onRemove={onRemove}
-        filterAssigneeId={filterAssigneeId}
+        filter={filter}
       />
     );
   }

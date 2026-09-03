@@ -14,11 +14,14 @@ import {
 } from "@/lib/sections";
 import { compareTaskOrder } from "@/lib/task-order";
 import type { TaskUnit } from "@/lib/outline";
+import { isAssignedTo, makeNodeMatcher, makeTaskPredicate } from "@/lib/task-filters";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
+import type { ProjectFilters } from "./useProjectFilters";
 import { TaskCard, TASK_DND_MIME } from "./TaskCard";
 import { BoardModal } from "./BoardModal";
 import { Avatar } from "@/components/ui/Badge";
 import { useViewMode } from "@/components/ui/ViewToggle";
+import { useAssignOnCreate } from "./useAssignOnCreate";
 import { SeparatorHeader } from "./SeparatorHeader";
 import { OutlineEditor } from "./OutlineEditor";
 import { useOutlineDraft } from "./useOutlineDraft";
@@ -30,8 +33,8 @@ const BOARD_DND_MIME = "application/x-board-id";
 
 /**
  * A project's Boards view: the triage ladder read top to bottom as one big
- * collapsible SEPARATOR per placement bucket (INBOX · DONE THIS WEEK · THIS
- * WEEK · BACKLOG · LATER), and inside each, the project's boards left→right
+ * collapsible SEPARATOR per placement bucket (INBOX · DONE THIS WEEK · TODAY ·
+ * THIS WEEK · BACKLOG · LATER), and inside each, the project's boards left→right
  * as columns — the same columns, in the same order, as before.
  *
  * The two axes are deliberate: the separator says WHEN you mean to do a thing,
@@ -45,8 +48,19 @@ const BOARD_DND_MIME = "application/x-board-id";
  * /api/placements — see `placementOfTask`. Drag a column by its handle to
  * reorder the boards (which also reorders the sidebar, since both read the
  * persisted board position).
+ *
+ * `filters` (TD2-216) narrows both axes: which boards get a column, and whose
+ * cards those columns draw. Render only — the board REORDER still works off the
+ * project's full board list, or dragging a column while some are filtered out
+ * would compute its new slot against a list the project doesn't have.
  */
-export function BoardsColumns({ project }: { project: Project }) {
+export function BoardsColumns({
+  project,
+  filters,
+}: {
+  project: Project;
+  filters: ProjectFilters;
+}) {
   const {
     nodes,
     taskMap,
@@ -59,7 +73,25 @@ export function BoardsColumns({ project }: { project: Project }) {
     archiveTasks,
     reorderBoards,
   } = useWorkspace();
-  const boards = useMemo(() => project.boards ?? [], [project.boards]);
+  /** Every board this project shows — the reorder baseline, and what the board
+   *  filter is a subset OF. */
+  const projectBoards = useMemo(() => project.boards ?? [], [project.boards]);
+  /** The columns actually drawn. */
+  const boards = filters.visibleBoards;
+
+  /** Whose cards to draw. One matcher for the whole render (it memoizes its
+   *  subtree walks), shared by the columns, the band counts and the sweeps —
+   *  so a band's count, the cards under it and what its sweep button acts on
+   *  can't disagree. */
+  const matchesAssignee = useMemo(
+    () =>
+      makeNodeMatcher<TaskNode>({
+        keep: makeTaskPredicate({ assigneeId: filters.assigneeId }),
+        taskOf: (id) => taskMap[id],
+        childrenOf: (id) => nodes.filter((n) => n.parentId === id),
+      }),
+    [filters.assigneeId, taskMap, nodes],
+  );
 
   const [dragBoardId, setDragBoardId] = useState<string | null>(null);
   const [overBoardId, setOverBoardId] = useState<string | null>(null);
@@ -184,7 +216,14 @@ export function BoardsColumns({ project }: { project: Project }) {
     const boardIds = new Set(boards.map((b) => b.id));
     const done = new Set<string>();
     for (const node of nodes)
-      if (node.status === "done" && node.boardId && boardIds.has(node.boardId))
+      if (
+        node.status === "done" &&
+        node.boardId &&
+        boardIds.has(node.boardId) &&
+        // Never sweep a card the filter is hiding: the button says "clear the
+        // done cards in this column", and it must mean the ones on screen.
+        matchesAssignee(node.id)
+      )
         done.add(node.id);
     const out = new Map<TaskPlacement, Map<string, string[]>>();
     for (const id of done) {
@@ -201,7 +240,7 @@ export function BoardsColumns({ project }: { project: Project }) {
       else lane.set(node.boardId, [id]);
     }
     return out;
-  }, [nodes, nodeById, boards, placementByNode]);
+  }, [nodes, nodeById, boards, placementByNode, matchesAssignee]);
 
   /** A card's children WITHIN one column — the mirror of the root rule above, so
    *  every task renders exactly once: a child that was promoted to a root of
@@ -217,6 +256,16 @@ export function BoardsColumns({ project }: { project: Project }) {
         )
         .sort(compareTaskOrder),
     [nodes, placementByNode],
+  );
+
+  /** The same children, narrowed to what the assignee filter draws. This is what
+   *  a column RENDERS and what its text mode edits (TD2-194) — while
+   *  `childrenInColumn` above stays whole, because the outline's save scope has
+   *  to keep knowing about the siblings it isn't showing. */
+  const visibleChildrenInColumn = useCallback(
+    (id: string, boardId: string, placement: TaskPlacement) =>
+      childrenInColumn(id, boardId, placement).filter((n) => matchesAssignee(n.id)),
+    [childrenInColumn, matchesAssignee],
   );
 
   /* ---- collapse state, remembered per project ---- */
@@ -243,9 +292,13 @@ export function BoardsColumns({ project }: { project: Project }) {
 
   function handleReorderDrop(targetId: string) {
     if (dragBoardId && dragBoardId !== targetId) {
-      const fromIdx = boards.findIndex((b) => b.id === dragBoardId);
-      const targetIdx = boards.findIndex((b) => b.id === targetId);
-      const ids = boards.map((b) => b.id).filter((id) => id !== dragBoardId);
+      // Against `projectBoards`, not the drawn ones: with a board filter on, the
+      // dragged column's new slot has to be expressed in the project's real
+      // order — reordering the visible subset would shuffle the boards you
+      // can't see (TD2-216).
+      const fromIdx = projectBoards.findIndex((b) => b.id === dragBoardId);
+      const targetIdx = projectBoards.findIndex((b) => b.id === targetId);
+      const ids = projectBoards.map((b) => b.id).filter((id) => id !== dragBoardId);
       const to = ids.indexOf(targetId);
       // Dropping onto a target lands the board on that target's side: when
       // moving forward (dragged board started before the target) insert AFTER
@@ -292,8 +345,11 @@ export function BoardsColumns({ project }: { project: Project }) {
     <div className="-mx-8 flex flex-col gap-4">
       {PLACEMENT_ORDER.map((placement) => {
         const lane = byPlacement.get(placement) ?? new Map<string, TaskNode[]>();
+        // Counted over what's DRAWN: a band headed "12" above two cards reads as
+        // a bug rather than as a filter.
         let count = 0;
-        for (const cards of lane.values()) count += cards.length;
+        for (const cards of lane.values())
+          for (const card of cards) if (matchesAssignee(card.id)) count += 1;
         const isCollapsed = collapsed.has(placement);
         return (
           <section key={placement}>
@@ -313,6 +369,10 @@ export function BoardsColumns({ project }: { project: Project }) {
                     board={board}
                     placement={placement}
                     roots={lane.get(board.id) ?? []}
+                    visibleRoots={(lane.get(board.id) ?? []).filter((n) =>
+                      matchesAssignee(n.id),
+                    )}
+                    assigneeId={filters.assigneeId}
                     // A band nobody has filed anything into shows as a single
                     // slim row of board chips instead of a full row of empty
                     // 440px columns: the ladder has six bands and most of them
@@ -334,6 +394,7 @@ export function BoardsColumns({ project }: { project: Project }) {
                     }
                     doneTrayLabel={placementTitle(titles, "doneThisWeek")}
                     childrenInColumn={childrenInColumn}
+                    visibleChildrenInColumn={visibleChildrenInColumn}
                     label={placementTitle(titles, placement)}
                     taskMap={taskMap}
                     openTask={openTask}
@@ -343,8 +404,8 @@ export function BoardsColumns({ project }: { project: Project }) {
                         at: { targetId, pos, orderedIds: (lane.get(board.id) ?? []).map((n) => n.id) },
                       })
                     }
-                    onAdd={(title) =>
-                      addTask("backlog", title, board.id, placement)
+                    onAdd={(title, assigneeIds) =>
+                      addTask("backlog", title, board.id, placement, assigneeIds)
                     }
                     isOver={overBoardId === board.id && dragBoardId !== board.id}
                     onReorderStart={() => setDragBoardId(board.id)}
@@ -379,12 +440,15 @@ function BoardColumn({
   board,
   placement,
   roots,
+  visibleRoots,
+  assigneeId,
   slim,
   doneIds,
   sweep,
   onSweep,
   doneTrayLabel,
   childrenInColumn,
+  visibleChildrenInColumn,
   label,
   taskMap,
   openTask,
@@ -399,7 +463,14 @@ function BoardColumn({
 }: {
   board: Board;
   placement: TaskPlacement;
+  /** Every root this column owns — the outline's save SCOPE, whatever is being
+   *  drawn. Narrowing it would hand text mode a world with a hole in it. */
   roots: TaskNode[];
+  /** The roots actually drawn, and the ones text mode edits (TD2-216/TD2-194). */
+  visibleRoots: TaskNode[];
+  /** The assignee filter in force, or null — a card not directly theirs is
+   *  dimmed, since it's here as context for a subtask that IS. */
+  assigneeId: string | null;
   /** Render as a one-line chip rather than a column — the whole band is empty. */
   slim: boolean;
   /** The done cards this column would sweep, at any depth. Empty when there's
@@ -417,6 +488,12 @@ function BoardColumn({
     boardId: string,
     placement: TaskPlacement,
   ) => TaskNode[];
+  /** `childrenInColumn`, narrowed to what the filter draws. */
+  visibleChildrenInColumn: (
+    id: string,
+    boardId: string,
+    placement: TaskPlacement,
+  ) => TaskNode[];
   /** The bucket's name as the band above shows it — so the composer's hint says
    *  where the card will land in the words the canvas uses. */
   label: string;
@@ -426,7 +503,7 @@ function BoardColumn({
   onDropCard: (id: string) => void;
   /** Dropped ON a card — land next to that card instead of at the end. */
   onDropCardAt: (dragId: string, targetId: string, pos: "before" | "after") => void;
-  onAdd: (title: string) => void;
+  onAdd: (title: string, assigneeIds?: string[]) => void;
   isOver: boolean;
   onReorderStart: () => void;
   onReorderEnd: () => void;
@@ -444,7 +521,13 @@ function BoardColumn({
 
   /** This column as a task TREE — what text mode edits. Same shape the canvas
    *  builds for a Section (`useSectionUnits`): roots in rendered order, each with
-   *  its in-column children beneath it. */
+   *  its in-column children beneath it.
+   *
+   *  Built from the VISIBLE roots (TD2-194): text mode shows what card mode
+   *  shows, or the filter reads as broken the moment you switch. Safe because
+   *  the outline deletes only a line someone deleted by hand and positions are
+   *  fractional midpoints — a row it can't see can neither be removed nor
+   *  renumbered. `scopeNodes` below is what keeps the hidden ones addressable. */
   const units = useMemo(() => {
     const build = (nodes: TaskNode[], depth: number): TaskUnit[] =>
       nodes.map((n) => {
@@ -454,11 +537,14 @@ function BoardColumn({
           title: t?.title ?? "",
           description: t?.description ?? "",
           // Same depth cap as the card renderer, against a corrupt parent cycle.
-          children: depth < 5 ? build(childrenInColumn(n.id, board.id, placement), depth + 1) : [],
+          children:
+            depth < 5
+              ? build(visibleChildrenInColumn(n.id, board.id, placement), depth + 1)
+              : [],
         };
       });
-    return build(roots, 0);
-  }, [roots, taskMap, childrenInColumn, board.id, placement]);
+    return build(visibleRoots, 0);
+  }, [visibleRoots, taskMap, visibleChildrenInColumn, board.id, placement]);
 
   /** Every task this column owns, at any depth — the scope a save may delete
    *  within, and the order/parent baseline it compares against. */
@@ -484,6 +570,10 @@ function BoardColumn({
     scopeNodes,
     boardId: board.id,
     rootTarget,
+    // Same rule as the canvas outline (TD2-193): a line typed into a filtered
+    // column belongs to the person that column is filtered to, or it would
+    // disappear as it bound.
+    assigneeIds: assigneeId ? [assigneeId] : undefined,
     // Escape leaves text mode; the hook has already flushed by then.
     onLeave: () => setText_(false),
   });
@@ -505,12 +595,13 @@ function BoardColumn({
     const task = taskMap[node.id];
     if (!task) return null;
     const kids =
-      depth < 5 ? childrenInColumn(node.id, board.id, placement) : [];
+      depth < 5 ? visibleChildrenInColumn(node.id, board.id, placement) : [];
     return (
       <TaskCard
         key={node.id}
         task={task}
         statusBadge
+        dimmed={!!assigneeId && !isAssignedTo(task, assigneeId)}
         onOpen={() => openTask(node.id)}
         // Roots only: they ARE this column's run, which is what the drop math
         // reorders. A nested subtask isn't in that run, so it stays inert and the
@@ -564,7 +655,7 @@ function BoardColumn({
         // Three widths, one rule: a column with cards is full width, one whose
         // band has cards elsewhere shrinks to a stub you can still aim at, and a
         // column in an entirely empty band is a single-line chip.
-        slim ? "w-44" : roots.length === 0 ? "w-56" : "w-[440px]",
+        slim ? "w-44" : visibleRoots.length === 0 ? "w-56" : "w-[440px]",
         isOver || cardOver ? "border-accent ring-1 ring-accent" : "border-border",
       ].join(" ")}
     >
@@ -596,7 +687,7 @@ function BoardColumn({
         >
           {board.name}
         </Link>
-        <span className="nums text-xs text-faint">{roots.length}</span>
+        <span className="nums text-xs text-faint">{visibleRoots.length}</span>
         {slim ? null : (
           <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5">
             <ViewBtn active={text} onClick={showText} title="Text">
@@ -660,8 +751,8 @@ function BoardColumn({
             />
           ) : (
             <div className="min-h-16 space-y-1.5">
-              {roots.map((node) => renderCard(node, 0))}
-              <AddCard label={label} onAdd={onAdd} />
+              {visibleRoots.map((node) => renderCard(node, 0))}
+              <AddCard label={label} assigneeId={assigneeId} onAdd={onAdd} />
             </div>
           )}
         </div>
@@ -702,12 +793,16 @@ function ViewBtn({
 function AddCard({
   label,
   onAdd,
+  assigneeId,
 }: {
   label: string;
-  onAdd: (title: string) => void;
+  onAdd: (title: string, assigneeIds?: string[]) => void;
+  /** The assignee filter in force — see `useAssignOnCreate` (TD2-193). */
+  assigneeId: string | null;
 }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState("");
+  const assign = useAssignOnCreate(assigneeId);
 
   if (!editing) {
     return (
@@ -721,24 +816,27 @@ function AddCard({
   }
 
   return (
-    <input
-      autoFocus
-      value={text}
-      onChange={(e) => setText(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" && text.trim()) {
-          onAdd(text.trim());
-          setText(""); // keep open for rapid entry
-        } else if (e.key === "Escape") {
-          setText("");
-          setEditing(false);
-        }
-      }}
-      onBlur={() => {
-        if (!text.trim()) setEditing(false);
-      }}
-      placeholder={`Task name, then Enter… (lands in ${label})`}
-      className="rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
-    />
+    <div>
+      <input
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && text.trim()) {
+            onAdd(text.trim(), assign.assigneeIds);
+            setText(""); // keep open for rapid entry
+          } else if (e.key === "Escape") {
+            setText("");
+            setEditing(false);
+          }
+        }}
+        onBlur={() => {
+          if (!text.trim()) setEditing(false);
+        }}
+        placeholder={`Task name, then Enter… (lands in ${label})`}
+        className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
+      />
+      {assign.control}
+    </div>
   );
 }

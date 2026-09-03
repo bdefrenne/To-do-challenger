@@ -42,6 +42,7 @@ loadEnvConfig(process.cwd(), true);
 import { db } from "../src/lib/db/client";
 import { workDays, tasks, taskStatusEvents } from "../src/lib/db/schema";
 import {
+  createTask,
   getWorkDay,
   markDayReady,
   finishWork,
@@ -109,6 +110,53 @@ async function main() {
     .from(workDays)
     .where(and(eq(workDays.userId, USER), eq(workDays.projectId, PROJECT), eq(workDays.day, TODAY)));
   check("exactly one row per (user, project, day)", rows.length, 1);
+
+  /* ---- WHICH tray the snapshot freezes (TD2-215) ------------------------
+     TODAY is the list you commit to by hand; THIS WEEK is the one an agent
+     writes to behind you (`statusImpliesThisWeek`). So the snapshot prefers
+     TODAY and falls back to THIS WEEK on a morning you didn't make a shortlist
+     — reading TODAY strictly would hand back an empty plan and silently zero
+     every drift figure, which is the failure that got the tray retired the
+     first time (TD2-202).
+
+     Precondition: this project's TODAY is empty of REAL cards. It is by
+     construction — TD2-215 reinstated the tray without moving anything into
+     it — and if that ever stops being true, the fallback check below is the
+     right place to find out. */
+  const inWeek = await withLogContext({ actorId: USER, source: "mcp" }, () =>
+    createTask(
+      { title: "TD2-215 scratch: in THIS WEEK", boardId: BOARD, placement: "thisWeek" },
+      USER,
+    ),
+  );
+  created.push(inWeek.id);
+  const fellBack = await markDayReady(USER, PROJECT, TODAY);
+  check(
+    "with TODAY empty, the snapshot falls back to THIS WEEK",
+    (fellBack.snapshot ?? []).some((e) => e.taskId === inWeek.id),
+    true,
+  );
+
+  const inToday = await withLogContext({ actorId: USER, source: "mcp" }, () =>
+    createTask(
+      { title: "TD2-215 scratch: in TODAY", boardId: BOARD, placement: "today" },
+      USER,
+    ),
+  );
+  created.push(inToday.id);
+  const shortlist = await markDayReady(USER, PROJECT, TODAY);
+  check(
+    "…and once TODAY has a card, that is what gets frozen",
+    (shortlist.snapshot ?? []).some((e) => e.taskId === inToday.id),
+    true,
+  );
+  /* Preferred OUTRIGHT, not merged: a shortlist that quietly carries the whole
+     week's board is not a shortlist. */
+  check(
+    "…and THIS WEEK is no longer in it — TODAY replaces it, never merges",
+    (shortlist.snapshot ?? []).some((e) => e.taskId === inWeek.id),
+    false,
+  );
 
   /* D1 still needs a snapshot for the drift assertions at the end. Seeded
      directly, because the service correctly refuses to back-date one — a fixture

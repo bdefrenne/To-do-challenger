@@ -16,7 +16,11 @@ import { LiveMap, LiveObject, type Json } from "@liveblocks/client";
 import { LiveblocksProvider, RoomProvider } from "@liveblocks/react";
 import { CanvasEditor } from "@/components/workspace/CanvasEditor";
 import { CanvasConnectionStatus } from "@/components/workspace/CanvasConnectionStatus";
-import { CanvasAssigneeFilter } from "@/components/workspace/CanvasAssigneeFilter";
+import { AssigneeFilter } from "@/components/workspace/AssigneeFilter";
+import { BoardFilter } from "@/components/workspace/BoardFilter";
+import { useProjectFilters } from "@/components/workspace/useProjectFilters";
+import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { makeRenderFilter } from "@/lib/task-filters";
 import type { StoredNode } from "@/liveblocks.config";
 import type { Canvas, CanvasNode } from "@/lib/types";
 
@@ -57,10 +61,29 @@ export default function CanvasPage() {
   // it, so the canvas only auto-draws lanes for its own project's boards.
   const [projectId, setProjectId] = useState<string | null>(null);
   const nameTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // TD-59: show only this assignee's cards, across every group on the canvas.
-  // Local UI state only — see CanvasEditor's `filterAssigneeId` prop doc for
-  // why this never touches Liveblocks storage.
-  const [filterAssigneeId, setFilterAssigneeId] = useState<string | null>(null);
+  /* What this canvas is showing: one person's work, some boards' lanes, or both
+     (TD-59, widened in TD2-216). Held per PROJECT rather than per canvas, and in
+     the same store the project page reads — so a filter set on the Boards view
+     is still on when you open the canvas, and the other way round.
+
+     It is one viewer's private view of a shared room: see CanvasEditor's
+     `filter` prop for the two places it must never reach. */
+  const { projects } = useWorkspace();
+  const boards = useMemo(
+    () => projects.find((p) => p.id === projectId)?.boards ?? [],
+    [projects, projectId],
+  );
+  const filters = useProjectFilters(projectId ?? "", boards);
+  // Built once per change: every memo boundary down the node tree compares it by
+  // reference (see `canvasNodeRenderPropsEqual`).
+  const filter = useMemo(
+    () =>
+      makeRenderFilter({
+        assigneeId: filters.assigneeId,
+        boardIds: filters.boardIds,
+      }),
+    [filters.assigneeId, filters.boardIds],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -133,7 +156,14 @@ export default function CanvasPage() {
           className="min-w-0 max-w-xs shrink rounded-md bg-transparent px-1 py-0.5 text-sm font-semibold text-fg outline-none focus:bg-surface-2"
           placeholder="Untitled canvas"
         />
-        <CanvasAssigneeFilter value={filterAssigneeId} onChange={setFilterAssigneeId} />
+        <AssigneeFilter value={filters.assigneeId} onChange={filters.setAssigneeId} />
+        {boards.length > 1 ? (
+          <BoardFilter
+            boards={boards}
+            value={filters.boardIds}
+            onChange={filters.setBoardIds}
+          />
+        ) : null}
         <div className="flex-1" />
       </header>
       <div className="relative min-h-0 flex-1">
@@ -166,7 +196,7 @@ export default function CanvasPage() {
                 canvasId={canvasId}
                 canvasName={name}
                 projectId={projectId ?? ""}
-                filterAssigneeId={filterAssigneeId}
+                filter={filter}
               />
               <CanvasConnectionStatus />
             </RoomProvider>

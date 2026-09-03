@@ -32,14 +32,22 @@ interface Entry {
   fireRef: { current: () => void };
 }
 
-/** key (lower-case, as `useCardShortcut` receives it) → the cards listening. */
+/** key (lower-case, as `useCardShortcut` receives it) → the cards listening.
+ *  A key may carry a `shift+` prefix; see `onKey` for how it's resolved. */
 const registry = new Map<string, Set<Entry>>();
 /** Installed with the first entry, removed with the last — so a page carrying no
  *  cards (and SSR) never has a listener at all. */
 let listening = false;
 
 function onKey(e: KeyboardEvent) {
-  const entries = registry.get(e.key.toLowerCase());
+  // SHIFT is looked up FIRST and falls through, rather than being part of the key
+  // outright: `shift+arrowup` (send to TODAY) must be distinguishable from
+  // `arrowup` (send to THIS WEEK), but holding shift while pressing D or SPACE
+  // has always fired those and silently must go on doing so. Meta/ctrl/alt stay
+  // disqualifying below — those are browser and OS gestures, not ours.
+  const bare = e.key.toLowerCase();
+  const entries =
+    (e.shiftKey ? registry.get(`shift+${bare}`) : undefined) ?? registry.get(bare);
   if (!entries?.size) return;
   // Ignore auto-repeat: each card shortcut is one discrete action, and it stops
   // a held key (e.g. SPACE mid-pan drifting over a card) from firing repeatedly.

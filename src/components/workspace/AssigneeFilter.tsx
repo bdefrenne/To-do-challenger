@@ -1,11 +1,16 @@
 "use client";
 
 /**
- * Canvas header control (TD-59) — show only one assignee's cards across every
- * section on the board. Purely a client-side render filter: no Liveblocks
- * write, no server round-trip (see CanvasEditor's `filterAssigneeId` prop and
- * SectionNode's resize guard for why that matters). A dropdown picks anyone on
- * the roster; the "Me" pill is a one-click shortcut for the common case.
+ * Show only one person's work (TD-59, generalised in TD2-216) — on the canvas,
+ * and on a project's List, Boards and Done views, which is why it lives here
+ * rather than beside the canvas. Purely a client-side render filter: no
+ * Liveblocks write, no server round-trip (see `src/lib/task-filters.ts` for
+ * what that buys and what it forbids). A dropdown picks anyone on the roster;
+ * the "Me" pill is a one-click shortcut for the common case.
+ *
+ * Single-select on purpose: "whose is this?" is a question with one answer at a
+ * time, and the answer is what the dimming of context ancestors is read
+ * against. The BOARD filter beside it is the multi-select one.
  */
 
 import { Check, ChevronDown } from "lucide-react";
@@ -14,7 +19,7 @@ import { usePeople } from "@/components/PeopleContext";
 import { PersonAvatar } from "@/components/PersonAvatar";
 import { AnchoredPopover } from "./AnchoredPopover";
 
-export function CanvasAssigneeFilter({
+export function AssigneeFilter({
   value,
   onChange,
 }: {
@@ -46,7 +51,7 @@ export function CanvasAssigneeFilter({
       <button
         type="button"
         onClick={() => (open ? setOpen(false) : openFresh())}
-        title="Show only one assignee's tasks, across every group on this canvas"
+        title="Show only one person's tasks"
         className={[
           "flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors",
           selected

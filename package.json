@@ -24,7 +24,6 @@
     "check:this-week": "tsx scripts/check-this-week.ts",
     "repair:cross-pins": "tsx scripts/repair-cross-canvas-pins.ts",
     "repair:week-lane-ids": "tsx scripts/repair-week-lane-ids.ts",
-    "retire:today": "tsx scripts/retire-today-tray.ts",
     "check:done": "tsx scripts/check-done-view.ts",
     "check:parent-done": "tsx scripts/check-parent-done.ts",
     "check:day": "tsx scripts/check-work-days.ts",

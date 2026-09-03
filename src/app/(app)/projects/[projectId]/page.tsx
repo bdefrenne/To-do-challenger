@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -13,6 +13,9 @@ import { EntityReadme } from "@/components/workspace/EntityReadme";
 import { TaskTable } from "@/components/workspace/TaskTable";
 import { DoneBoards } from "@/components/workspace/DoneBoards";
 import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
+import { AssigneeFilter } from "@/components/workspace/AssigneeFilter";
+import { BoardFilter } from "@/components/workspace/BoardFilter";
+import { useProjectFilters } from "@/components/workspace/useProjectFilters";
 
 /**
  * Project view. Three modes:
@@ -23,6 +26,10 @@ import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
  *     board; drag a column handle to reorder the boards (and the sidebar).
  *   • Done — what actually got finished, as collapsible weeks and days, each day
  *     holding one column per person cut across by a band per board.
+ *
+ * All three read ONE pair of filters (TD2-216) — whose work, and which boards —
+ * held here rather than per view, so the answer survives switching between them.
+ * They're render filters: what a view draws, never what it writes.
  */
 export default function ProjectPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -52,8 +59,14 @@ export default function ProjectPage() {
     };
   }, [projectId]);
 
-  const boards = project?.boards ?? [];
-  const boardIds = boards.map((b) => b.id);
+  const boards = useMemo(() => project?.boards ?? [], [project?.boards]);
+  const filters = useProjectFilters(projectId, boards);
+  // What the views actually draw: the board filter narrows this, and the List
+  // view needs nothing else — its scope is already a board-id list.
+  const boardIds = useMemo(
+    () => filters.visibleBoards.map((b) => b.id),
+    [filters.visibleBoards],
+  );
 
   return (
     <div className="min-h-screen">
@@ -110,12 +123,32 @@ export default function ProjectPage() {
               gitFolder={project.gitFolder}
               description={project.description}
             />
+            {/* One filter bar for all three views. Below the header rather than
+                in it: the header is the project's identity and its actions,
+                these change what you're looking at. */}
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              <AssigneeFilter
+                value={filters.assigneeId}
+                onChange={filters.setAssigneeId}
+              />
+              {boards.length > 1 ? (
+                <BoardFilter
+                  boards={boards}
+                  value={filters.boardIds}
+                  onChange={filters.setBoardIds}
+                />
+              ) : null}
+            </div>
             {view === "list" ? (
-              <TaskTable boardIds={boardIds} addBoardId={boardIds[0] ?? null} />
+              <TaskTable
+                boardIds={boardIds}
+                addBoardId={boardIds[0] ?? null}
+                assigneeId={filters.assigneeId}
+              />
             ) : view === "boards" ? (
-              <BoardsColumns project={project} />
+              <BoardsColumns project={project} filters={filters} />
             ) : (
-              <DoneBoards project={project} />
+              <DoneBoards project={project} filters={filters} />
             )}
           </>
         )}

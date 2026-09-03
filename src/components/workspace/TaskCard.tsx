@@ -27,6 +27,7 @@ export function TaskCard({
   neutralDone = false,
   readOnly = false,
   onDropAt,
+  dimmed = false,
   children,
 }: {
   task: Task;
@@ -49,6 +50,10 @@ export function TaskCard({
    *  page, the Done view) leaves the card drop-inert exactly as before: the
    *  column underneath keeps the whole gesture. */
   onDropAt?: (dragId: string, pos: "before" | "after") => void;
+  /** Drawn only as CONTEXT for a matching subtask under an assignee filter
+   *  (TD2-216) — nothing on this card is theirs. Dimmed, exactly as the canvas
+   *  card is, so the real match still reads as the point of the filter. */
+  dimmed?: boolean;
   /** Nested subtask cards, rendered indented beneath this one. */
   children?: React.ReactNode;
 }) {
@@ -153,6 +158,7 @@ export function TaskCard({
           // rounded corners without clashing with any drop-hint shadow.
           badge ? `outline outline-[3px] outline-offset-2 ${statusTone.outline}` : "",
           dragging ? "opacity-40" : "",
+          dimmed ? "opacity-45" : "",
           // Same drop hint as the List view's rows, so the gesture reads the
           // same on both surfaces.
           dropPos === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",

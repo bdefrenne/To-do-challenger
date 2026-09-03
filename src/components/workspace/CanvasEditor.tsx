@@ -88,6 +88,7 @@ import {
 } from "@/lib/sections";
 import type { TaskPlacement } from "@/lib/types";
 import { allBoards } from "@/lib/boards";
+import { NO_FILTER, type RenderFilter } from "@/lib/task-filters";
 
 type Tool = "select" | "text" | "section" | "group" | "draw" | "erase";
 
@@ -134,9 +135,11 @@ const TRAY_GAP = 120;
  *  `trayOfPlacement`, `PLACEMENT_BAR` and the project Boards view, all of which
  *  still want the bucket. Only the canvas stops rendering a lane for it.
  *
- *  TODAY isn't here because it isn't anywhere any more (TD2-202) — it was
- *  removed from `SYSTEM_GROUPS` outright, and its leftover nodes are swept
- *  below. */
+ *  TODAY is here again (TD2-215). The sweep that used to delete its nodes by id
+ *  prefix is GONE — leaving it in place would destroy the tray on the same pass
+ *  that created it. Any `today-*` node a canvas still carries from before TD2-202
+ *  is simply re-adopted, which is the behaviour we want: those ids are derived,
+ *  so an old node IS the node the reconciler would have made. */
 const CANVAS_SYSTEM_GROUPS = SYSTEM_GROUPS.filter((k) => k !== "doneThisWeek");
 
 /** Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
@@ -569,17 +572,29 @@ export function CanvasEditor({
   canvasId,
   canvasName,
   projectId,
-  filterAssigneeId = null,
+  filter = NO_FILTER,
 }: {
   canvasId: string;
   canvasName: string;
   /** The project this canvas lays out. Scopes which boards the reconcilers draw
    *  lanes for — see `canvasTaskNodes`. */
   projectId: string;
-  /** Show only this assignee's cards across every section (TD-59). Render-only
-   *  — never patched into Liveblocks storage, so it can't fight over section
-   *  heights with peers who have a different (or no) filter active. */
-  filterAssigneeId?: string | null;
+  /**
+   * Show only some cards, and only some boards' lanes (TD-59, widened to boards
+   * in TD2-216). Render-only — never patched into Liveblocks storage, so it
+   * can't fight over section heights with peers who have a different (or no)
+   * filter active.
+   *
+   * READ THIS BEFORE USING IT ANYWHERE ELSE IN THIS FILE. It is applied at the
+   * bottom, in the `ordered.map()` that draws the nodes, and NOWHERE above it.
+   * `projectBoards` — the board list the lane reconciler works from — treats a
+   * board it can't see as one that has left the project and DELETES its lanes
+   * for everyone in the room (that's how hiding a board works, TD2-213). A
+   * viewer's private filter reaching that set would sweep other people's lanes.
+   * Same for `computeGroupLayout`, which must keep reading every node or one
+   * person's filter would repack the arrangement for the room.
+   */
+  filter?: RenderFilter;
 }) {
   const nodesMap = useStorage((root) => root.nodes);
   const others = useOthers();
@@ -1070,15 +1085,6 @@ export function CanvasEditor({
         .map((n) => n.id),
     );
 
-    // TODAY, retired outright (TD2-202): its cards were moved to the top of THIS
-    // WEEK and the bucket deleted, so unlike DONE THIS WEEK there is nothing
-    // left of it anywhere. Matched on the id PREFIX rather than through
-    // `systemGroupOf`, which can't name a kind that no longer exists in
-    // `SystemGroup` — `today-<canvasId>` is the group and
-    // `today-<canvasId>-<boardId>` its lanes, so one prefix catches both.
-    const todayPrefix = `today-${canvasId}`;
-    removes.push(...nodes.filter((n) => n.id.startsWith(todayPrefix)).map((n) => n.id));
-
     // Legacy THIS WEEK lanes (`wk-<groupId>-<boardId>`) from when the group was
     // hand-made (TD-137). The reconciler now creates `thisWeek-<canvasId>-…`
     // lanes for the same boards, so leaving these would double every lane in the
@@ -1297,6 +1303,7 @@ export function CanvasEditor({
       .map((kind) => nodes.find((n) => n.id === systemGroupId(kind, canvasId)))
       .filter((n): n is CanvasNode => n !== undefined);
     const inbox = nodes.find((n) => n.id === systemGroupId("inbox", canvasId));
+    const today = nodes.find((n) => n.id === systemGroupId("today", canvasId));
     const patches: { id: string; patch: Partial<StoredNode> }[] = [];
     /** Put a derived tray at (x,y). Returns where it ended up so the next one
      *  down stacks off the truth rather than off a patch that hasn't landed. */
@@ -1327,6 +1334,26 @@ export function CanvasEditor({
     for (const g of below) {
       above = place(g, head.x, above.y + above.height + TRAY_GAP);
     }
+    // TODAY hangs ABOVE the head — the only tray that does, because it's the only
+    // one tighter than a week, and the column reads as a timescale loosening
+    // downward (today → this week → backlog → later).
+    //
+    // Deriving UPWARD is the thing the TD2-171 comment above warns about, so be
+    // clear about why it's safe now and wasn't then. The invariant that fixed the
+    // overlap is that no tray may claim ground another tray STANDS on. TODAY's
+    // bottom edge is pinned exactly TRAY_GAP above the head's top, and there is
+    // nothing above TODAY, so its growth only ever extends into empty canvas — it
+    // cannot reach any other tray. What actually broke in TD2-171 was the `placed`
+    // flag: a dragged tray stopped being arranged while `computeGroupLayout` went
+    // on growing its box, so it grew through its neighbour's frame. That flag is
+    // now swept off every tray (`DEAD_GROUP_KEYS`) and a tray can't acquire one.
+    //
+    // The cost is cosmetic and deliberate: adding cards to TODAY moves the
+    // column's TOP edge up rather than pushing everything else down. That's the
+    // trade for keeping THIS WEEK as the single stored origin — making TODAY the
+    // head instead would teleport every existing canvas's column the first time
+    // this ran.
+    if (today) place(today, head.x, head.y - today.height - TRAY_GAP);
     // INBOX sits beside the column because triage is a sideways move — what's
     // arrived, not yet a when. It rides THIS WEEK's row, so the two you compare
     // while sorting sit side by side. Measured from INBOX's OWN width so a tray
@@ -2994,6 +3021,13 @@ export function CanvasEditor({
 
           {ordered.map((node) => {
             const bid = node.data?.boardId as string | undefined;
+            /* The board filter, applied to whole LANES: a section bound to a
+               board nobody selected isn't drawn at all. Sections only — a
+               group, an image or a drawing belongs to no board, and a tray that
+               vanished because its columns are hidden would read as lost work.
+               Nothing above this line knows the filter exists (see the prop). */
+            if (node.kind === "section" && !filter.showsBoard(laneBoardId(node)))
+              return null;
             const master = bid ? masterByBoard.get(bid) : undefined;
             const other = master && master.id !== node.id ? master : null;
             return (
@@ -3016,7 +3050,7 @@ export function CanvasEditor({
                 groupDropActive={
                   node.kind === "section_group" && groupDropTarget === node.id
                 }
-                filterAssigneeId={filterAssigneeId}
+                filter={filter}
                 api={nodeApi}
               />
             );

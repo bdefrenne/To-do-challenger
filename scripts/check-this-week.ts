@@ -40,6 +40,7 @@ import {
   purgeTask,
   resolveThisWeekSection,
   resolvePlacementSection,
+  listPlacementGroups,
   getCanvas,
   listCanvases,
   listPlacementSections,
@@ -65,6 +66,11 @@ const TITLE = "[check:this-week] scratch — safe to delete";
  *  multi-group tie on the lowest id, so this guarantees the scratch group wins
  *  over any real one that happens to carry the same flag. */
 const LANE_ID = "!check-tw-lane";
+/** The same trick inside TODAY. Since TD2-215 the STATUS-IMPLIED move files a
+ *  task there rather than on THIS WEEK, so the implicit-move checks below need a
+ *  lane of their own to land in — and having both proves the two trays stay
+ *  distinct rather than one quietly standing in for the other. */
+const TODAY_LANE = "!check-td-lane";
 
 /** The throwaway board created for the "not covered yet" case — module-level so
  *  cleanup can reach it. */
@@ -164,6 +170,7 @@ async function main() {
   // ORDER BY position, id rather than by a tie-break — which is the rule under
   // test, not an accident of which board sorts first.
   const WEEK_GROUP = systemGroupId("thisWeek", canvas.id);
+  const TODAY_GROUP = systemGroupId("today", canvas.id);
   const [coveredBoard] = [...ownBoards];
   if (!coveredBoard) throw new Error("this canvas's project has no boards");
 
@@ -260,8 +267,17 @@ async function main() {
       position: -1,
       data: { groupId: WEEK_GROUP, boardId: coveredBoard },
     },
+    {
+      id: TODAY_LANE,
+      userId: ME,
+      canvasId: canvas.id,
+      kind: "section",
+      content: "[check:this-week] today lane",
+      position: -1,
+      data: { groupId: TODAY_GROUP, boardId: coveredBoard },
+    },
   ]);
-  console.log("Created a throwaway lane inside the THIS WEEK group.\n");
+  console.log("Created throwaway lanes inside the THIS WEEK and TODAY groups.\n");
 
   /* ---- 1. Resolution --------------------------------------------------- */
   check(
@@ -343,7 +359,7 @@ async function main() {
   }
   {
     const id = await mk({ boardId: coveredBoard, status: "analyzing" }, "mcp");
-    check("createTask born in analyzing via mcp → THIS WEEK", (await pinOf(id)) === LANE_ID);
+    check("createTask born in analyzing via mcp → TODAY", (await pinOf(id)) === TODAY_LANE);
   }
   {
     const id = await mk({ boardId: coveredBoard, status: "analyzing" }, "ui");
@@ -365,7 +381,7 @@ async function main() {
   {
     const id = await mk({ boardId: coveredBoard });
     await as("mcp", () => updateTask(id, { status: "analyzing" }, ME, AUTHOR));
-    check("updateTask → analyzing via mcp files an UNPINNED task", (await pinOf(id)) === LANE_ID);
+    check("updateTask → analyzing via mcp files an UNPINNED task on TODAY", (await pinOf(id)) === TODAY_LANE);
   }
   {
     const id = await mk({ boardId: coveredBoard });
@@ -393,7 +409,7 @@ async function main() {
   {
     const id = await mk({ boardId: coveredBoard });
     await as("mcp", () => moveTask(id, { status: "building" }, ME, AUTHOR));
-    check("moveTask → building via mcp files it on THIS WEEK", (await pinOf(id)) === LANE_ID);
+    check("moveTask → building via mcp files it on TODAY", (await pinOf(id)) === TODAY_LANE);
   }
   {
     const id = await mk({ boardId: coveredBoard });
@@ -421,7 +437,7 @@ async function main() {
   {
     const a = await mk({ boardId: coveredBoard });
     await as("mcp", () => bulkUpdate(ME, [a], { status: "building" }, AUTHOR));
-    check("bulkUpdate → building via mcp files unpinned tasks", (await pinOf(a)) === LANE_ID);
+    check("bulkUpdate → building via mcp files unpinned tasks on TODAY", (await pinOf(a)) === TODAY_LANE);
   }
 
   /* ---- 7. The other groups: BACKLOG / LATER / DONE THIS WEEK ----------
@@ -473,13 +489,24 @@ async function main() {
       got !== SYS_LANE_ID && got !== SYS_GROUP_ID,
       `got ${got}`,
     );
-    // Which canvas hosts the derived lane depends on the data (see
-    // `trayCanvasId`), so assert the KIND rather than the exact id — that's the
-    // part the reconciler reads to put the card in the right tray.
+    // Assert the BUCKET, not the id shape. The lane it hands back is derived
+    // only when LATER has no member for this board; when the user has made one
+    // by hand it wins ("an existing member wins"), and that lane carries a bare
+    // uuid. Both are correct — the card lands in LATER either way, which is the
+    // only thing this is about.
+    //
+    // Insisting on a derived id here was a real false alarm: Ben's LATER group
+    // has carried hand-made lanes for two of his boards since July, so this
+    // failed for a canvas that was working exactly as designed. `placements`
+    // reads the group flag, so it answers for both shapes; the derived-id path
+    // is still covered, because a lane that doesn't exist yet is absent from the
+    // map and falls through to `placementOfDerivedId`.
+    const { placements } = await listPlacementGroups(canvas.projectId);
+    const bucket = got === null ? null : (placements[got] ?? placementOfDerivedId(got));
     check(
-      "…and an unflagged tray resolves to a canvas-derived LATER lane",
-      got !== null && placementOfDerivedId(got) === "later",
-      `got ${got}`,
+      "…and an unflagged tray resolves into the LATER bucket",
+      bucket === "later",
+      `got ${got} → ${bucket}`,
     );
   }
   check(
@@ -689,7 +716,7 @@ async function main() {
     const detail = await getTask(id, ME);
     check(
       "activity trail explains the implicit move",
-      (detail?.logs ?? []).some((l) => l.message.includes("THIS WEEK")),
+      (detail?.logs ?? []).some((l) => l.message.includes("TODAY")),
       JSON.stringify((detail?.logs ?? []).map((l) => l.message)),
     );
   }
@@ -708,7 +735,7 @@ async function cleanup() {
     .delete(canvasNodes)
     .where(
       or(
-        inArray(canvasNodes.id, [LANE_ID, SYS_GROUP_ID, SYS_LANE_ID]),
+        inArray(canvasNodes.id, [LANE_ID, TODAY_LANE, SYS_GROUP_ID, SYS_LANE_ID]),
       ),
     )
     .returning({ id: canvasNodes.id });

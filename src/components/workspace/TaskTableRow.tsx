@@ -45,6 +45,7 @@ export function TaskTableRow({
   onEditMembers,
   onDragStartRow,
   onDropRow,
+  dimmed = false,
 }: {
   node: TaskNode;
   task: Task;
@@ -75,6 +76,10 @@ export function TaskTableRow({
   onEditMembers?: () => void;
   onDragStartRow: (id: string) => void;
   onDropRow: (targetId: string, pos: DropPos) => void;
+  /** Drawn only as CONTEXT for a matching subtask under an assignee filter
+   *  (TD2-216) — the row isn't itself assigned to them. Dimmed so the actual
+   *  match still reads as the point of the filter, exactly as a canvas card is. */
+  dimmed?: boolean;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<DropPos | null>(null);
@@ -127,6 +132,7 @@ export function TaskTableRow({
         // warm→cold. Normal stays plain.
         importance !== 0 ? ic.bg : "hover:bg-surface-2",
         isDragging ? "opacity-40" : "",
+        dimmed ? "opacity-45" : "",
         pos === "inside" ? "ring-1 ring-inset ring-accent" : "",
         pos === "before" ? "shadow-[inset_0_2px_0_0_var(--color-accent)]" : "",
         pos === "after" ? "shadow-[inset_0_-2px_0_0_var(--color-accent)]" : "",

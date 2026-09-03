@@ -365,11 +365,11 @@ const WORK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
 ]);
 
 /** Statuses that mean "this is in flight" — entering one auto-places the task in
- *  the canvas's THIS WEEK group, because an agent moving a task here is doing it
- *  NOW. Excludes `done`: finishing something is no reason to drag it onto this
- *  week's board. Only applies to a task nobody has pinned by hand — see
- *  `resolveThisWeekSection`. */
-const THIS_WEEK_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+ *  the canvas's TODAY group, because an agent moving a task here is doing it NOW.
+ *  Excludes `done`: finishing something is no reason to put it back on a tray of
+ *  work to do. Only applies to a task nobody has pinned by hand, and only from an
+ *  agent surface — see `placementImpliedByStatus`. */
+const STARTED_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
   "analyzing",
   "analyzed",
   "building",
@@ -580,6 +580,7 @@ export async function positionAtEnd(
  *  these lines exist to prevent. */
 const PLACEMENT_LOG: Record<TaskPlacement, string> = {
   inbox: "📥 Moved back to INBOX",
+  today: "🌅 Moved to TODAY",
   thisWeek: "📅 Moved to THIS WEEK",
   backlog: "🗂️ Moved to BACKLOG",
   later: "🕓 Moved to LATER",
@@ -718,15 +719,30 @@ function claimsWork(status?: TaskStatus | null): boolean {
   return source !== undefined && ASSIGNING_SOURCES.has(source);
 }
 
-/** Does writing `status` from the current surface also FILE the task on THIS
- *  WEEK's board? Same surface rule as `claimsWork`, for the same reason: an agent
- *  moving a task into work is telling us it's this week's, while a human dragging
- *  a card across a Kanban column would be startled to find it re-filed on the
- *  canvas. An explicit `thisWeek` still works from every surface. */
-function statusImpliesThisWeek(status?: TaskStatus | null): boolean {
-  if (status == null || !THIS_WEEK_STATUSES.has(status)) return false;
+/**
+ * The group a status write FILES the task into, or null for "leave it alone".
+ *
+ * TODAY (TD2-215; it was THIS WEEK from TD2-202 until then). An agent moving a
+ * task into work isn't guessing about the week — it's starting on the thing now,
+ * which is what TODAY means, and it puts the work in front of Ben on the tray
+ * `ready_for_day` freezes instead of somewhere he has to go fetch it from.
+ *
+ * Same surface rule as `claimsWork`, for the same reason: a human dragging a card
+ * across a Kanban column would be startled to find it re-filed on the canvas, so
+ * only the agent surfaces imply anything. An explicit `placement` still works from
+ * every surface and always wins.
+ *
+ * THE ONE PLACE THE BUCKET IS NAMED. All four mutators call this rather than
+ * writing the name themselves, so moving the implied destination again is a
+ * one-line change here and not a hunt through `createTask` / `updateTask` /
+ * `moveTask` / `bulkApply`.
+ */
+function placementImpliedByStatus(
+  status?: TaskStatus | null,
+): TaskPlacement | null {
+  if (status == null || !STARTED_STATUSES.has(status)) return null;
   const source = currentLogContext()?.source;
-  return source !== undefined && ASSIGNING_SOURCES.has(source);
+  return source !== undefined && ASSIGNING_SOURCES.has(source) ? "today" : null;
 }
 
 /**
@@ -1715,11 +1731,11 @@ export async function createTask(
   }
   // Canvas placement. An explicit pin (a canvas composer knows the section you
   // typed into) always wins; otherwise the asked-for group — or, failing that,
-  // THIS WEEK when being born straight into work implies it — and anything else
-  // stays unpinned and surfaces in its board's INBOX lane.
+  // whatever being born straight into work implies (TODAY, see
+  // `placementImpliedByStatus`) — and anything else stays unpinned and surfaces
+  // in its board's INBOX lane.
   const placement =
-    askedPlacement(input) ??
-    (statusImpliesThisWeek(status) ? "thisWeek" : "inbox");
+    askedPlacement(input) ?? placementImpliedByStatus(status) ?? "inbox";
   const canvasSectionId =
     input.canvasSectionId !== undefined && input.canvasSectionId !== null
       ? input.canvasSectionId
@@ -1928,13 +1944,8 @@ export async function updateTask(
       current.status === "done"
     )
       placed = await unparkPlacement(current.canvasSectionId, current.boardId);
-    if (
-      placed === null &&
-      statusChanged &&
-      statusImpliesThisWeek(patch.status) &&
-      current.canvasSectionId === null
-    )
-      placed = "thisWeek";
+    if (placed === null && statusChanged && current.canvasSectionId === null)
+      placed = placementImpliedByStatus(patch.status);
   }
   if (placed !== null) {
     const target = await resolvePlacementSection(
@@ -2161,13 +2172,10 @@ export async function moveTask(
   // …and an agent moving the task into work files it on THIS WEEK's board, the
   // same rule `updateTask` applies — but only if nothing else claimed it, so a
   // card the user filed by hand (or a fresh pin above) stays where it is.
-  if (
-    canvasSectionId === null &&
-    statusChanged &&
-    statusImpliesThisWeek(status)
-  ) {
-    canvasSectionId = await resolvePlacementSection("thisWeek", boardId, current.projectId);
-    if (canvasSectionId !== null) placed = "thisWeek";
+  const impliedMove = statusChanged ? placementImpliedByStatus(status) : null;
+  if (canvasSectionId === null && impliedMove !== null) {
+    canvasSectionId = await resolvePlacementSection(impliedMove, boardId, current.projectId);
+    if (canvasSectionId !== null) placed = impliedMove;
   }
 
   // Position LAST, because "top"/"bottom" is relative to the lane resolved just
@@ -3074,7 +3082,7 @@ export async function bulkUpdate(
   const repinned = new Map<string, string | null>();
   if (patch.canvasSectionId === undefined) {
     const asked = askedPlacement(patch);
-    const target = asked ?? (statusImpliesThisWeek(patch.status) ? "thisWeek" : null);
+    const target = asked ?? placementImpliedByStatus(patch.status);
     if (target !== null) {
       // A status-IMPLIED move spares anything already filed in a section; an
       // explicit one moves every task named.
@@ -4268,10 +4276,22 @@ export async function markDayReady(
     throw new ValidationError(
       `A snapshot records the list as it stands now, so it can only be taken for the current working day (${current}), not ${day}.`,
     );
-  // THIS WEEK, since TD2-202 retired the TODAY bucket this used to freeze. Same
-  // meaning — the list you commit to in the morning — read off the tray the work
-  // actually sits in now.
-  const planned = await tasksInPlacement(userId, projectId, "thisWeek");
+  // TODAY again (TD2-215), the tray this froze before TD2-202 retired the bucket.
+  // It is the list actually in flight: starting a task files it there
+  // (`placementImpliedByStatus`), so by the time you press this the tray already
+  // describes the day rather than waiting to be filled by hand.
+  //
+  // FALLING BACK TO THIS WEEK when TODAY is empty is the safety net for the
+  // failure that got the bucket retired. TODAY died because nothing filed into
+  // it and every morning read as an empty plan; that shouldn't be possible now,
+  // but a project where the work is all driven from the UI would still find it
+  // empty, and an empty snapshot silently zeroes the drift figures in
+  // `workDayReview`. So: what's in flight if there is any, this week's board if
+  // not.
+  const shortlist = await tasksInPlacement(userId, projectId, "today");
+  const planned = shortlist.length
+    ? shortlist
+    : await tasksInPlacement(userId, projectId, "thisWeek");
   const snapshot: WorkDaySnapshotEntry[] = planned.map((t) => ({
     taskId: t.id,
     ...(t.code ? { ref: t.code } : {}),
@@ -4559,7 +4579,7 @@ export type ReviewFlag =
   | { flag: "analyzingNoAnalysis" }
   | { flag: "reviewNoSummary" }
   | { flag: "doneNotSwept" }
-  | { flag: "workingNotThisWeek" }
+  | { flag: "workingNotScheduled" }
   | { flag: "untriaged" }
   | { flag: "unassigned" };
 
@@ -4582,7 +4602,7 @@ const FLAG_WEIGHT: Record<ReviewFlagName, number> = {
   buildingNoCommits: 25,
   doneNotSwept: 20,
   silentEdit: 15,
-  workingNotThisWeek: 12,
+  workingNotScheduled: 12,
   untriaged: 10,
   unassigned: 8,
   movedInWindow: 0,
@@ -4643,8 +4663,13 @@ export function reviewFlags(f: ReviewFacts): ReviewFlag[] {
     flags.push({ flag: "reviewNoSummary" });
   if (f.status === "done" && f.placement !== "doneThisWeek")
     flags.push({ flag: "doneNotSwept" });
-  if (ongoing && f.placement !== "thisWeek")
-    flags.push({ flag: "workingNotThisWeek" });
+  // Either ACTIVE tray is fine. Since TD2-215 an agent starting work files the
+  // task on TODAY and a human plans the week into THIS WEEK, so demanding one
+  // specific tray would flag half the board for sitting exactly where the app
+  // just put it. What the flag is actually for is work in flight that got parked
+  // somewhere nobody looks — BACKLOG, LATER, or never triaged out of INBOX.
+  if (ongoing && f.placement !== "today" && f.placement !== "thisWeek")
+    flags.push({ flag: "workingNotScheduled" });
   if (f.placement === "inbox" && f.status !== "done")
     flags.push({ flag: "untriaged" });
   if (ongoing && !f.assigned) flags.push({ flag: "unassigned" });
@@ -4856,7 +4881,8 @@ export async function boardReview(
     const placement = placementOf(t.id);
     const why: BoardReviewTask["why"] = [];
     if (ongoing.has(t.status)) why.push("status");
-    if (includeThisWeek && placement === "thisWeek") why.push("thisWeek");
+    if (includeThisWeek && (placement === "today" || placement === "thisWeek"))
+      why.push("thisWeek");
     if (includeInbox && placement === "inbox") why.push("inbox");
     if (why.length) candidates.push({ task: t, why, placement });
   }

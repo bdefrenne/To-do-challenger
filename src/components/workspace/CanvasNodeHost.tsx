@@ -63,7 +63,7 @@ function CanvasNodeHostInner({
   masterSectionName,
   groupMemberCount,
   groupDropActive,
-  filterAssigneeId,
+  filter,
   api,
 }: CanvasNodeHostProps) {
   // Rebuilt per render of THIS node only — inside the memo boundary, so a fresh
@@ -88,7 +88,7 @@ function CanvasNodeHostInner({
       masterSection={masterSection}
       groupMemberCount={groupMemberCount}
       groupDropActive={groupDropActive}
-      filterAssigneeId={filterAssigneeId}
+      filter={filter}
       onPointerDown={(e) => api.pointerDown(e, node)}
       onStartEditing={() => api.startEditing(node.id)}
       onStopEditing={api.stopEditing}

@@ -18,6 +18,7 @@ import {
   mergeIntoPrevious,
   nextCreatableIndex,
   createOpFor,
+  hiddenOrphanMoves,
   moveOpFor,
   type TaskUnit,
 } from "@/lib/outline";
@@ -87,6 +88,7 @@ export function useOutlineDraft({
   scopeNodes,
   boardId,
   rootTarget,
+  assigneeIds,
   peersPresent = false,
   ownsField,
   onLeave,
@@ -101,6 +103,10 @@ export function useOutlineDraft({
   scopeNodes: TaskNode[];
   boardId: string | null;
   rootTarget: OutlineRootTarget;
+  /** Who a newly typed line is for (TD2-193) — the assignee filter the caller is
+   *  showing this list under, when its "Assign to <name>" box is ticked.
+   *  Undefined on an unfiltered list, which creates as it always did. */
+  assigneeIds?: string[];
   /** Is anyone else in this list's outline right now? Only then is it worth
    *  broadcasting every keystroke — a peer applying a text patch rebuilds the unit
    *  tree in every section on their canvas, so paying that when nobody is watching
@@ -124,10 +130,12 @@ export function useOutlineDraft({
   const rootTargetRef = useRef(rootTarget);
   const scopeRef = useRef(scopeNodes);
   const unitsRef = useRef(units);
+  const assigneeIdsRef = useRef(assigneeIds);
   useEffect(() => {
     rootTargetRef.current = rootTarget;
     scopeRef.current = scopeNodes;
     unitsRef.current = units;
+    assigneeIdsRef.current = assigneeIds;
   });
   /** Ids this session has seen (baseline + what it created). A delete op naming
    *  anything else is a bug, not a user intent — see `commitStructure`. */
@@ -387,6 +395,10 @@ export function useOutlineDraft({
           boardId: board,
           positionOf,
           rootTarget: rootTargetRef.current as Record<string, unknown>,
+          // Whoever the list is filtered to, if the composer's box is ticked
+          // (TD2-193) — a line typed into a filtered outline must not be
+          // filtered off the screen the moment it binds.
+          assigneeIds: assigneeIdsRef.current,
         });
         if (!op) break;
         const position = op.input.position;
@@ -461,6 +473,21 @@ export function useOutlineDraft({
       localPosRef.current.set(id, op.target.position);
       moves.push(op);
     }
+    /* Descendants the outline CAN'T SEE, because a filter is hiding them
+       (TD2-194/TD2-216): their parent's line just died and nothing on screen
+       claimed them. The rule itself is pure and lives in `outline.ts`, where
+       `npm run check:outline` can hold it to account. */
+    moves.push(
+      ...hiddenOrphanMoves(
+        deletedRef.current,
+        new Set(
+          current.filter((r) => !r.desc && r.taskId).map((r) => r.taskId as string),
+        ),
+        scopeRef.current,
+        positionOf,
+      ),
+    );
+
     // Deletes: only ids the user actually deleted, and only ones this session
     // knows. An id from nowhere means a bug upstream — log it, don't delete it.
     for (const id of deletedRef.current) {

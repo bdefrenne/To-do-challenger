@@ -44,12 +44,14 @@ of the RYDR board set.)
 - `npm run dev` — dev server
 - `npm run db:generate` / `npm run db:migrate` — Drizzle migrations
 - `npx tsc --noEmit` · `npm run lint` · `npm run build` — checks before committing
-- `npm run check:outline` — the outline/text-view logic checks (222 pure assertions:
+- `npm run check:outline` — the outline/text-view logic checks (254 pure assertions:
   the row⇄field merge, per-row locks, fractional positions, delete subtrees, what
   each structural key does to the row list, and the create/move op payloads those
-  rows produce).
+  rows produce, and — since TD2-216 — what the assignee/board filters keep, and
+  the re-parent ops a delete owes the children a filter is hiding).
   **Run it after touching anything in `src/lib/outline.ts`,
-  `useOutlineDraft.ts`, `OutlineEditor.tsx` or `useRowLock.ts`** — that code is
+  `src/lib/task-filters.ts`, `useOutlineDraft.ts`, `OutlineEditor.tsx` or
+  `useRowLock.ts`** — that code is
   co-editing, task creation and deletion at once, so a wrong answer there loses a
   task, duplicates one, or yanks the caret out of someone's hands rather than
   merely rendering oddly. Six real bugs came out of writing these, three of them
@@ -131,6 +133,26 @@ of the RYDR board set.)
   all — the lane reconciler reads the visible set, so a hidden board is
   indistinguishable from one that left the project and its lanes are swept from
   every tray.
+- **A filter is a RENDER filter, and it stops at the renderer (TD2-216).**
+  Both filters — one person's work (`AssigneeFilter`), some of the boards
+  (`BoardFilter`) — live in `useProjectFilters` (per project, in localStorage,
+  shared by the project's List/Boards/Done views AND its canvas) and decide only
+  what is DRAWN. The rules are in `src/lib/task-filters.ts`: keep the branches
+  that lead to a match, ancestors included, and dim an ancestor kept only as
+  context. **Never let a filtered set reach a writer.** The one that will bite
+  you is `CanvasEditor`'s lane reconciler: it reads `projectBoards` and DELETES
+  every machine lane whose board isn't in it (that IS how hiding a board works,
+  TD2-213), so a viewer's private board filter reaching that set would sweep the
+  room's lanes for everyone. It is applied in the `ordered.map()` render loop and
+  nowhere above it — same for `computeGroupLayout`, which must keep reading every
+  node or one person's filter repacks the arrangement for the room. Text mode IS
+  filtered (TD2-194) and is safe because the outline deletes only a line someone
+  deleted by hand and positions are fractional midpoints; what keeps it safe is
+  `scopeNodes`, which stays WHOLE — narrow that and a hidden sibling stops being
+  addressable. And a composer running under an assignee filter offers "Assign to
+  <name>", ticked (TD2-193, `useAssignOnCreate`): a task created with nobody on
+  it in a filtered view vanishes as it is typed. Proven by `npm run check:outline`.
+
 - **Every MCP call is logged at ONE chokepoint (TD2-211).** `instrument()` in
   the MCP route patches `server.tool` / `server.prompt` before any registration
   runs, so a tool added later is recorded because it is a tool — **never add
@@ -153,6 +175,24 @@ of the RYDR board set.)
   picker says `LIVE DATA` and names the host for this reason) — browse as
   `testuser` rather than as a real person, so a stray edit isn't attributed to
   them.
+- **Starting work files a task on TODAY (TD2-215).** The bucket was retired by
+  TD2-202 — nothing ever filed into it, so it read empty every morning — and
+  brought back with that fixed: `placementImpliedByStatus` is now the **one place
+  the implied bucket is named**, and it says `today`. All four mutators
+  (`createTask` / `updateTask` / `moveTask` / `bulkApply`) call it rather than
+  writing a bucket name, so **moving the implied destination again is one line
+  there** — never re-hardcode it at a call site. It still only fires from an
+  agent surface (`ASSIGNING_SOURCES`) and only for a task nobody pinned by hand;
+  a human dragging a Kanban card is never re-filed behind their back.
+  TODAY = in flight now, THIS WEEK = what a human planned for the week; they're a
+  pair, not a ladder, so anything asking "is this scheduled?" must accept BOTH
+  (see `workingNotScheduled`, and `board_review`'s candidate test). `markDayReady`
+  snapshots TODAY and falls back to THIS WEEK when nothing is in flight, so an
+  empty tray can't silently zero the drift figures. On the canvas TODAY is the one
+  tray derived ABOVE the stored origin (THIS WEEK's own x/y) — safe only because
+  nothing sits above it; read the TD2-171 warning in `CanvasEditor.tsx` first.
+  `scripts/retire-today-tray.ts` was deleted: running it would empty the tray
+  again. Proven by `npm run check:day` and `npm run check:this-week`.
 - **Notes are DISCONTINUED (TD2-209).** The whole feature is gone: no
   `add_note` / `list_notes` / `resolve_note`, no decisions, standup callouts or
   `review` items, no Notes page, no canvas sticky notes, no `task_notes` table.

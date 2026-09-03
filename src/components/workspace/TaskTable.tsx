@@ -5,6 +5,8 @@ import { useMemo, useState } from "react";
 import type { Project, TaskStatus } from "@/lib/types";
 import { STATUS_LABEL, STATUS_ORDER, STATUS_TONE } from "@/lib/statuses";
 import { allBoards } from "@/lib/boards";
+import { isAssignedTo, makeNodeMatcher, makeTaskPredicate } from "@/lib/task-filters";
+import { useAssignOnCreate } from "./useAssignOnCreate";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
 import { TaskTableRow, GRID } from "./TaskTableRow";
 import type { BoardGroup } from "./BoardPill";
@@ -17,13 +19,21 @@ import type { BoardGroup } from "./BoardPill";
  * that inline-added tasks land on (null = unassigned). Every row shows its
  * board as a clickable pill (change within the same project; assign to any
  * project when the task has no board).
+ *
+ * `assigneeId` narrows it to one person (TD2-216) on the same rule the canvas
+ * uses: a branch survives if anything in it matches, and a parent kept only
+ * because a subtask matched is dimmed. A board filter needs nothing here —
+ * `boardIds` IS the board scope, so the caller just passes fewer.
  */
 export function TaskTable({
   boardIds,
   addBoardId = null,
+  assigneeId = null,
 }: {
   boardIds?: string[];
   addBoardId?: string | null;
+  /** Show only this person's work, or null for everyone. */
+  assigneeId?: string | null;
 } = {}) {
   const {
     nodes,
@@ -88,6 +98,19 @@ export function TaskTable({
   const inScope = (n: TaskNode) =>
     !boardIds || (n.boardId != null && boardIds.includes(n.boardId));
 
+  /* Whose work to draw. Memoized across the whole render, not per row: the
+     matcher walks a subtree to answer, and every row asks about its own
+     children right after its parent asked about it. */
+  const matchesAssignee = useMemo(
+    () =>
+      makeNodeMatcher<TaskNode>({
+        keep: makeTaskPredicate({ assigneeId }),
+        taskOf: (id) => taskMap[id],
+        childrenOf,
+      }),
+    [assigneeId, taskMap, childrenOf],
+  );
+
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -95,7 +118,7 @@ export function TaskTable({
   function renderRow(node: TaskNode, depth: number): React.ReactNode {
     const task = taskMap[node.id];
     if (!task) return null;
-    const kids = childrenOf(node.id);
+    const kids = childrenOf(node.id).filter((k) => matchesAssignee(k.id));
     const hasChildren = kids.length > 0;
     const expanded = !collapsedRows[node.id];
     // Scope the assign picker to the task's project members (mirrors the card).
@@ -128,6 +151,9 @@ export function TaskTable({
           onEditMembers={
             taskProject ? () => openProjectSettings(taskProject.id) : undefined
           }
+          // Context only — nothing on this row is theirs, it's here because
+          // something below it is.
+          dimmed={!!assigneeId && !isAssignedTo(task, assigneeId)}
           onDragStartRow={setDraggingId}
           onDropRow={(targetId, pos) => {
             if (draggingId) moveNode(draggingId, targetId, pos);
@@ -160,7 +186,11 @@ export function TaskTable({
 
         {STATUS_ORDER.map((status) => {
           const groupTop = nodes.filter(
-            (n) => n.parentId === null && n.status === status && inScope(n),
+            (n) =>
+              n.parentId === null &&
+              n.status === status &&
+              inScope(n) &&
+              matchesAssignee(n.id),
           );
           const collapsed = collapsedGroups[status];
           return (
@@ -195,7 +225,10 @@ export function TaskTable({
                     groupTop.map((n) => renderRow(n, 0))
                   )}
                   <AddTaskRow
-                    onAdd={(title) => addTask(status, title, addBoardId)}
+                    assigneeId={assigneeId}
+                    onAdd={(title, assigneeIds) =>
+                      addTask(status, title, addBoardId, undefined, assigneeIds)
+                    }
                   />
                 </>
               ) : null}
@@ -247,9 +280,17 @@ function GroupHeader({
   );
 }
 
-function AddTaskRow({ onAdd }: { onAdd: (title: string) => void }) {
+function AddTaskRow({
+  onAdd,
+  assigneeId,
+}: {
+  onAdd: (title: string, assigneeIds?: string[]) => void;
+  /** The assignee filter in force — see `useAssignOnCreate` (TD2-193). */
+  assigneeId: string | null;
+}) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState("");
+  const assign = useAssignOnCreate(assigneeId);
 
   if (!editing) {
     return (
@@ -263,7 +304,8 @@ function AddTaskRow({ onAdd }: { onAdd: (title: string) => void }) {
   }
 
   return (
-    <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 pl-12">
+    <div className="border-b border-border px-3 py-1.5 pl-12">
+      <div className="flex items-center gap-2">
       <span className="text-sm leading-none text-faint">+</span>
       <input
         autoFocus
@@ -271,7 +313,7 @@ function AddTaskRow({ onAdd }: { onAdd: (title: string) => void }) {
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter" && text.trim()) {
-            onAdd(text.trim());
+            onAdd(text.trim(), assign.assigneeIds);
             setText(""); // keep open for rapid entry
           } else if (e.key === "Escape") {
             setText("");
@@ -284,6 +326,8 @@ function AddTaskRow({ onAdd }: { onAdd: (title: string) => void }) {
         placeholder="Task name, then Enter…"
         className="flex-1 bg-transparent py-1 text-sm text-fg outline-none placeholder:text-faint"
       />
+      </div>
+      {assign.control}
     </div>
   );
 }

@@ -14,6 +14,7 @@ import { Markdown } from "@/components/ui/Markdown";
 import { usePeople, type Person } from "@/components/PeopleContext";
 import { ViewToggle, useViewMode } from "@/components/ui/ViewToggle";
 import { useWorkspace } from "./WorkspaceContext";
+import type { ProjectFilters } from "./useProjectFilters";
 import { SeparatorHeader } from "./SeparatorHeader";
 import { TaskCard } from "./TaskCard";
 
@@ -111,8 +112,19 @@ type DayLayout = "person" | "board";
  * Cards deliberately do NOT get the green done wash they carry everywhere else:
  * here everything is done, so green distinguishes nothing, and the importance
  * colors it would cover are the only signal left worth having.
+ *
+ * `filters` (TD2-216) narrows it like the other two views, with one difference
+ * worth knowing: here "assignee" means who a completion was CREDITED to (see
+ * `creditFor`), not who the task is assigned to now. Filtering to a person is
+ * therefore filtering to their column — which is the axis this view already had.
  */
-export function DoneBoards({ project }: { project: Project }) {
+export function DoneBoards({
+  project,
+  filters,
+}: {
+  project: Project;
+  filters: ProjectFilters;
+}) {
   const { openTask, taskMap } = useWorkspace();
   const { people, resolveById, me } = usePeople();
 
@@ -235,6 +247,31 @@ export function DoneBoards({ project }: { project: Project }) {
   const isOpen = (key: string, openByDefault: boolean) =>
     flippedSet.has(key) ? !openByDefault : openByDefault;
 
+  /* ---- what the filters leave ----
+     Applied ONCE, here, so the buckets, the axes, the counts and the standups
+     all read the same log. Board filter: a completion belongs to the board the
+     task is on. Assignee filter: to the person credited with it. */
+  const visible = useMemo(() => {
+    const entries = (page?.entries ?? []).filter(
+      (e) =>
+        filters.isBoardVisible(e.task.boardId ?? null) &&
+        (!filters.assigneeId || e.creditedTo === filters.assigneeId),
+    );
+    /* A standup is written per person per DAY, not per board — so a board filter
+       can't say whether one is in scope, and keeping them all would seed days
+       that hold nothing else with prose about work the filter just hid. With a
+       board filter on, write-ups follow the cards: kept for days that survived,
+       dropped as a reason to draw a day at all. The assignee filter CAN speak to
+       them, so it applies directly. */
+    const days = new Set(entries.map((e) => e.day));
+    const writeUps = (page?.writeUps ?? []).filter(
+      (w) =>
+        (!filters.assigneeId || w.userId === filters.assigneeId) &&
+        (!filters.boardIds || days.has(w.day)),
+    );
+    return { entries, writeUps };
+  }, [page, filters]);
+
   /* ---- bucket the log: week → day → entries ---- */
 
   const byWeek = useMemo(() => {
@@ -247,33 +284,33 @@ export function DoneBoards({ project }: { project: Project }) {
       if (!list) days.set(day, (list = []));
       return list;
     };
-    for (const e of page?.entries ?? []) bucket(e.day).push(e);
+    for (const e of visible.entries) bucket(e.day).push(e);
     /* A day someone wrote a standup for but closed nothing in is still a day
        worth reading — often the most worth reading. Seed it so it gets a row
        with the prose and no cards, rather than vanishing along with it. */
-    for (const w of page?.writeUps ?? []) bucket(w.day);
+    for (const w of visible.writeUps) bucket(w.day);
     return m;
-  }, [page]);
+  }, [visible]);
 
   /** The day's write-ups, keyed by person. One map for the whole page; the
    *  columns look themselves up. */
   const writeUpAt = useMemo(() => {
     const m = new Map<string, DayWriteUp>();
-    for (const w of page?.writeUps ?? []) m.set(`${w.userId} ${w.day}`, w);
+    for (const w of visible.writeUps) m.set(`${w.userId} ${w.day}`, w);
     return m;
-  }, [page]);
+  }, [visible]);
 
   /** Who wrote something on a given day, in no particular order — the extra
    *  columns a day needs beyond the people it credits work to. */
   const authorsOn = useMemo(() => {
     const m = new Map<string, string[]>();
-    for (const w of page?.writeUps ?? []) {
+    for (const w of visible.writeUps) {
       const list = m.get(w.day);
       if (list) list.push(w.userId);
       else m.set(w.day, [w.userId]);
     }
     return m;
-  }, [page]);
+  }, [visible]);
 
   /* Every week in the loaded range, newest first — including EMPTY ones. A week
      you finished nothing in is a fact worth seeing; skipping it would also make

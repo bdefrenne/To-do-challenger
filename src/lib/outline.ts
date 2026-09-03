@@ -623,6 +623,11 @@ export function createOpFor(
     boardId: string;
     positionOf: (taskId: string) => number | undefined;
     rootTarget: Record<string, unknown>;
+    /** Who the new task is for (TD2-193). Set when the list is being written
+     *  under an assignee filter: a line created with nobody on it would be
+     *  filtered straight back off the screen it was typed on. Applies to
+     *  subtask lines too, which is why it isn't part of `rootTarget`. */
+    assigneeIds?: string[];
   },
 ): {
   op: "create";
@@ -647,8 +652,55 @@ export function createOpFor(
       parentId: parent?.taskId ?? undefined,
       position: siblingPositionAt(rows, index, opts.positionOf),
       ...(parent ? {} : opts.rootTarget),
+      ...(opts.assigneeIds?.length ? { assigneeIds: opts.assigneeIds } : {}),
     },
   };
+}
+
+/**
+ * The re-parent ops for descendants the outline COULDN'T SEE when their parent's
+ * line was deleted (TD2-194/TD2-216).
+ *
+ * Deleting a line re-parents what was nested under it — the editor does that by
+ * walking the rows that are on screen. Under a filter, some of the dead task's
+ * children have no row at all, so nothing claims them, and `deleteTask` promotes
+ * an orphan to root at the END of its group: work nobody was looking at moves,
+ * with nothing on screen to explain it.
+ *
+ * There is no row to derive a target from, so the op is written out directly:
+ * the parent the deleted task itself had, and the position the child already
+ * holds — which leaves it exactly where it was among its new siblings.
+ *
+ * Cheap and correct to run unconditionally: with no filter every child IS on
+ * screen, so `shown` covers them all and this returns nothing.
+ */
+export function hiddenOrphanMoves(
+  deletedIds: Iterable<string>,
+  shown: ReadonlySet<string>,
+  scope: readonly { id: string; parentId: string | null; position: number }[],
+  positionOf: (taskId: string) => number | undefined,
+): { op: "move"; id: string; target: { parentId: string | null; position: number } }[] {
+  const dead = new Set(deletedIds);
+  const out: {
+    op: "move";
+    id: string;
+    target: { parentId: string | null; position: number };
+  }[] = [];
+  for (const id of dead) {
+    const grandparent = scope.find((n) => n.id === id)?.parentId ?? null;
+    for (const child of scope) {
+      if (child.parentId !== id) continue;
+      // On screen ⇒ the editor's own walk already claimed it. Also dying ⇒ there
+      // is nothing left to re-parent it onto.
+      if (shown.has(child.id) || dead.has(child.id)) continue;
+      out.push({
+        op: "move",
+        id: child.id,
+        target: { parentId: grandparent, position: positionOf(child.id) ?? child.position },
+      });
+    }
+  }
+  return out;
 }
 
 /** The `move` op for a bound row: where it now hangs and where it now sorts. */

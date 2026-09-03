@@ -179,11 +179,20 @@ group("placement — status and tray disagreeing");
      has(reviewFlags(facts({ status: "done", placement: "doneThisWeek" })), "doneNotSwept"),
      false);
   eq("in flight but filed in BACKLOG",
-     has(reviewFlags(facts({ status: "building", placement: "backlog" })), "workingNotThisWeek"),
+     has(reviewFlags(facts({ status: "building", placement: "backlog" })), "workingNotScheduled"),
      true);
   eq("in flight and in THIS WEEK is the normal case",
-     has(reviewFlags(facts({ status: "building", placement: "thisWeek" })), "workingNotThisWeek"),
+     has(reviewFlags(facts({ status: "building", placement: "thisWeek" })), "workingNotScheduled"),
      false);
+  /* TODAY is the other normal case, and since TD2-215 it is the one an agent
+     produces by itself: starting work files the task there. Flagging it would
+     mean flagging every task the app had just placed correctly. */
+  eq("…and so is in flight and in TODAY, where starting work files it",
+     has(reviewFlags(facts({ status: "building", placement: "today" })), "workingNotScheduled"),
+     false);
+  eq("in flight and deferred to LATER is still wrong",
+     has(reviewFlags(facts({ status: "building", placement: "later" })), "workingNotScheduled"),
+     true);
   eq("an INBOX task is untriaged",
      has(reviewFlags(facts({ status: "todo", placement: "inbox" })), "untriaged"),
      true);

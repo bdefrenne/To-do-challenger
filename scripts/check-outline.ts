@@ -34,8 +34,16 @@ import {
   mergeIntoPrevious,
   nextCreatableIndex,
   createOpFor,
+  hiddenOrphanMoves,
   moveOpFor,
 } from "@/lib/outline";
+import {
+  NO_FILTER,
+  filterUnits,
+  makeNodeMatcher,
+  makeRenderFilter,
+  makeTaskPredicate,
+} from "@/lib/task-filters";
 import { resolveRowLock, PARK_MS, type RowClaim } from "@/components/workspace/useRowLock";
 
 /* ------------------------------- harness ------------------------------- */
@@ -972,6 +980,158 @@ group("resolveRowLock — ownership from presence alone");
      takeoverText("hi", "hi", { insert: "!", at: -3 }).text, "!hi");
   eq("adopting an empty field is not a special case",
      takeoverText("", "leftovers", { insert: "a", at: 4 }).text, "a");
+}
+
+group("createOpFor — a line typed under an assignee filter (TD2-193)");
+{
+  const opts = {
+    boardId: "board-1",
+    positionOf: () => 0,
+    rootTarget: { canvasSectionId: "section-1" },
+  };
+  const rows = [r("kn", null, "typed while filtered")];
+  eq("with nobody filtered, the payload is unchanged — no empty field appears",
+     Object.keys(createOpFor(rows, 0, opts)!.input).includes("assigneeIds"), false);
+  eq("filtered to someone, the create carries them",
+     createOpFor(rows, 0, { ...opts, assigneeIds: ["u1"] })?.input.assigneeIds, ["u1"]);
+  eq("a SUBTASK line carries them too — it would vanish just as fast",
+     createOpFor(
+       [r("kt", "t", "parent"), r("kn", null, "child", 1)],
+       1,
+       { ...opts, assigneeIds: ["u1"] },
+     )?.input.assigneeIds,
+     ["u1"]);
+  eq("an empty list of assignees is not a filter, and adds nothing",
+     Object.keys(createOpFor(rows, 0, { ...opts, assigneeIds: [] })!.input).includes("assigneeIds"),
+     false);
+}
+
+group("hiddenOrphanMoves — deleting a line whose children the filter hid (TD2-194)");
+{
+  /* p ─ a (shown) · b (hidden by the filter). Deleting p's line must re-parent
+     BOTH, or `deleteTask` promotes the hidden one to root at the end. */
+  const scope = [
+    { id: "p", parentId: null, position: 1 },
+    { id: "a", parentId: "p", position: 2 },
+    { id: "b", parentId: "p", position: 3 },
+  ];
+  const posOf = (id: string) => scope.find((n) => n.id === id)?.position;
+
+  eq("the hidden child is re-parented onto the dead line's own parent",
+     hiddenOrphanMoves(["p"], new Set(["a"]), scope, posOf),
+     [{ op: "move", id: "b", target: { parentId: null, position: 3 } }]);
+  eq("the SHOWN child is left alone — the editor's own walk claimed it",
+     hiddenOrphanMoves(["p"], new Set(["a"]), scope, posOf).some((m) => m.id === "a"),
+     false);
+  eq("with nothing filtered there is nothing to fix up",
+     hiddenOrphanMoves(["p"], new Set(["a", "b"]), scope, posOf), []);
+  eq("a child that is ALSO being deleted is not re-parented onto anything",
+     hiddenOrphanMoves(["p", "b"], new Set([]), scope, posOf).some((m) => m.id === "b"),
+     false);
+  eq("it keeps the position it already had, so it lands where it was",
+     hiddenOrphanMoves(["p"], new Set([]), scope, posOf).map((m) => m.target.position),
+     [2, 3]);
+  eq("a live local position wins over the stale one from the scope",
+     hiddenOrphanMoves(["p"], new Set(["a"]), scope, (id) => (id === "b" ? 99 : posOf(id)))[0]
+       .target.position,
+     99);
+  /* g ─ p ─ b: deleting p hands b to g, not to the root. */
+  const nested = [
+    { id: "g", parentId: null, position: 1 },
+    { id: "p", parentId: "g", position: 2 },
+    { id: "b", parentId: "p", position: 3 },
+  ];
+  eq("a nested line's hidden child goes to the GRANDPARENT, not to root",
+     hiddenOrphanMoves(["p"], new Set([]), nested, (id) => nested.find((n) => n.id === id)?.position)[0]
+       .target.parentId,
+     "g");
+}
+
+group("task filters — what a view draws (TD2-216)");
+{
+  const t = (id: string, assignees: string[], boardId: string | null = "b1") => ({
+    taskId: id,
+    title: id,
+    description: "",
+    task: { id, assigneeIds: assignees, boardId },
+    children: [] as never[],
+  });
+  const tree = (parent: ReturnType<typeof t>, kids: ReturnType<typeof t>[]) =>
+    ({ ...parent, children: kids }) as unknown as ReturnType<typeof t>;
+
+  const mine = makeTaskPredicate({ assigneeId: "u1" });
+  eq("a task assigned to them is kept", mine({ assigneeIds: ["u1"], boardId: "b1" }), true);
+  eq("…and one that isn't, is not", mine({ assigneeIds: ["u2"], boardId: "b1" }), false);
+  eq("a co-assigned task is theirs too", mine({ assigneeIds: ["u2", "u1"] }), true);
+
+  const onBoard = makeTaskPredicate({ boardIds: ["b1"] });
+  eq("a task on a selected board is kept", onBoard({ boardId: "b1" }), true);
+  eq("…on another board, it is not", onBoard({ boardId: "b2" }), false);
+  eq("a task on NO board is hidden by any narrowing — no selection includes it",
+     onBoard({ boardId: null }), false);
+  eq("but with nothing narrowed, a board-less task is shown",
+     makeTaskPredicate({})({ boardId: null }), true);
+  eq("both axes must hold at once",
+     makeTaskPredicate({ assigneeId: "u1", boardIds: ["b1"] })({
+       assigneeIds: ["u1"],
+       boardId: "b2",
+     }),
+     false);
+
+  const units = [
+    tree(t("p", ["u2"]), [t("c", ["u1"])]),
+    t("solo", ["u2"]),
+  ] as unknown as Parameters<typeof filterUnits>[0];
+  const kept = filterUnits(units, mine);
+  eq("a parent survives on its child's account — an orphaned match reads as a lie",
+     kept.map((u) => u.taskId), ["p"]);
+  eq("…and the matching child is still under it", kept[0].children.map((c) => c.taskId), ["c"]);
+  eq("a filter that keeps everything hands back the SAME array (memo identity)",
+     filterUnits(units, NO_FILTER.keep) === units, true);
+
+  /* The node-shaped twin: the project views hold a flat list plus a lookup. */
+  const nodes = [
+    { id: "p", parentId: null },
+    { id: "c", parentId: "p" },
+    { id: "solo", parentId: null },
+  ];
+  const tasks: Record<string, { assigneeIds: string[] }> = {
+    p: { assigneeIds: ["u2"] },
+    c: { assigneeIds: ["u1"] },
+    solo: { assigneeIds: ["u2"] },
+  };
+  const match = makeNodeMatcher({
+    keep: mine,
+    taskOf: (id) => tasks[id],
+    childrenOf: (id) => nodes.filter((n) => n.parentId === id),
+  });
+  eq("a node with a matching descendant is drawn", match("p"), true);
+  eq("the match itself is drawn", match("c"), true);
+  eq("a node with no match anywhere below is not", match("solo"), false);
+
+  const cyclic = [
+    { id: "x", parentId: "y" },
+    { id: "y", parentId: "x" },
+  ];
+  eq("a corrupt parent cycle answers false instead of recursing forever",
+     makeNodeMatcher({
+       keep: mine,
+       taskOf: () => ({ assigneeIds: ["u2"] }),
+       childrenOf: (id) => cyclic.filter((n) => n.parentId === id),
+     })("x"),
+     false);
+
+  eq("the canvas filter hides a lane whose board nobody selected",
+     makeRenderFilter({ boardIds: ["b1"] }).showsBoard("b2"), false);
+  eq("…and draws one whose board is selected",
+     makeRenderFilter({ boardIds: ["b1"] }).showsBoard("b1"), true);
+  eq("the No-board lane goes with any narrowing",
+     makeRenderFilter({ boardIds: ["b1"] }).showsBoard(null), false);
+  eq("an assignee-only filter leaves every LANE standing — it prunes cards",
+     makeRenderFilter({ assigneeId: "u1" }).showsBoard("b2"), true);
+  eq("nothing narrowed is the shared no-filter object, so memo boundaries hold",
+     makeRenderFilter({}) === NO_FILTER, true);
+  eq("…and it is not marked active", NO_FILTER.active, false);
 }
 
 /* -------------------------------- summary ------------------------------- */

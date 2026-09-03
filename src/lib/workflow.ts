@@ -43,14 +43,18 @@ beyond the one rule below.
 | \`placement\` | means |
 | --- | --- |
 | \`inbox\` | untriaged — the default, and where anything unfiled shows up |
+| \`today\` | in flight NOW — starting work files a task here for you |
 | \`thisWeek\` | to be done this week, or you're starting on it now |
 | \`backlog\` | triaged, but not scheduled |
 | \`later\` | deliberately deferred — what to pass when the user says "later" |
 | \`doneThisWeek\` | finished this week, waiting to be swept |
 
 Pass it to \`create_task\` / \`update_task\`. Setting the status to Analyzing or
-beyond already files a task nobody has placed by hand onto THIS WEEK, so the
-normal "create it, then start work" flow needs nothing extra. Every project's
+beyond already files a task nobody has placed by hand onto **TODAY**, so the
+normal "create it, then start work" flow needs nothing extra — you rarely have to
+pass \`today\` yourself. THIS WEEK is the other half of the pair and stays a
+human's: what Ben means to get through this week, filed by hand. A task planned
+into THIS WEEK on Monday moves to TODAY on Thursday when you actually start it. Every project's
 canvas has a THIS WEEK group and the rest of the trays automatically, so filing
 always has somewhere to land.
 
@@ -174,10 +178,11 @@ to is decided in one place (\`lib/workday.ts\`) and every read agrees with it.
 
 ## Ready for the day → the snapshot
 
-\`ready_for_day\` freezes what the todo looks like right now. That list is
-otherwise lost: THIS WEEK is a mutable bucket, so by evening the morning's plan has
-been edited past recognition, and "was my list clear enough?" becomes
-unanswerable. Pressing it again overwrites — the last arrangement of the morning
+\`ready_for_day\` freezes what the todo looks like right now. It reads **TODAY**,
+the tray that starting work fills, and falls back to THIS WEEK if nothing is in
+flight. That list is otherwise lost: both are
+mutable buckets, so by evening the morning's plan has been edited past
+recognition, and "was my list clear enough?" becomes unanswerable. Pressing it again overwrites — the last arrangement of the morning
 is the real commitment.
 
 It is **not** a crediting boundary. It changes no dates. That's what makes it

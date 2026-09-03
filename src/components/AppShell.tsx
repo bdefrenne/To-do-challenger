@@ -367,6 +367,7 @@ function DeleteUndoToast() {
 
 const SEND_LABEL: Record<TaskPlacement, string> = {
   inbox: "Inbox",
+  today: "Today",
   thisWeek: "This week",
   backlog: "Backlog",
   later: "Later",

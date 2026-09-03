@@ -33,6 +33,7 @@ import {
   Pencil,
   Rows3,
   Star,
+  Sun,
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -40,6 +41,8 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useOthers, useSelf, useUpdateMyPresence, shallow } from "@liveblocks/react";
 import type { CanvasNode as CanvasNodeT } from "@/lib/types";
 import { type TaskUnit } from "@/lib/outline";
+import { NO_FILTER, filterUnits, type RenderFilter } from "@/lib/task-filters";
+import { useAssignOnCreate } from "./useAssignOnCreate";
 import type { TaskStatus, Importance, TaskPlacement } from "@/lib/types";
 import { useWorkspace, type DropPos, type TaskNode } from "./WorkspaceContext";
 import { useSectionMembership } from "./SectionMembershipContext";
@@ -80,6 +83,7 @@ const SECTION_DND_MIME = "application/x-section-task";
 /** How each machine-managed tray labels itself in its header. */
 const TRAY_GLYPH: Record<SystemGroup, { icon: LucideIcon; hint: string }> = {
   inbox: { icon: Inbox, hint: "Inbox — untriaged, nobody has filed these yet" },
+  today: { icon: Sun, hint: "Today — the shortlist you committed to this morning" },
   thisWeek: { icon: Star, hint: "This week — what you mean to do this week" },
   backlog: { icon: ListTodo, hint: "Backlog — triaged, not scheduled" },
   later: { icon: Clock, hint: "Later — deliberately deferred" },
@@ -159,39 +163,6 @@ function useSectionUnits(sectionId: string): TaskUnit[] {
   }, [sectionId, childIndex, nodeIndex, contentSig, bySection]);
 }
 
-/** Does this unit, or any of its descendants, belong to the filtered assignee?
- *  Used to decide whether a unit survives an assignee filter at all — a match
- *  buried a few levels deep keeps its ancestors around too, so the tree isn't
- *  left with orphaned children (see `filterUnitsByAssignee`). */
-function unitMatchesAssignee(unit: TaskUnit, assigneeId: string): boolean {
-  if (unit.task?.assigneeIds?.includes(assigneeId)) return true;
-  return unit.children.some((c) => unitMatchesAssignee(c, assigneeId));
-}
-
-/** Prune a unit tree down to branches that lead to a match (TD-59: "show only
- *  this assignee's tasks"). An ancestor kept only because a descendant matches
- *  stays in the tree — `TaskCard` dims it via `h.filterAssigneeId` so it reads
- *  as context, not a hidden match. `null` ⇒ no filter, tree unchanged. This is
- *  a pure render-time filter: the caller must NOT feed the result back into
- *  outline authoring (`unitsToRows`) or a save would delete the pruned tasks. */
-function filterUnitsByAssignee(
-  units: TaskUnit[],
-  assigneeId: string | null,
-): TaskUnit[] {
-  if (!assigneeId) return units;
-  const kept = units.filter((u) => unitMatchesAssignee(u, assigneeId));
-  const out = kept.map((u) => {
-    const children = filterUnitsByAssignee(u.children, assigneeId);
-    // Nothing pruned below ⇒ hand back the SAME unit. `useSectionUnits` works
-    // hard to keep unit identity stable so cards can memoize; rebuilding every
-    // unit here would throw that away the moment a filter was on (TD-132).
-    return children === u.children ? u : { ...u, children };
-  });
-  return out.every((u, i) => u === units[i]) && out.length === units.length
-    ? units
-    : out;
-}
-
 export function SectionNode({
   node,
   selected,
@@ -202,7 +173,7 @@ export function SectionNode({
   isMaster = false,
   masterSection = null,
   onRemove,
-  filterAssigneeId = null,
+  filter = NO_FILTER,
 }: {
   node: CanvasNodeT;
   selected: boolean;
@@ -224,10 +195,12 @@ export function SectionNode({
   masterSection?: { id: string; name: string } | null;
   /** Remove this node from the canvas (used after sending its cards away). */
   onRemove?: () => void;
-  /** Show only this assignee's cards (TD-59). Render-only: filters what's
-   *  drawn in committed view and suppresses the resize→storage mirror below,
-   *  never touches outline authoring or Liveblocks storage. */
-  filterAssigneeId?: string | null;
+  /** Show only some cards — one person's work, some boards' work, or both
+   *  (TD-59, widened in TD2-216). Render-only: it decides what's DRAWN and
+   *  suppresses the resize→storage mirror below, and never touches Liveblocks
+   *  storage. Text mode shows the same narrowed tree (TD2-194); what keeps that
+   *  safe is `scopeNodes`, which stays whole. */
+  filter?: RenderFilter;
 }) {
   const ws = useWorkspace();
   const boardId = (node.data?.boardId as string | undefined) ?? null;
@@ -241,12 +214,15 @@ export function SectionNode({
   // by its board — so it starts empty and stays separate from sibling sections.
   const sectionId = node.id;
   const units = useSectionUnits(sectionId);
-  // Committed-view-only render filter (TD-59) — deliberately NOT fed back into
-  // outline authoring (`unitsToRows` below still seeds from the full `units`),
-  // so an assignee filter can never cause a save to delete the tasks it hid.
+  /* What this section actually draws — and, since TD2-194, what text mode edits
+     too: a filter that card mode honours and text mode ignores reads as broken.
+     It is safe to author against because the outline deletes only a line someone
+     deleted by hand and positions are fractional midpoints, so a row it can't
+     see can be neither removed nor renumbered; `sectionNodes` (the save SCOPE,
+     below) stays whole, which is what keeps the hidden rows addressable. */
   const visibleUnits = useMemo(
-    () => filterUnitsByAssignee(units, filterAssigneeId),
-    [units, filterAssigneeId],
+    () => filterUnits(units, filter.keep),
+    [units, filter],
   );
   /** The cards this section draws at TOP level, in display order — what an insert
    *  between two cards is positioned against. Taken from the rendered tree, so it
@@ -480,10 +456,20 @@ export function SectionNode({
   const { rows, saving, inputRefs, setText, onRowKeyDown, seed, flush, adoptField, flushSends } =
     useOutlineDraft({
       active: mode === "authoring",
-      units,
+      units: visibleUnits,
+      // The WHOLE section, filter or no filter: this is the set a save may move
+      // and delete within, and the parent/position baseline it computes against.
+      // Narrowing it would hand the outline a world with a hole in it, and a
+      // hidden sibling would stop being addressable the moment a filter was on.
       scopeNodes: sectionNodes,
       boardId,
       rootTarget: outlineTarget,
+      /* A line typed into a FILTERED outline is for the person being filtered
+         for (TD2-193) — without this it would bind and vanish in the same
+         keystroke. The card composers put that behind a checkbox; a text row
+         has nowhere to hang one, and "the list I am writing in shows only Sam's
+         work" is the only reading a new line there has. */
+      assigneeIds: filter.assigneeId ? [filter.assigneeId] : undefined,
       // Only broadcast keystrokes when someone else is actually in this outline —
       // a peer applying a text patch rebuilds every section's unit tree on their
       // canvas, so it isn't worth paying while you type alone.
@@ -671,16 +657,16 @@ export function SectionNode({
   const boxRef = useRef<HTMLDivElement>(null);
   const onResizeRef = useRef(onResize);
   const heightRef = useRef(node.height);
-  // An assignee filter (TD-59) shrinks the rendered card list without the
+  // A filter (TD-59/TD2-216) shrinks the rendered card list without the
   // section actually being smaller — never mirror that measurement into
   // shared storage, or one viewer's filter would resize the section live for
   // everyone else in the room. Kept in a ref (not a dep) for the same reason
   // as the two above: the observer is created once.
-  const filterActiveRef = useRef(!!filterAssigneeId);
+  const filterActiveRef = useRef(filter.active);
   useEffect(() => {
     onResizeRef.current = onResize;
     heightRef.current = node.height;
-    filterActiveRef.current = !!filterAssigneeId;
+    filterActiveRef.current = filter.active;
   });
   useEffect(() => {
     const el = boxRef.current;
@@ -1195,21 +1181,28 @@ export function SectionNode({
         ) : (
           <CommittedList
             units={visibleUnits}
-            filterAssigneeId={filterAssigneeId}
+            filter={filter}
             onOpen={ws.openTask}
             onToggle={ws.toggleDone}
             onStatus={ws.setStatus}
             onAssign={ws.editTask}
             onImportance={(id, v) => ws.editTask(id, { importance: v })}
             onMove={ws.moveNode}
-            onAddTask={(title) =>
-              ws.addSectionTask({ title, canvasSectionId: pin, boardId, parentId: null, siblingIds })
+            onAddTask={(title, assigneeIds) =>
+              ws.addSectionTask({
+                title,
+                canvasSectionId: pin,
+                boardId,
+                parentId: null,
+                siblingIds,
+                assigneeIds,
+              })
             }
             // Same create, but landing above the card whose gap was clicked. The
             // run goes with it: these are the rows this section actually draws at
             // top level (`units`, not the assignee-filtered view — a hidden card is
             // still in the order being restamped).
-            onAddTaskAbove={(beforeId, title) =>
+            onAddTaskAbove={(beforeId, title, assigneeIds) =>
               ws.addSectionTask({
                 title,
                 canvasSectionId: pin,
@@ -1218,12 +1211,19 @@ export function SectionNode({
                 siblingIds,
                 insertBefore: beforeId,
                 runIds: rootIds,
+                assigneeIds,
               })
             }
             // Subtasks are never pinned — they inherit their parent's placement,
             // so they follow it if the parent is dragged elsewhere.
-            onAddSubtask={(parentId, title) =>
-              ws.addSectionTask({ title, canvasSectionId: null, boardId, parentId })
+            onAddSubtask={(parentId, title, assigneeIds) =>
+              ws.addSectionTask({
+                title,
+                canvasSectionId: null,
+                boardId,
+                parentId,
+                assigneeIds,
+              })
             }
             onDropIntoSection={(dragId) =>
               ws.moveNodeIntoSection(dragId, pin, boardId, { siblingIds })
@@ -1239,6 +1239,7 @@ export function SectionNode({
  *  WEEK first because it's where a sweep almost always goes (and the one the
  *  canvas already draws in orange), then the rest of the ladder. */
 const MOVE_TO_ORDER: readonly TaskPlacement[] = [
+  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -1563,17 +1564,17 @@ interface CardHandlers {
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
   /** Create a subtask under this task (from the hover "+ Subtask" button). */
-  onAddSubtask: (parentId: string, title: string) => void;
+  onAddSubtask: (parentId: string, title: string, assigneeIds?: string[]) => void;
 }
 
 interface TaskCardProps {
   unit: TaskUnit;
   depth: number;
-  /** Set when an assignee filter (TD-59) is active — a card whose task isn't
-   *  directly assigned to this id is dimmed (it's shown only as context for a
-   *  matching descendant, see `filterUnitsByAssignee`). A prop rather than part
-   *  of `h` because the card RENDERS from it, so memo has to compare it. */
-  filterAssigneeId: string | null;
+  /** The filter in force (TD-59/TD2-216) — a card that doesn't itself match is
+   *  dimmed, since it's drawn only as context for a matching descendant (see
+   *  `filterUnits`). A prop rather than part of `h` because the card RENDERS
+   *  from it, so memo has to compare it. */
+  filter: RenderFilter;
   h: CardHandlers;
 }
 
@@ -1583,7 +1584,7 @@ interface TaskCardProps {
  *  either a primitive, the stable `h`, or a `unit` whose identity `useSectionUnits`
  *  keeps stable across rebuilds — so a change to ONE task re-renders one card
  *  instead of all of them. */
-function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
+function TaskCardInner({ unit, depth, filter, h }: TaskCardProps) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [addingSub, setAddingSub] = useState(false);
   // Which edge a hovered drop would land on. Card-local — as a single hint on the
@@ -1612,9 +1613,7 @@ function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
 
   // Filtered-in only as context for a matching descendant (TD-59) — dim it so
   // the actual match still reads as the point of the filter.
-  const dimmedByFilter = filterAssigneeId
-    ? !(t.assigneeIds ?? []).includes(filterAssigneeId)
-    : false;
+  const dimmedByFilter = filter.active && !filter.keep(t);
   const half = (e: React.DragEvent) => {
     const r = e.currentTarget.getBoundingClientRect();
     return e.clientY < r.top + r.height / 2 ? "before" : "after";
@@ -1700,7 +1699,7 @@ function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
               key={c.taskId ?? c.title}
               unit={c}
               depth={depth + 1}
-              filterAssigneeId={filterAssigneeId}
+              filter={filter}
               h={h}
             />
           ))}
@@ -1708,7 +1707,10 @@ function TaskCardInner({ unit, depth, filterAssigneeId, h }: TaskCardProps) {
             <div style={{ marginLeft: 12 }}>
               <InlineTaskComposer
                 label="Subtask"
-                onSubmit={(title) => h.onAddSubtask(id, title)}
+                assigneeId={filter.assigneeId}
+                onSubmit={(title, assigneeIds) =>
+                  h.onAddSubtask(id, title, assigneeIds)
+                }
                 onClose={() => setAddingSub(false)}
               />
             </div>
@@ -1741,7 +1743,7 @@ const TaskCard = memo(
   TaskCardInner,
   (prev, next) =>
     prev.depth === next.depth &&
-    prev.filterAssigneeId === next.filterAssigneeId &&
+    prev.filter === next.filter &&
     prev.h === next.h &&
     sameUnit(prev.unit, next.unit),
 );
@@ -1760,14 +1762,19 @@ function InlineTaskComposer({
   label,
   onSubmit,
   onClose,
+  assigneeId = null,
 }: {
   label: string;
-  onSubmit: (title: string) => void;
+  onSubmit: (title: string, assigneeIds?: string[]) => void;
   onClose?: () => void;
+  /** The assignee filter in force — see `useAssignOnCreate` (TD2-193). Without
+   *  it, a card typed into a filtered section vanishes as it is created. */
+  assigneeId?: string | null;
 }) {
   const controlled = !!onClose;
   const [editing, setEditing] = useState(controlled);
   const [text, setText] = useState("");
+  const assign = useAssignOnCreate(assigneeId);
 
   const close = () => {
     setText("");
@@ -1792,27 +1799,29 @@ function InlineTaskComposer({
   }
 
   return (
-    <input
-      autoFocus
-      value={text}
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
-      onChange={(e) => setText(e.target.value)}
-      onKeyDown={(e) => {
-        e.stopPropagation();
-        if (e.key === "Enter" && text.trim()) {
-          onSubmit(text.trim());
-          setText(""); // keep open for rapid entry
-        } else if (e.key === "Escape") {
-          close();
-        }
-      }}
-      onBlur={() => {
-        if (!text.trim()) close();
-      }}
-      placeholder={`${label} name, then Enter…`}
-      className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
-    />
+    <div onPointerDown={(e) => e.stopPropagation()}>
+      <input
+        autoFocus
+        value={text}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter" && text.trim()) {
+            onSubmit(text.trim(), assign.assigneeIds);
+            setText(""); // keep open for rapid entry
+          } else if (e.key === "Escape") {
+            close();
+          }
+        }}
+        onBlur={() => {
+          if (!text.trim()) close();
+        }}
+        placeholder={`${label} name, then Enter…`}
+        className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-accent"
+      />
+      {assign.control}
+    </div>
   );
 }
 
@@ -1861,7 +1870,7 @@ function InsertGap({ onOpen }: { onOpen: () => void }) {
 
 function CommittedList({
   units,
-  filterAssigneeId,
+  filter,
   onOpen,
   onToggle,
   onStatus,
@@ -1874,18 +1883,18 @@ function CommittedList({
   onDropIntoSection,
 }: {
   units: TaskUnit[];
-  /** TD-59: dims a card kept only as context for a matching descendant. */
-  filterAssigneeId: string | null;
+  /** TD-59/TD2-216: dims a card kept only as context for a matching descendant. */
+  filter: RenderFilter;
   onOpen: (id: string) => void;
   onToggle: (id: string) => void;
   onStatus: (id: string, s: TaskStatus) => void;
   onAssign: (id: string, patch: { assigneeIds: string[] }) => void;
   onImportance: (id: string, v: Importance) => void;
   onMove: (dragId: string, targetId: string, pos: DropPos) => void;
-  onAddTask: (title: string) => void;
+  onAddTask: (title: string, assigneeIds?: string[]) => void;
   /** Create a card immediately ABOVE this one (the between-cards composer). */
-  onAddTaskAbove: (beforeTaskId: string, title: string) => void;
-  onAddSubtask: (parentId: string, title: string) => void;
+  onAddTaskAbove: (beforeTaskId: string, title: string, assigneeIds?: string[]) => void;
+  onAddSubtask: (parentId: string, title: string, assigneeIds?: string[]) => void;
   /** Drop a card into THIS section's blank area (or an empty section) — lands it
    *  at the end as a top-level card, moving it (and its subtree) here. */
   onDropIntoSection: (dragId: string) => void;
@@ -1957,18 +1966,25 @@ function CommittedList({
             insertAbove === u.taskId ? (
               <InlineTaskComposer
                 label="Task"
-                onSubmit={(title) => onAddTaskAbove(u.taskId!, title)}
+                assigneeId={filter.assigneeId}
+                onSubmit={(title, assigneeIds) =>
+                  onAddTaskAbove(u.taskId!, title, assigneeIds)
+                }
                 onClose={() => setInsertAbove(null)}
               />
             ) : (
               <InsertGap onOpen={() => setInsertAbove(u.taskId)} />
             )
           ) : null}
-          <TaskCard unit={u} depth={0} filterAssigneeId={filterAssigneeId} h={h} />
+          <TaskCard unit={u} depth={0} filter={filter} h={h} />
         </Fragment>
       ))}
       {/* Always-present "+ Add task" composer at the bottom of the list. */}
-      <InlineTaskComposer label="Add task" onSubmit={onAddTask} />
+      <InlineTaskComposer
+        label="Add task"
+        assigneeId={filter.assigneeId}
+        onSubmit={onAddTask}
+      />
     </div>
   );
 }

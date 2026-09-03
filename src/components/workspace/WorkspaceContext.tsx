@@ -237,6 +237,10 @@ interface WorkspaceContextValue {
     title: string,
     boardId?: string | null,
     placement?: TaskPlacement,
+    /** Who the new task is for. Passed by a composer running under an assignee
+     *  filter (TD2-193): a task created with nobody on it while a view is
+     *  showing one person's work would vanish the moment it was created. */
+    assigneeIds?: string[],
   ) => void;
   /** Create a task inside a canvas Section, optionally nested under `parentId`.
    *  Optimistic, like `addTask`. */
@@ -258,6 +262,8 @@ interface WorkspaceContextValue {
      *  derived from `parentId === null` would leave it out (so it would jump to
      *  the end of a run everyone else got restamped into). */
     runIds?: readonly string[];
+    /** Who the new card is for — see `addTask` (TD2-193). */
+    assigneeIds?: string[];
   }) => void;
   /** Post a comment to a task's thread (attributed to "You"). */
   addComment: (id: string, message: string) => Promise<void>;
@@ -2632,6 +2638,7 @@ export function WorkspaceProvider({
     title: string,
     boardId: string | null = null,
     placement?: TaskPlacement,
+    assigneeIds: string[] = [],
   ) {
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
@@ -2649,7 +2656,7 @@ export function WorkspaceProvider({
             id: tempId,
             title,
             status,
-            assigneeIds: [],
+            assigneeIds,
             boardId,
             updatedAt: now,
             // Placeholder pin so a view that groups by bucket shows the new card
@@ -2677,7 +2684,7 @@ export function WorkspaceProvider({
           body: JSON.stringify({
             title,
             status,
-            assigneeIds: [],
+            assigneeIds,
             boardId,
             ...(placement ? { placement } : {}),
           }),
@@ -2717,8 +2724,10 @@ export function WorkspaceProvider({
     siblingIds?: Set<string>;
     insertBefore?: string | null;
     runIds?: readonly string[];
+    assigneeIds?: string[];
   }) {
     const { title, canvasSectionId, boardId, siblingIds } = input;
+    const assigneeIds = input.assigneeIds ?? [];
     const parentId = input.parentId ?? null;
     const tempId = `temp-${Date.now()}`;
     const now = new Date().toISOString();
@@ -2764,7 +2773,7 @@ export function WorkspaceProvider({
             id: tempId,
             title,
             status: "backlog",
-            assigneeIds: [],
+            assigneeIds,
             boardId,
             canvasSectionId,
             updatedAt: now,
@@ -2784,7 +2793,7 @@ export function WorkspaceProvider({
           body: JSON.stringify({
             title,
             status: "backlog",
-            assigneeIds: [],
+            assigneeIds,
             boardId,
             parentId,
             canvasSectionId,

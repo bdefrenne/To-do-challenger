@@ -1,4 +1,5 @@
 import type { CanvasNode } from "./types";
+import type { RenderFilter } from "@/lib/task-filters";
 
 /**
  * Does this node still look the same to the renderer?
@@ -46,9 +47,11 @@ export interface CanvasNodeRenderProps {
   masterSectionName: string | null;
   groupMemberCount: number;
   groupDropActive: boolean;
-  /** Section-only: show only this assignee's cards across every section on the
-   *  canvas (TD-59). Purely a render filter — never written to storage. */
-  filterAssigneeId: string | null;
+  /** Section-only: show only some cards across every section on the canvas —
+   *  one person's work, some boards' work, or both (TD-59/TD2-216). Purely a
+   *  render filter, never written to storage. Compared by REFERENCE, which is
+   *  why the editor builds it once with `useMemo` rather than per render. */
+  filter: RenderFilter;
   api: unknown;
 }
 
@@ -71,6 +74,6 @@ export const canvasNodeRenderPropsEqual = (
   p.masterSectionName === n.masterSectionName &&
   p.groupMemberCount === n.groupMemberCount &&
   p.groupDropActive === n.groupDropActive &&
-  p.filterAssigneeId === n.filterAssigneeId &&
+  p.filter === n.filter &&
   p.api === n.api &&
   sameCanvasNode(p.node, n.node);

@@ -124,6 +124,7 @@ const recurrenceEnum = z.enum(["none", "daily", "weekly", "monthly"]);
  *  status. Mirrors `placementSchema` in api.ts. */
 const placementEnum = z.enum([
   "inbox",
+  "today",
   "thisWeek",
   "backlog",
   "later",
@@ -552,7 +553,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "create_task",
-      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). Adding an unfinished subtask to a DONE parent reopens that parent to Review (and moves it out of DONE THIS WEEK) — work underneath it means it isn't finished. PLACEMENT — which canvas group the task lands in, an axis independent of status: it defaults to `inbox` (untriaged), and creating it at analyzing/building implies `thisWeek`. Pass `placement: \"thisWeek\"` when it's to be done this week or you're about to start on it, `\"backlog\"` when it's triaged but not scheduled, `\"later\"` when the user said later, `\"inbox\"` to force it back to untriaged.",
+      "Create a new task. Only `title` is required. Status defaults to backlog. `value` and `difficulty` are Fibonacci points (1/2/3/5/8); `importance` is the -2…3 priority ladder (default 0 Normal). Pass parentId to create it as a subtask, or boardId to file it onto a specific board (see list_projects). Adding an unfinished subtask to a DONE parent reopens that parent to Review (and moves it out of DONE THIS WEEK) — work underneath it means it isn't finished. PLACEMENT — which canvas group the task lands in, an axis independent of status: it defaults to `inbox` (untriaged), and creating it at analyzing/building implies `today` — starting work files the task on TODAY. Pass `placement: \"thisWeek\"` when it's to be done this week or you're about to start on it, `\"backlog\"` when it's triaged but not scheduled, `\"later\"` when the user said later, `\"inbox\"` to force it back to untriaged. `\"today\"` is what's in flight right now — you rarely need to pass it, because setting the status to analyzing or beyond files it there for you.",
       {
         title: z.string().min(1).max(500),
         status: statusEnum.optional(),
@@ -571,7 +572,7 @@ const handler = createMcpHandler(
         placement: placementEnum
           .optional()
           .describe(
-            "Which canvas group to file it in: 'inbox' (untriaged, the default), 'thisWeek' (do it this week, or you're starting now), 'backlog' (triaged, not scheduled), 'later' (deferred), 'doneThisWeek' (finished, awaiting a sweep). Omit to let the status decide.",
+            "Which canvas group to file it in: 'inbox' (untriaged, the default), 'today' (in flight now — the status usually files this for you), 'thisWeek' (meant for this week, but not started), 'backlog' (triaged, not scheduled), 'later' (deferred), 'doneThisWeek' (finished, awaiting a sweep). Omit to let the status decide.",
           ),
         thisWeek: z
           .boolean()
@@ -588,7 +589,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "update_task",
-      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `placement` moves the task between the canvas's groups — 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review files it on THIS WEEK automatically, but only for a task nobody has filed by hand. Placement never changes status, and status never changes placement beyond that one rule. `end` says WHERE in that group it lands — 'top' for \"do this next\", 'bottom' for the back of the queue.",
+      "Update fields on an existing task. Only the fields you pass change. Pass null to clear a nullable field (startDate, dueDate, value, difficulty, description). Pass an empty array to clear assignees/dependsOn. WORKFLOW: `status` is the process spine (backlog → todo → analyzing → analyzed → building → review → done); moving to analyzing or beyond locks the code. Cannot set `done` here — use complete_task, which requires human confirmation. Write the revisable free-text fields here — `analysisSummary` (the Analysis: what & why) and `plan` (the Technical Plan: how) during analysis, and `summary` at the end (a short write-up of what shipped; you can diff git to help). Keep all three concise — length is the driver's call. PLACEMENT: `placement` moves the task between the canvas's groups — 'today', 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Moving to analyzing/analyzed/building/review files it on TODAY automatically, but only for a task nobody has filed by hand — so you rarely need to pass 'today' yourself. Placement never changes status, and status never changes placement beyond that one rule. `end` says WHERE in that group it lands — 'top' for \"do this next\", 'bottom' for the back of the queue.",
       {
         id: taskHandle,
         title: z.string().min(1).max(500).optional(),
@@ -609,7 +610,7 @@ const handler = createMcpHandler(
         placement: placementEnum
           .optional()
           .describe(
-            "Move it to a canvas group: 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Omit to let the status decide.",
+            "Move it to a canvas group: 'today' (in flight now — the status usually files this for you), 'thisWeek', 'backlog', 'later', 'doneThisWeek', or 'inbox' to send it back to its board's INBOX lane. Omit to let the status decide.",
           ),
         thisWeek: z
           .boolean()
@@ -927,7 +928,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "ready_for_day",
-      "\"Ready for the day\": freeze what's in THIS WEEK for this project right now, so it can be reviewed later against what actually happened (\"was my list clear enough?\"). THIS WEEK is a mutable bucket, so this list is otherwise lost by evening.\n" +
+      "\"Ready for the day\": freeze the user's shortlist for this project right now, so it can be reviewed later against what actually happened (\"was my list clear enough?\"). It reads TODAY — the tray that starting work fills — and falls back to THIS WEEK if nothing is in flight. Either way the list is mutable and otherwise lost by evening.\n" +
         "\n" +
         "Pressing it again overwrites — the last arrangement of the morning is the real commitment. It is NOT a crediting boundary: it changes no dates and nothing depends on it, so skipping it costs only the snapshot.",
       {
@@ -1443,7 +1444,7 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_canvas",
-      "Get one canvas by id with all its nodes. A canvas belongs to exactly one project (`projectId`) and lays out that project's boards; a task's `placement` resolves against ITS OWN project's canvas. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.thisWeek`, `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — this week's board, triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. THIS WEEK is where create_task/update_task put anything with `placement: \"thisWeek\"` (or moved into analyzing/building); every section inside it is its board's master, the target of other sections' \"Send to\" button. A tray's lanes are machine-made, but a section you add to a tray by hand is an ordinary section and is PREFERRED over a derived lane, so hand-named lanes are what work actually lands in.",
+      "Get one canvas by id with all its nodes. A canvas belongs to exactly one project (`projectId`) and lays out that project's boards; a task's `placement` resolves against ITS OWN project's canvas. Positions/sizes are in canvas coordinates. Node `kind` is one of: `text` (markdown in `content`), `section` (a titled container of a board's tasks — `content` is its label, `data.boardId` its board), `section_group` (a container that arranges member sections; each member carries `data.groupId`), `draw` and `image`. Some groups are special — each is the canvas end of a `placement`, and carries its name as a `data` flag on the group and on every lane inside it. `data.inbox` is the machine-managed INBOX tray, one lane per board, holding every task nobody filed anywhere (an inbox lane means UNPINNED, so nothing points at it). `data.today`, `data.thisWeek`, `data.backlog`, `data.later` and `data.doneThisWeek` are the other machine-managed trays — the day's shortlist, this week's board, triaged-not-scheduled, deferred, and finished-awaiting-a-sweep. TODAY hangs above the column: starting a task files it there, and it is what `ready_for_day` snapshots. TODAY is where create_task/update_task put anything moved into analyzing/building, and THIS WEEK takes anything with `placement: \"thisWeek\"`; every section inside it is its board's master, the target of other sections' \"Send to\" button. A tray's lanes are machine-made, but a section you add to a tray by hand is an ordinary section and is PREFERRED over a derived lane, so hand-named lanes are what work actually lands in.",
       { id: z.string() },
       async ({ id }) => {
         const canvas = await getCanvas(id);

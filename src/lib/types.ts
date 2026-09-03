@@ -25,6 +25,7 @@ export type TaskStatus =
  * word itself.
  *
  *   inbox         untriaged — no pin, so it surfaces in its board's INBOX lane
+ *   today         the shortlist you committed to this morning
  *   thisWeek      scheduled for this week — the starred group's lane for its board
  *   backlog       triaged, not scheduled
  *   later         deliberately deferred
@@ -36,6 +37,7 @@ export type TaskStatus =
  */
 export type TaskPlacement =
   | "inbox"
+  | "today"
   | "thisWeek"
   | "backlog"
   | "later"

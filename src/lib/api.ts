@@ -25,6 +25,7 @@ export const recurrenceSchema = z.enum(["none", "daily", "weekly", "monthly"]);
  *  `status`. See `TaskPlacement` in types.ts. */
 export const placementSchema = z.enum([
   "inbox",
+  "today",
   "thisWeek",
   "backlog",
   "later",

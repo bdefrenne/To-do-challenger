@@ -18,8 +18,10 @@ edit and a human edit go through the exact same door.
 - **Hierarchy:** Project → Board → Task. Tasks carry Jira-style refs
   (`PREFIX-seq`) whose prefix resolves board → project → user.
 - **One canvas per project.** A canvas is that project's whiteboard, laying its
-  boards out as sections inside machine-managed trays — INBOX · THIS WEEK ·
-  BACKLOG · LATER. Every tray holds a lane for **every** board, in sidebar
+  boards out as sections inside machine-managed trays — INBOX · TODAY ·
+  THIS WEEK · BACKLOG · LATER. TODAY is what's in flight: starting a task files
+  it there, and it's what **Ready for the day** freezes. THIS WEEK is the other
+  half — what you mean to get through this week, filed by hand. Every tray holds a lane for **every** board, in sidebar
   order, so the trays read as one grid: same columns, same order, every
   band — the project Boards view, laid out in space. The 1:1 is enforced, and
   it's what lets the server answer "which canvas does this task's placement go
@@ -61,8 +63,9 @@ edit and a human edit go through the exact same door.
   work always takes a second, deliberate press before it leaves: off the canvas
   it parks in DONE THIS WEEK first, on the canvas — which has no such tray — it
   sits in its board's lane until DELETE archives it), and the **arrows** file it:
-  **↑** to the top of THIS WEEK (do it next), **→** to the bottom of THIS WEEK,
-  **↓** to BACKLOG, **←** to LATER. **?** shows the cheatsheet.
+  **⇧↑** to TODAY, **↑** to the top of THIS WEEK (do it next), **→** to the
+  bottom of THIS WEEK, **↓** to BACKLOG, **←** to LATER. **?** shows the
+  cheatsheet.
 - **Nothing is deleted by accident.** DELETE is a **soft delete**: the task keeps
   its id, ref, activity and subtasks, leaves every board, list, canvas and search,
   and lands in the **Trash** — newest deleted first — where **Restore** puts the
