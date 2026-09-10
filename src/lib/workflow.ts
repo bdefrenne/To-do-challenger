@@ -107,8 +107,14 @@ artifacts you produce, record them on the task (\`analysisSummary\`, \`plan\`,
    **new**, what's a **duplicate** or merely **relocated**, what's deliberately
    **out of scope**, and any **risk** — just say it in words a non-coder can act
    on. Save the file-level, step-by-step detail for the Technical Plan. Keep it
-   concise, a short write-up that scales with the work; length is the driver's
-   call. When this is settled, **ask first — "Can I mark this as analyzed?" —
+   concise: aim for 150–250 words, and use fewer for a simple task. Expand only
+   when a decision or risk needs explaining, or the user asks for more detail.
+   **Always format the Analysis in Markdown**: a few short headings, brief
+   paragraphs, and bullets where they help scanning — never a wall of text.
+   Use everyday language and explain what changes, why it matters, and what you
+   recommend so a non-coder can understand it on the first read. Avoid jargon,
+   repeated context, and implementation detail; those belong in the plan.
+   When this is settled, **ask first — "Can I mark this as analyzed?" —
    and only set \`status: "analyzed"\` once the user confirms** (a valid resting
    state — understood, not yet built). Never flip it to analyzed on your own; the
    user may want to review or check something first.
