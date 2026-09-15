@@ -1,21 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useParams } from "next/navigation";
-import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Avatar } from "@/components/ui/Badge";
 import { ViewToggle, useViewMode } from "@/components/ui/ViewToggle";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import { BoardsColumns } from "@/components/workspace/BoardsColumns";
-import { ProjectModal } from "@/components/workspace/ProjectModal";
 import { EntityReadme } from "@/components/workspace/EntityReadme";
 import { TaskTable } from "@/components/workspace/TaskTable";
 import { DoneBoards } from "@/components/workspace/DoneBoards";
 import { ArchiveDoneButton } from "@/components/workspace/ArchiveDoneButton";
+import { ClearDoneButton } from "@/components/workspace/ClearDoneButton";
 import { AssigneeFilter } from "@/components/workspace/AssigneeFilter";
 import { BoardFilter } from "@/components/workspace/BoardFilter";
 import { useProjectFilters } from "@/components/workspace/useProjectFilters";
+import { useProjectPlacements } from "@/components/workspace/useProjectPlacements";
 
 /**
  * Project view. Three modes:
@@ -30,6 +30,13 @@ import { useProjectFilters } from "@/components/workspace/useProjectFilters";
  * All three read ONE pair of filters (TD2-216) — whose work, and which boards —
  * held here rather than per view, so the answer survives switching between them.
  * They're render filters: what a view draws, never what it writes.
+ *
+ * The header carries the two bulk exits for finished work, in the order you use
+ * them: "Clear Done" parks every done card in the project in DONE THIS WEEK
+ * (TD2-218 — it used to be one button per board column), and "Archive done"
+ * takes them out of the week. Project settings and the canvas used to sit here
+ * too and don't any more: the sidebar's per-project gear opens the same settings
+ * modal, and its Canvas page lists every project's canvas.
  */
 export default function ProjectPage() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -39,28 +46,11 @@ export default function ProjectPage() {
     "view-mode:project",
     "list",
   );
-  const [editing, setEditing] = useState(false);
-  // This project's canvas — exactly one (TD-136), so the lookup returns 0 or 1.
-  // Fetched rather than read from the workspace store, which doesn't hold
-  // canvases (they're outside the task poll).
-  const [canvasId, setCanvasId] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const res = await fetch(
-        `/api/canvases?projectId=${encodeURIComponent(projectId)}`,
-      );
-      if (!alive || !res.ok) return;
-      const { canvases } = (await res.json()) as { canvases: { id: string }[] };
-      setCanvasId(canvases[0]?.id ?? null);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [projectId]);
-
   const boards = useMemo(() => project?.boards ?? [], [project?.boards]);
   const filters = useProjectFilters(projectId, boards);
+  // One copy for the page: the Boards view's bands and the header's "Clear Done"
+  // both resolve buckets against it (TD2-218).
+  const { placements, titles } = useProjectPlacements(projectId);
   // What the views actually draw: the board filter narrows this, and the List
   // view needs nothing else — its scope is already a board-id list.
   const boardIds = useMemo(
@@ -86,20 +76,11 @@ export default function ProjectPage() {
         right={
           <>
             {project ? (
-              <button
-                onClick={() => setEditing(true)}
-                className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg"
-              >
-                Settings
-              </button>
-            ) : null}
-            {canvasId ? (
-              <Link
-                href={`/canvas/${canvasId}`}
-                className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg"
-              >
-                Canvas
-              </Link>
+              <ClearDoneButton
+                boards={boards}
+                placements={placements}
+                titles={titles}
+              />
             ) : null}
             {project ? <ArchiveDoneButton projectId={project.id} /> : null}
             <ViewToggle
@@ -146,7 +127,12 @@ export default function ProjectPage() {
                 assigneeId={filters.assigneeId}
               />
             ) : view === "boards" ? (
-              <BoardsColumns project={project} filters={filters} />
+              <BoardsColumns
+                project={project}
+                filters={filters}
+                placements={placements}
+                titles={titles}
+              />
             ) : (
               <DoneBoards project={project} filters={filters} />
             )}
@@ -154,13 +140,6 @@ export default function ProjectPage() {
         )}
       </div>
 
-      {editing && project ? (
-        <ProjectModal
-          mode="edit"
-          project={project}
-          onClose={() => setEditing(false)}
-        />
-      ) : null}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { AlignJustify, GripVertical, LayoutGrid } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import Link from "next/link";
 import type { Board, Project, TaskPlacement } from "@/lib/types";
 import {
@@ -13,6 +13,7 @@ import {
   type PlacementTitles,
 } from "@/lib/sections";
 import { compareTaskOrder } from "@/lib/task-order";
+import { sweepableDoneIds } from "@/lib/sweep";
 import type { TaskUnit } from "@/lib/outline";
 import { isAssignedTo, makeNodeMatcher, makeTaskPredicate } from "@/lib/task-filters";
 import { useWorkspace, type TaskNode } from "./WorkspaceContext";
@@ -57,9 +58,16 @@ const BOARD_DND_MIME = "application/x-board-id";
 export function BoardsColumns({
   project,
   filters,
+  placements,
+  titles,
 }: {
   project: Project;
   filters: ProjectFilters;
+  /** This project's `sectionId → placement` map and its bucket names, fetched
+   *  once by the page (`useProjectPlacements`) and shared with the header's
+   *  "Clear Done" so the two can't disagree about what's already in the tray. */
+  placements: PlacementMap;
+  titles: PlacementTitles;
 }) {
   const {
     nodes,
@@ -67,7 +75,6 @@ export function BoardsColumns({
     openTask,
     fileTask,
     pendingPlacements,
-    registerPlacementMap,
     addTask,
     fileTasks,
     archiveTasks,
@@ -104,34 +111,10 @@ export function BoardsColumns({
 
   /* ---- which bucket each card is in ---- */
 
-  const [placements, setPlacements] = useState<PlacementMap>({});
-  // The bands' own names, as they read on the canvas — a group can be renamed
-  // there, and a band headed with the default while the canvas says something
-  // else looks like a DIFFERENT bucket rather than the one you renamed.
-  const [titles, setTitles] = useState<PlacementTitles>({});
-  useEffect(() => {
-    let alive = true;
-    // Scoped to this project: canvases are per-project (TD-136), so an unscoped
-    // map would bucket another project's sections into these bands.
-    fetch(`/api/placements?projectId=${encodeURIComponent(project.id)}`)
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((d: { placements?: PlacementMap; titles?: PlacementTitles }) => {
-        if (!alive) return;
-        setPlacements(d.placements ?? {});
-        setTitles(d.titles ?? {});
-        // Lend it to the workspace: it resolves a card's bucket from the pin id
-        // alone, which covers every machine-made lane, and this adds the rest —
-        // so what DELETE does to a card matches the band it's rendered in.
-        registerPlacementMap(d.placements ?? {});
-      })
-      .catch(() => {
-        /* leave both empty — everything reads as INBOX under the default names,
-           rather than vanishing */
-      });
-    return () => {
-      alive = false;
-    };
-  }, [registerPlacementMap, project.id]);
+  // `placements` / `titles` arrive as props (see `useProjectPlacements`). The
+  // bands' own names come from the canvas because a group can be renamed there,
+  // and a band headed with the default while the canvas says something else
+  // looks like a DIFFERENT bucket rather than the one you renamed.
 
   // Where a just-filed card shows until the write lands: `fileTask` publishes the
   // bucket it's writing (the pin is the SERVER's to compute — it owns
@@ -206,41 +189,40 @@ export function BoardsColumns({
    * than clears (see the render), so the tray is no longer a dead end.
    *
    * One card is deliberately left out: a done card whose parent is ALSO being
-   * swept. It has no pin of its own — it renders here by inheriting its parent's
-   * placement — so it follows the parent for free, into the tray or into the
-   * archive (`archiveTask` cascades over the subtree). Naming it as well would
-   * convert an inherited placement into a hand-made one, and the next time the
-   * parent moves, the child would stay behind.
+   * swept and that has NO pin of its own. It renders here by inheriting its
+   * parent's placement, so it follows the parent for free, into the tray or into
+   * the archive (`archiveTask` cascades over the subtree) — and naming it as
+   * well would convert an inherited placement into a hand-made one, so the next
+   * time the parent moved, the child would stay behind. A child that carries its
+   * own pin is the opposite case and IS named: nothing would carry it. That rule
+   * is `sweepableDoneIds`, shared with the project header's sweep so the two
+   * can't drift (`npm run check:sweep`).
    */
   const doneByPlacement = useMemo(() => {
     const boardIds = new Set(boards.map((b) => b.id));
-    const done = new Set<string>();
-    for (const node of nodes)
-      if (
-        node.status === "done" &&
-        node.boardId &&
+    const ids = sweepableDoneIds(nodes, {
+      inScope: (node) =>
+        node.boardId !== null &&
         boardIds.has(node.boardId) &&
         // Never sweep a card the filter is hiding: the button says "clear the
         // done cards in this column", and it must mean the ones on screen.
-        matchesAssignee(node.id)
-      )
-        done.add(node.id);
+        matchesAssignee(node.id),
+      pinned: (id) => taskMap[id]?.canvasSectionId != null,
+    });
     const out = new Map<TaskPlacement, Map<string, string[]>>();
-    for (const id of done) {
+    for (const id of ids) {
       const node = nodeById.get(id);
       if (!node?.boardId) continue;
-      // Inherits its way into the tray with its parent — nothing to write.
-      if (node.parentId && done.has(node.parentId)) continue;
       const placement = placementByNode.get(id);
       if (!placement) continue;
       let lane = out.get(placement);
       if (!lane) out.set(placement, (lane = new Map()));
-      const ids = lane.get(node.boardId);
-      if (ids) ids.push(id);
+      const cards = lane.get(node.boardId);
+      if (cards) cards.push(id);
       else lane.set(node.boardId, [id]);
     }
     return out;
-  }, [nodes, nodeById, boards, placementByNode, matchesAssignee]);
+  }, [nodes, nodeById, boards, placementByNode, matchesAssignee, taskMap]);
 
   /** A card's children WITHIN one column — the mirror of the root rule above, so
    *  every task renders exactly once: a child that was promoted to a root of

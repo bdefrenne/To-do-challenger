@@ -578,6 +578,55 @@ export function placementOfTask(
   return "inbox";
 }
 
+/**
+ * When a requested-bucket override may be dropped (TD2-218).
+ *
+ * Filing a card publishes the bucket it's heading for (`pendingPlacements`) and
+ * renders it there for the round trip, because the PIN is the server's to
+ * compute and doesn't exist yet. The question this answers is the other half:
+ * when may that override be taken away again?
+ *
+ * It used to be "as soon as the request returns", and that is wrong whenever a
+ * second write is still in flight: the reconcile fetch is deferred to the LAST
+ * op in a burst (see `mutate`), so the first sweep dropped its override with no
+ * fresh data behind it and its cards redrew in the band they had just left —
+ * until the second sweep's fetch landed seconds later. Clearing two board
+ * columns a second apart was enough to see it.
+ *
+ * So an override now lives until a snapshot that could answer for it has been
+ * ACCEPTED, which is either of:
+ *
+ *   • the snapshot agrees — the pin it carries resolves to the bucket we asked
+ *     for, so there is nothing left to override (and nothing to see); or
+ *   • the snapshot is entitled to disagree — it was requested while no write was
+ *     in flight (`quietSince`), and after we asked, so it is the server's final
+ *     word on this card. The card snaps to where the server actually put it,
+ *     which is what should happen when a write is refused, when a placement has
+ *     nowhere to resolve to (a project with no canvas), or when a bulk batch
+ *     reports the op as failed.
+ *
+ * A card that is no longer in the snapshot at all (`resolved` null — trashed,
+ * archived, gone) has nothing to override either.
+ *
+ * Both timestamps are client-side and compared only against each other, never
+ * against a server clock.
+ */
+export function placementOverrideSettled(opts: {
+  /** The bucket the filing asked for. */
+  asked: TaskPlacement;
+  /** What the incoming snapshot resolves the card to, or null if it's not in it. */
+  resolved: TaskPlacement | null;
+  /** When the override was published. */
+  openedAt: number;
+  /** When the snapshot was REQUESTED, if no write was in flight at that moment —
+   *  else null, which makes the snapshot a witness only to what it confirms. */
+  quietSince: number | null;
+}): boolean {
+  const { asked, resolved, openedAt, quietSince } = opts;
+  if (resolved === null || resolved === asked) return true;
+  return quietSince !== null && openedAt < quietSince;
+}
+
 /** An empty membership — used before a canvas's nodes have loaded, and by the
  *  board views, which don't do section resolution at all. */
 export const EMPTY_MEMBERSHIP: SectionMembership = {

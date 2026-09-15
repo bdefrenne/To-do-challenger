@@ -22,6 +22,7 @@ import type {
 import {
   deletionOf,
   placementOfTask,
+  placementOverrideSettled,
   trayOfPlacement,
   type PlacementMap,
   type SystemGroup,
@@ -659,6 +660,12 @@ export function WorkspaceProvider({
   // finishes during one fetch.
   const reconcileSeq = useRef(0);
 
+  // Bumped every time a snapshot is actually APPLIED (as opposed to fetched and
+  // then discarded by the guard above). A mutation reads it around its reconcile
+  // to tell the two apart — a discarded snapshot leaves the screen stale, so it
+  // must not also claim the poll's change cursor (TD2-218).
+  const appliedSeq = useRef(0);
+
   // Last change-cursor we've reconciled to. The poll compares the server's
   // cursor against this and only re-fetches when it moves.
   const lastVersion = useRef<string | null>(null);
@@ -763,9 +770,74 @@ export function WorkspaceProvider({
   // Buckets requested but not yet confirmed — see `fileTask`. A view that renders
   // by bucket reads these on top of the resolved pins, so a filed card appears
   // where it's going for the round trip rather than sitting in its old band.
+  //
+  // An override outlives its own request (TD2-218): it is dropped by the first
+  // ACCEPTED snapshot that can answer for it — see `placementOverrideSettled`
+  // and `dropSettledPlacements`. Dropping it when the request returned instead
+  // was the "cleared cards pop back" bug, since a burst of writes defers the
+  // reconcile fetch to the last op in it.
   const [pendingPlacements, setPendingPlacements] = useState<
     Record<string, TaskPlacement>
   >({});
+  /** When each override was published — half of the rule above. Kept beside the
+   *  state rather than in it so the map every consumer reads stays a plain
+   *  `id → bucket`. Written only by the two helpers below. */
+  const pendingPlacedAtRef = useRef<Map<string, number>>(new Map());
+
+  /** Publish the bucket a filing is heading for, for as long as it takes a
+   *  snapshot to confirm (or overrule) it. */
+  const openPlacementOverrides = useCallback(
+    (ids: readonly string[], placement: TaskPlacement) => {
+      const at = Date.now();
+      for (const id of ids) pendingPlacedAtRef.current.set(id, at);
+      setPendingPlacements((prev) => {
+        const next = { ...prev };
+        for (const id of ids) next[id] = placement;
+        return next;
+      });
+    },
+    [],
+  );
+
+  /**
+   * Drop every override an accepted snapshot has settled — the ONE place they
+   * are taken away, so no caller can drop one with nothing behind it.
+   *
+   * `quietSince` is when that snapshot was requested, if no write was in flight
+   * at the time (else null): a snapshot taken while something was being written
+   * can confirm an override but is in no position to overrule one.
+   */
+  const dropSettledPlacements = useCallback(
+    (map: Record<string, TaskDTO>, quietSince: number | null) => {
+      setPendingPlacements((prev) => {
+        const ids = Object.keys(prev);
+        if (!ids.length) return prev;
+        const parentOf = (child: string) => map[child]?.parentId ?? null;
+        let next: Record<string, TaskPlacement> | null = null;
+        for (const id of ids) {
+          const settled = placementOverrideSettled({
+            asked: prev[id],
+            resolved: map[id]
+              ? placementOfTask(
+                  id,
+                  map as unknown as Record<string, Task>,
+                  parentOf,
+                  placementMapRef.current,
+                )
+              : null,
+            openedAt: pendingPlacedAtRef.current.get(id) ?? 0,
+            quietSince,
+          });
+          if (!settled) continue;
+          next ??= { ...prev };
+          delete next[id];
+          pendingPlacedAtRef.current.delete(id);
+        }
+        return next ?? prev;
+      });
+    },
+    [],
+  );
 
   // Tasks removed on the canvas but not yet committed to Postgres — kept alive
   // for the ~5s undo window (Gmail-style). `fetchAll` filters these ids so a
@@ -836,7 +908,7 @@ export function WorkspaceProvider({
    *  the reconcile rules. Returns false if a mutation raced us and the snapshot
    *  was dropped. Mutates `map` (overlay re-application). */
   const applyTaskMap = useCallback(
-    (map: Record<string, TaskDTO>, seq: number): boolean => {
+    (map: Record<string, TaskDTO>, seq: number, quietSince: number | null = null): boolean => {
       // A mutation started while the fetch was in flight — its snapshot may
       // predate that write, so don't apply it (nor touch the overlay). A later
       // reconcile (the mutation's own finally, or the poll) applies clean state.
@@ -887,9 +959,13 @@ export function WorkspaceProvider({
       }
       lastAppliedRef.current = map;
       setTaskMap(map);
+      // This snapshot is now the board's truth, so it is also what answers for
+      // the buckets we're still holding an override for (TD2-218).
+      dropSettledPlacements(map, quietSince);
+      appliedSeq.current++;
       return true;
     },
-    [],
+    [dropSettledPlacements],
   );
 
   const fetchAll = useCallback(async (): Promise<Record<string, Task> | undefined> => {
@@ -898,6 +974,9 @@ export function WorkspaceProvider({
     // reconcile / the poll will apply clean state). Still return the fetched map
     // so return-value callers (e.g. `hydrate`) keep working.
     const seq = reconcileSeq.current;
+    // Was the board QUIET when we asked? Only a read taken with nothing being
+    // written is entitled to overrule a bucket override (TD2-218).
+    const quietSince = inflight.current === 0 ? Date.now() : null;
     try {
       const { tasks: fetched, now } = await api<{ tasks: TaskDTO[]; now?: string }>(
         "/api/tasks?flat=1",
@@ -911,7 +990,7 @@ export function WorkspaceProvider({
       // racing mutation made us drop it, `lastApplied` still holds the older
       // base, and moving the watermark would make the next delta skip
       // everything this response carried.
-      if (applyTaskMap(map, seq) && now) lastSyncAt.current = now;
+      if (applyTaskMap(map, seq, quietSince) && now) lastSyncAt.current = now;
       return map;
     } catch (e) {
       console.error("[workspace] failed to load tasks", e);
@@ -930,6 +1009,7 @@ export function WorkspaceProvider({
       return;
     }
     const seq = reconcileSeq.current;
+    const quietSince = inflight.current === 0 ? Date.now() : null;
     try {
       const { tasks: changed, ids, now } = await api<{
         tasks: TaskDTO[];
@@ -948,7 +1028,7 @@ export function WorkspaceProvider({
         if (!pend.has(t.id)) map[t.id] = t;
       }
       // Same rule as the full fetch: the watermark only moves if we applied.
-      if (applyTaskMap(map, seq)) lastSyncAt.current = now;
+      if (applyTaskMap(map, seq, quietSince)) lastSyncAt.current = now;
     } catch (e) {
       console.error("[workspace] delta fetch failed — falling back to full", e);
       await fetchAll();
@@ -1200,10 +1280,14 @@ export function WorkspaceProvider({
         // Only the last op in a burst reconciles (fewer fetches); the guard in
         // `fetchAll` keeps that safe even if a new op starts mid-fetch.
         if (inflight.current === 0) {
+          const applied = appliedSeq.current;
           await fetchAll();
           // Our own write moved the cursor; sync it so the next poll tick
-          // doesn't see a "change" and re-fetch redundantly.
-          await refreshVersion();
+          // doesn't see a "change" and re-fetch redundantly. ONLY if the
+          // snapshot was actually applied, though (TD2-218): claiming the cursor
+          // for one the guard discarded leaves the screen stale AND tells the
+          // poll there is nothing to come back for, so it never heals.
+          if (appliedSeq.current !== applied) await refreshVersion();
           // Tell peers in the canvas room to refresh now (hot path).
           emitLocalChange();
         }
@@ -1302,8 +1386,10 @@ export function WorkspaceProvider({
       } finally {
         inflight.current--;
         if (inflight.current === 0) {
+          const applied = appliedSeq.current;
           await Promise.all([fetchProjects(), fetchAll()]);
-          await refreshVersion();
+          // Same rule as `mutate`: a discarded snapshot doesn't get the cursor.
+          if (appliedSeq.current !== applied) await refreshVersion();
           emitLocalChange();
         }
       }
@@ -2348,27 +2434,21 @@ export function WorkspaceProvider({
     const node = nodes.find((n) => n.id === id);
     if (!node) return;
     const boardChanged = node.boardId !== boardId;
-    setPendingPlacements((prev) => ({ ...prev, [id]: placement }));
-    try {
-      await fileTaskWrite(
-        id,
-        boardId,
-        boardChanged,
-        placement,
-        opts?.status,
-        opts?.at,
-        opts?.end,
-      );
-    } finally {
-      // Clear it either way: on success the refetched pin says the same thing, and
-      // on failure the card belongs back wherever the server still thinks it is.
-      setPendingPlacements((prev) => {
-        if (!(id in prev)) return prev;
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }
+    openPlacementOverrides([id], placement);
+    // Nothing clears it here (TD2-218): a snapshot does, once there is one that
+    // can answer for it — on success by agreeing, on failure by overruling. The
+    // write's own reconcile is usually that snapshot, but when another write is
+    // still in flight it is deferred, and dropping the override on the way out
+    // of this function would redraw the card in the band it just left.
+    await fileTaskWrite(
+      id,
+      boardId,
+      boardChanged,
+      placement,
+      opts?.status,
+      opts?.at,
+      opts?.end,
+    );
   }
 
   /**
@@ -2389,22 +2469,14 @@ export function WorkspaceProvider({
    */
   async function fileTasks(ids: string[], placement: TaskPlacement) {
     if (!ids.length) return;
-    setPendingPlacements((prev) => {
-      const next = { ...prev };
-      for (const id of ids) next[id] = placement;
-      return next;
-    });
-    try {
-      await mutate(null, () =>
-        bulk(ids.map((id) => ({ op: "move", id, target: { placement } }))),
-      );
-    } finally {
-      setPendingPlacements((prev) => {
-        const next = { ...prev };
-        for (const id of ids) delete next[id];
-        return next;
-      });
-    }
+    openPlacementOverrides(ids, placement);
+    // Held until a snapshot settles them — see `fileTask`. This is the path the
+    // two "Clear Done" buttons take, and the one the bug was reported on:
+    // sweeping a second column a second later deferred this batch's reconcile,
+    // and the first sweep's cards came back.
+    await mutate(null, () =>
+      bulk(ids.map((id) => ({ op: "move", id, target: { placement } }))),
+    );
   }
 
   /** The write half of `fileTask`, split out so the override above wraps it. */

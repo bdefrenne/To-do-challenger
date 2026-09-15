@@ -56,6 +56,15 @@ of the RYDR board set.)
   task, duplicates one, or yanks the caret out of someone's hands rather than
   merely rendering oddly. Six real bugs came out of writing these, three of them
   from cases nobody had hit yet.
+- `npm run check:sweep` — the "Clear Done" rules (21 pure assertions: which done
+  cards a sweep NAMES — scope, depth, and the pinned-vs-inherited child — and how
+  long a filed card's requested bucket is allowed to show before the server's
+  answer takes over, including a replay of the two-columns-a-second-apart bug).
+  **Run it after touching `src/lib/sweep.ts`, `placementOverrideSettled` in
+  `src/lib/sections.ts`, or the `pendingPlacements` lifecycle in
+  `WorkspaceContext.tsx`** — both rules move finished work in bulk with no undo
+  toast behind them, and both fail by moving the wrong cards or by redrawing
+  cards in a band you were just told was cleared, not by rendering oddly.
 - `npm run check:review` — the board-cleanup flag rules (51 pure assertions: the
   two staleness ladders in working days, what each status owes, when a
   `silentEdit` is real, and the severity order). **Run it after touching
@@ -153,6 +162,27 @@ of the RYDR board set.)
   <name>", ticked (TD2-193, `useAssignOnCreate`): a task created with nobody on
   it in a filtered view vanishes as it is typed. Proven by `npm run check:outline`.
 
+- **A filed card's bucket shows until a snapshot settles it (TD2-218).** Filing
+  publishes the bucket it's heading for (`pendingPlacements`) because the PIN is
+  the server's to compute; `placementOverrideSettled` is the ONE rule for taking
+  that override away, and `dropSettledPlacements` the one place it happens — a
+  snapshot settles an override by AGREEING, or, if it was requested while no
+  write was in flight, by overruling it. **Never clear an override when a request
+  returns**: `mutate` defers the reconcile fetch to the last op in a burst, so
+  the returning op has no fresh data behind it — that was "Clear Done on two
+  boards and the first board's cards come back". For the same reason a mutation
+  claims the poll's change cursor (`refreshVersion`) only when its snapshot was
+  actually applied; claiming it for a discarded one leaves the screen stale AND
+  tells the poll there is nothing to come back for.
+- **One sweep rule, two buttons (TD2-218).** `sweepableDoneIds` decides what
+  "Clear Done" moves. Scope is the caller's — a board column honours the view's
+  filters because it says "clear THIS column", the project header's ignores them
+  because it says "clear the project" and a sweep that skipped the boards a
+  filter was hiding would leave work behind under a button claiming the opposite.
+  What the rule owns is the child case: a done child riding on its parent's
+  placement is left unnamed (it follows for free, and naming it would weld it to
+  that lane), a done child with a pin of its own IS named (nothing carries it).
+  Both proven by `npm run check:sweep`.
 - **Every MCP call is logged at ONE chokepoint (TD2-211).** `instrument()` in
   the MCP route patches `server.tool` / `server.prompt` before any registration
   runs, so a tool added later is recorded because it is a tool — **never add
